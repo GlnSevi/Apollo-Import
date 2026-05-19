@@ -2,6 +2,8 @@
 
 Dieser Prototyp zeigt eine moegliche Desktop-GUI fuer die Erfassung neuer Artikel und erzeugt daraus die Importdateien als `.xlsx`.
 
+Das Programm nutzt jetzt ein eigenes App-Logo aus `assets/apollo_import_logo.png` bzw. `assets/apollo_import_logo.ico`, das sowohl in der laufenden GUI als auch im Windows-`exe`-Build verwendet wird.
+
 ## Start
 
 ```powershell
@@ -21,22 +23,28 @@ Alternativ unter Windows:
   - eine fuer `Kurzbezeichnung`
   - eine fuer `Text`
 - Kurztexte pro Sprache pflegen
+  - Umlaute in Kurzbezeichnungen werden automatisch ersetzt, z. B. `ä -> ae`, `ö -> oe`, `ü -> ue`, `ß -> ss`
 - Langtexte pro Sprache pflegen
 - Bilder, Dokumente, Videos und Web Links erfassen
   - mit Bild-Thumbnail und PDF-Vorschau in den Bilder- und Dokumente-Tabs
   - vorhandene Zeilen koennen direkt im Formular nachbearbeitet und aktualisiert werden
   - Aenderungen werden direkt in die Output-Excel-Dateien geschrieben
 - Kurzbezeichnungen und Texte per DeepL aus dem deutschen Feld in `EN`, `CZ`, `FR`, `IT` und `NL` uebersetzen
+- GenArt lokal und optional ueber inoffizielle Google-Lens-Treffer zum Produktbild verfeinern
+  - mit direkter Suche ueber das GenArt-Feld oder den Button `Suchen...`
 - Produktdaten direkt von `kunzer.de` laden
   - per Artikelnummer oder Produkt-URL
   - inklusive Titel, Web-Link, Bildern und Dokumenten
   - optional mit automatischer DeepL-Uebersetzung
+  - mit Hintergrundladen, damit die GUI waehrenddessen fluessiger bleibt
 - Eine Produktliste als CSV oder XLSX importieren und mehrere Produkte in Serie ueber Kunzer anlegen
   - mit Auswahl der zu scrapenden Daten
   - mit automatischer DeepL-Uebersetzung fuer Texte
   - mit direktem Schreiben in den festen Output-Pfad
 - Exportdateien wahlweise in einen Zeitstempel-Unterordner oder direkt in einen festen Importpfad schreiben
 - Vorhandene Artikel aus den Output-Dateien in einem Artikelverzeichnis erneut aufrufen
+- Bild-, PDF- und Web-Vorschauen werden zwischengespeichert, damit wiederholtes Oeffnen spuerbar schneller ist
+- Die GUI merkt sich beim Beenden ihren letzten Zustand, inklusive Pfaden, Optionen, aktuellem Artikel, Texten, Medien und geoeffnetem Tab
 
 ## Kunzer Import
 
@@ -59,9 +67,11 @@ Bei Dokumenten wird die `Art` automatisch aus der Bezeichnung bzw. dem Dateiname
 - `Produktinfo` -> `17`
 - `Zubehoer` -> `17`
 
-Video-Links werden automatisch auf einen normalen oeffentlichen YouTube-Link im Format `https://youtu.be/...` normalisiert. Das gilt fuer gescrapte Kunzer-Videos und auch fuer manuell eingetragene `embed`-, `watch`- oder `shorts`-Links.
+Video-Links werden automatisch auf ein einbettbares YouTube-Format im Stil `https://www.youtube.com/embed/...` normalisiert. Das gilt fuer gescrapte Kunzer-Videos und auch fuer manuell eingetragene `embed`-, `watch`-, `shorts`- oder `youtu.be`-Links.
 
 Wenn `DEEPL_API_KEY` gesetzt ist oder der Key in der GUI eingetragen wurde, koennen die geladenen deutschen Texte direkt weiter uebersetzt werden.
+
+Wenn `Google Lens ohne API-Key fuer GenArt verwenden (inoffiziell)` aktiv ist, kann die GUI GenArt-Vorschlaege ueber sichtbare Treffer aus Google Lens verfeinern. Dabei werden Treffertexte und erkannte Seiten aus dem Lens-Ergebnis als zusaetzliches Signal fuer die GenArt-Suche genutzt.
 
 ## Artikelverzeichnis
 
@@ -120,6 +130,17 @@ python apollo_import_gui.py
 ```
 
 Standardmaessig nutzt die GUI `https://api.deepl.com`. Fuer DeepL Free kannst du in der GUI oder per `DEEPL_API_BASE_URL` auf `https://api-free.deepl.com` wechseln.
+
+## Google Lens
+
+Die GenArt-Vorschlaege koennen optional ueber einen inoffiziellen Google-Lens-Abruf ohne API Key verfeinert werden.
+
+- es ist kein zusaetzlicher API Key noetig
+- die GUI nutzt dafuer einen Headless-Browser ueber `Playwright`
+- ausgewertet werden sichtbare Treffertexte und erkannte Zielseiten aus dem Lens-Ergebnis
+- der Weg ist bewusst experimentell und kann sich durch Aenderungen bei Google jederzeit veraendern
+
+Die lokale Such- und Bildaehnlichkeitslogik bleibt als Fallback erhalten, falls Lens keine brauchbaren Treffer liefert.
 
 ## Exportierte Dateien
 

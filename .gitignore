@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 output/
+apollo_import_gui_state.json
+build/
+dist/
