@@ -13,6 +13,8 @@ from pathlib import Path
 import random
 import re
 import string
+import subprocess
+import tempfile
 import threading
 import sys
 import tkinter as tk
@@ -23,6 +25,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 import xml.etree.ElementTree as ET
+import webbrowser
 
 from openpyxl import Workbook, load_workbook
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -44,6 +47,8 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
+APP_VERSION = "0.1.2"
+APP_VERSION_TAG = f"v{APP_VERSION}"
 DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
 DEFAULT_GENART_SOURCE = Path(r"C:\Users\heimbuchner\Downloads\Genarten.xlsx")
@@ -68,6 +73,9 @@ SHORT_TEXT_UMLAUT_REPLACEMENTS = str.maketrans(
 SESSION_STATE_FILE = Path.cwd() / "apollo_import_gui_state.json"
 APP_ICON_PNG_RELATIVE_PATH = Path("assets") / "apollo_import_logo.png"
 APP_ICON_ICO_RELATIVE_PATH = Path("assets") / "apollo_import_logo.ico"
+GITHUB_REPO_FULL_NAME = "GlnSevi/Apollo-Import"
+GITHUB_RELEASES_LATEST_API_URL = f"https://api.github.com/repos/{GITHUB_REPO_FULL_NAME}/releases/latest"
+GITHUB_RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPO_FULL_NAME}/releases"
 
 SHORT_TEXT_HEADERS = [
     "Artikelnummer",
@@ -325,6 +333,28 @@ class GoogleLensWebResult:
 
 
 @dataclass
+class GitHubReleaseAsset:
+    name: str
+    download_url: str
+    content_type: str = ""
+    size: int = 0
+
+    @property
+    def suffix(self) -> str:
+        return Path(self.name).suffix.lower()
+
+
+@dataclass
+class GitHubReleaseInfo:
+    tag_name: str
+    name: str = ""
+    html_url: str = ""
+    body: str = ""
+    published_at: str = ""
+    assets: list[GitHubReleaseAsset] = field(default_factory=list)
+
+
+@dataclass
 class ExportBundle:
     article_number: str
     short_module_id: str
@@ -384,6 +414,96 @@ def get_application_base_path() -> Path:
 
 def resolve_application_asset_path(relative_path: str | Path) -> Path:
     return get_application_base_path() / Path(relative_path)
+
+
+def parse_version_parts(value: str) -> tuple[int, ...]:
+    parts = [int(part) for part in re.findall(r"\d+", value)]
+    return tuple(parts) if parts else (0,)
+
+
+def is_newer_release_tag(current_tag: str, candidate_tag: str) -> bool:
+    current_parts = parse_version_parts(current_tag)
+    candidate_parts = parse_version_parts(candidate_tag)
+    max_length = max(len(current_parts), len(candidate_parts))
+    current_padded = current_parts + (0,) * (max_length - len(current_parts))
+    candidate_padded = candidate_parts + (0,) * (max_length - len(candidate_parts))
+    return candidate_padded > current_padded
+
+
+def fetch_latest_github_release(timeout_seconds: int = 20) -> GitHubReleaseInfo:
+    request = urllib_request.Request(
+        GITHUB_RELEASES_LATEST_API_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"{APP_TITLE}/{APP_VERSION}",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        raise ValueError(f"GitHub Release konnte nicht geladen werden ({exc.code}).") from exc
+    except urllib_error.URLError as exc:
+        raise ValueError(f"GitHub Release konnte nicht geladen werden: {exc.reason}") from exc
+
+    assets = [
+        GitHubReleaseAsset(
+            name=str(item.get("name", "")).strip(),
+            download_url=str(item.get("browser_download_url", "")).strip(),
+            content_type=str(item.get("content_type", "")).strip(),
+            size=int(item.get("size", 0) or 0),
+        )
+        for item in payload.get("assets", [])
+        if str(item.get("browser_download_url", "")).strip()
+    ]
+    return GitHubReleaseInfo(
+        tag_name=str(payload.get("tag_name", "")).strip(),
+        name=str(payload.get("name", "")).strip(),
+        html_url=str(payload.get("html_url", "")).strip(),
+        body=str(payload.get("body", "") or ""),
+        published_at=str(payload.get("published_at", "")).strip(),
+        assets=assets,
+    )
+
+
+def choose_release_asset(release: GitHubReleaseInfo) -> GitHubReleaseAsset | None:
+    def score(asset: GitHubReleaseAsset) -> tuple[int, int]:
+        name = asset.name.casefold()
+        if asset.suffix == ".exe" and ("setup" in name or "installer" in name):
+            return (4, len(asset.name))
+        if asset.suffix == ".exe" and "onefile" in name:
+            return (3, len(asset.name))
+        if asset.suffix == ".exe":
+            return (2, len(asset.name))
+        if asset.suffix == ".zip":
+            return (1, len(asset.name))
+        return (0, len(asset.name))
+
+    ranked = sorted(release.assets, key=score, reverse=True)
+    best = ranked[0] if ranked else None
+    if best is None or score(best)[0] <= 0:
+        return None
+    return best
+
+
+def download_release_asset(asset: GitHubReleaseAsset, target_path: Path, timeout_seconds: int = 120) -> Path:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib_request.Request(
+        asset.download_url,
+        headers={"User-Agent": f"{APP_TITLE}/{APP_VERSION}"},
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_seconds) as response, target_path.open("wb") as handle:
+            while True:
+                chunk = response.read(1024 * 64)
+                if not chunk:
+                    break
+                handle.write(chunk)
+    except urllib_error.HTTPError as exc:
+        raise ValueError(f"Release-Datei konnte nicht geladen werden ({exc.code}).") from exc
+    except urllib_error.URLError as exc:
+        raise ValueError(f"Release-Datei konnte nicht geladen werden: {exc.reason}") from exc
+    return target_path
 
 
 def sanitize_short_translation_set(translations: TranslationSet) -> TranslationSet:
@@ -2347,6 +2467,10 @@ class MediaTableFrame(ttk.LabelFrame):
         self.inline_editor: ttk.Entry | None = None
         self.inline_editor_item = ""
         self.inline_editor_column = ""
+        self.preview_visible = True
+        self.preview_toggle_var = tk.StringVar(value="Vorschau ausblenden")
+        self.compact_preview_layout = False
+        self._layout_after_id: str | None = None
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
         self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
@@ -2378,6 +2502,7 @@ class MediaTableFrame(ttk.LabelFrame):
         ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(actions, text="Formular leeren", command=self.clear_form).grid(row=0, column=3)
+        ttk.Button(actions, textvariable=self.preview_toggle_var, command=self.toggle_preview).grid(row=0, column=4, padx=(8, 0))
 
         self.tree = ttk.Treeview(self, columns=("path", "art", "sprache"), show="headings", height=10, selectmode="extended")
         self.tree.grid(row=1, column=0, sticky="nsew")
@@ -2398,6 +2523,7 @@ class MediaTableFrame(ttk.LabelFrame):
         preview_frame = ttk.LabelFrame(self, text="Vorschau", padding=10)
         preview_frame.grid(row=1, column=2, sticky="nsew", padx=(12, 0))
         preview_frame.columnconfigure(0, weight=1)
+        self.preview_frame = preview_frame
 
         self.preview_title_var = tk.StringVar(value="Keine Auswahl")
         self.preview_meta_var = tk.StringVar(value="Waehle eine Zeile aus, um mehr Details zu sehen.")
@@ -2412,6 +2538,8 @@ class MediaTableFrame(ttk.LabelFrame):
             row=2, column=0, sticky="w"
         )
         self._reset_preview()
+        self.bind("<Configure>", self._handle_resize)
+        self.after_idle(self._apply_responsive_layout)
 
     def browse_files(self) -> None:
         selected = filedialog.askopenfilenames(
@@ -2516,6 +2644,40 @@ class MediaTableFrame(ttk.LabelFrame):
         self.preview_title_var.set("Keine Auswahl")
         self.preview_meta_var.set("Waehle eine Zeile aus, um mehr Details zu sehen.")
         self.preview_visual.configure(text="Keine Vorschau", image="")
+
+    def toggle_preview(self) -> None:
+        self.set_preview_visible(not self.preview_visible)
+
+    def set_preview_visible(self, visible: bool) -> None:
+        self.preview_visible = bool(visible)
+        self.preview_toggle_var.set("Vorschau ausblenden" if self.preview_visible else "Vorschau einblenden")
+        self._apply_responsive_layout()
+
+    def _handle_resize(self, _event: tk.Event[tk.Misc]) -> None:
+        if self._layout_after_id is not None:
+            try:
+                self.after_cancel(self._layout_after_id)
+            except Exception:
+                pass
+        self._layout_after_id = self.after_idle(self._apply_responsive_layout)
+
+    def _apply_responsive_layout(self) -> None:
+        self._layout_after_id = None
+        width = max(self.winfo_width(), self.winfo_reqwidth())
+        compact = width < 1220
+        self.compact_preview_layout = compact
+
+        if self.preview_visible:
+            if compact:
+                self.preview_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=(0, 0), pady=(12, 0))
+            else:
+                self.preview_frame.grid(row=1, column=2, columnspan=1, sticky="nsew", padx=(12, 0), pady=(0, 0))
+        else:
+            self.preview_frame.grid_remove()
+
+        reserved_preview_width = 0 if (compact or not self.preview_visible) else 320
+        path_width = max(360, width - reserved_preview_width - 260)
+        self.tree.column("path", width=path_width, anchor="w")
 
     def _handle_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         selected = self.tree.selection()
@@ -2771,6 +2933,10 @@ class LinkTableFrame(ttk.LabelFrame):
         self.remote_image_cache: dict[str, bytes] = {}
         self.web_preview_cache: dict[str, tuple[bytes, str]] = {}
         self.page_title_cache: dict[str, str] = {}
+        self.preview_visible = True
+        self.preview_toggle_var = tk.StringVar(value="Vorschau ausblenden")
+        self.compact_preview_layout = False
+        self._layout_after_id: str | None = None
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
         self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
@@ -2790,6 +2956,7 @@ class LinkTableFrame(ttk.LabelFrame):
         ttk.Button(form, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=3, padx=(8, 0))
         ttk.Button(form, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(form, text="Leeren", command=self.clear_form).grid(row=0, column=5, padx=(8, 0))
+        ttk.Button(form, textvariable=self.preview_toggle_var, command=self.toggle_preview).grid(row=0, column=6, padx=(8, 0))
 
         self.tree = ttk.Treeview(self, columns=("link",), show="headings", height=7, selectmode="extended")
         self.tree.grid(row=1, column=0, sticky="nsew")
@@ -2806,6 +2973,7 @@ class LinkTableFrame(ttk.LabelFrame):
         preview_frame = ttk.LabelFrame(self, text="Vorschau", padding=10)
         preview_frame.grid(row=1, column=2, sticky="nsew", padx=(12, 0))
         preview_frame.columnconfigure(0, weight=1)
+        self.preview_frame = preview_frame
 
         self.preview_title_var = tk.StringVar(value="Keine Auswahl")
         self.preview_meta_var = tk.StringVar(value="Waehle eine Zeile aus, um mehr Details zu sehen.")
@@ -2819,6 +2987,8 @@ class LinkTableFrame(ttk.LabelFrame):
             row=2, column=0, sticky="w"
         )
         self._reset_preview()
+        self.bind("<Configure>", self._handle_resize)
+        self.after_idle(self._apply_responsive_layout)
 
     def add_row(self) -> None:
         link = self.link_var.get().strip()
@@ -2976,6 +3146,40 @@ class LinkTableFrame(ttk.LabelFrame):
         self.preview_title_var.set("Keine Auswahl")
         self.preview_meta_var.set("Waehle eine Zeile aus, um mehr Details zu sehen.")
         self.preview_visual.configure(text="Keine Vorschau", image="", wraplength=220, justify="center")
+
+    def toggle_preview(self) -> None:
+        self.set_preview_visible(not self.preview_visible)
+
+    def set_preview_visible(self, visible: bool) -> None:
+        self.preview_visible = bool(visible)
+        self.preview_toggle_var.set("Vorschau ausblenden" if self.preview_visible else "Vorschau einblenden")
+        self._apply_responsive_layout()
+
+    def _handle_resize(self, _event: tk.Event[tk.Misc]) -> None:
+        if self._layout_after_id is not None:
+            try:
+                self.after_cancel(self._layout_after_id)
+            except Exception:
+                pass
+        self._layout_after_id = self.after_idle(self._apply_responsive_layout)
+
+    def _apply_responsive_layout(self) -> None:
+        self._layout_after_id = None
+        width = max(self.winfo_width(), self.winfo_reqwidth())
+        compact = width < 1160
+        self.compact_preview_layout = compact
+
+        if self.preview_visible:
+            if compact:
+                self.preview_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=(0, 0), pady=(12, 0))
+            else:
+                self.preview_frame.grid(row=1, column=2, columnspan=1, sticky="nsew", padx=(12, 0), pady=(0, 0))
+        else:
+            self.preview_frame.grid_remove()
+
+        reserved_preview_width = 0 if (compact or not self.preview_visible) else 320
+        link_width = max(360, width - reserved_preview_width - 40)
+        self.tree.column("link", width=link_width, anchor="w")
 
     def _update_preview(self, link: str) -> None:
         parsed = urlparse(link)
@@ -3263,8 +3467,12 @@ class ApolloImportApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1360x920")
-        self.root.minsize(1180, 780)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        default_width = min(1360, max(980, screen_width - 120))
+        default_height = min(920, max(700, screen_height - 140))
+        self.root.geometry(f"{default_width}x{default_height}")
+        self.root.minsize(920, 620)
         self.app_icon_photo: object | None = None
 
         self.id_registry = IdRegistry()
@@ -3293,8 +3501,15 @@ class ApolloImportApp:
         self.short_module_id_var = tk.StringVar()
         self.long_module_id_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Bereit.")
+        self.update_status_var = tk.StringVar(value=f"Aktuelle Version: {APP_VERSION_TAG}")
         self.known_id_count_var = tk.StringVar(value="0 IDs geladen")
         self.genart_count_var = tk.StringVar(value="0 GenArts geladen")
+        self.article_section_collapsed = False
+        self.api_section_collapsed = False
+        self.article_browser_collapsed = False
+        self.article_section_toggle_var = tk.StringVar()
+        self.api_section_toggle_var = tk.StringVar()
+        self.article_browser_toggle_var = tk.StringVar()
         self.current_id_article_number = ""
         self.article_browser_records: dict[str, StoredArticleSnapshot] = {}
         self.current_kunzer_category_context = ""
@@ -3308,6 +3523,10 @@ class ApolloImportApp:
         self.article_browser_context_menu: tk.Menu | None = None
         self.background_task_running = False
         self.pending_article_browser_selection = ""
+        self.project_tab_compact_mode = False
+        self.article_browser_compact_mode = False
+        self._project_layout_after_id: str | None = None
+        self._article_browser_layout_after_id: str | None = None
 
         self._configure_style()
         self._configure_window_icon()
@@ -3560,6 +3779,15 @@ class ApolloImportApp:
                     },
                 },
             },
+            "ui": {
+                "article_section_collapsed": self.article_section_collapsed,
+                "api_section_collapsed": self.api_section_collapsed,
+                "article_browser_collapsed": self.article_browser_collapsed,
+                "image_preview_visible": getattr(self.image_frame, "preview_visible", True),
+                "document_preview_visible": getattr(self.document_frame, "preview_visible", True),
+                "video_preview_visible": getattr(self.video_frame, "preview_visible", True),
+                "web_preview_visible": getattr(self.web_frame, "preview_visible", True),
+            },
             "article_browser": {
                 "selected_article": selected_browser_article,
             },
@@ -3670,6 +3898,16 @@ class ApolloImportApp:
                     if isinstance(form, dict):
                         self.web_frame.link_var.set(str(form.get("path_or_link", "")))
 
+            ui = payload.get("ui")
+            if isinstance(ui, dict):
+                self.article_section_collapsed = bool(ui.get("article_section_collapsed", self.article_section_collapsed))
+                self.api_section_collapsed = bool(ui.get("api_section_collapsed", self.api_section_collapsed))
+                self.article_browser_collapsed = bool(ui.get("article_browser_collapsed", self.article_browser_collapsed))
+                self.image_frame.set_preview_visible(bool(ui.get("image_preview_visible", getattr(self.image_frame, "preview_visible", True))))
+                self.document_frame.set_preview_visible(bool(ui.get("document_preview_visible", getattr(self.document_frame, "preview_visible", True))))
+                self.video_frame.set_preview_visible(bool(ui.get("video_preview_visible", getattr(self.video_frame, "preview_visible", True))))
+                self.web_frame.set_preview_visible(bool(ui.get("web_preview_visible", getattr(self.web_frame, "preview_visible", True))))
+
             selected_tab = payload.get("selected_tab")
             if isinstance(selected_tab, int) and 0 <= selected_tab < len(self.main_notebook.tabs()):
                 self.main_notebook.select(selected_tab)
@@ -3677,6 +3915,11 @@ class ApolloImportApp:
             browser_state = payload.get("article_browser")
             if isinstance(browser_state, dict):
                 self.pending_article_browser_selection = normalize_article_number(str(browser_state.get("selected_article", "")))
+
+        self._apply_article_section_visibility()
+        self._apply_api_section_visibility()
+        self._apply_article_browser_visibility()
+        self._schedule_project_tab_layout()
 
     def _apply_pending_session_selection(self) -> None:
         selected_article = normalize_article_number(self.pending_article_browser_selection)
@@ -3693,12 +3936,316 @@ class ApolloImportApp:
             pass
         self.root.destroy()
 
+    def _open_github_releases_page(self) -> None:
+        webbrowser.open(GITHUB_RELEASES_PAGE_URL)
+
+    def _check_for_github_updates(self) -> None:
+        self.update_status_var.set("Pruefe GitHub-Releases...")
+
+        def worker() -> GitHubReleaseInfo:
+            release = fetch_latest_github_release()
+            if not release.tag_name:
+                raise ValueError("GitHub Release enthaelt kein gueltiges Versions-Tag.")
+            return release
+
+        def on_success(result: object) -> None:
+            if not isinstance(result, GitHubReleaseInfo):
+                raise ValueError("Unerwartete Antwort bei der Update-Pruefung.")
+
+            release = result
+            latest_label = release.name or release.tag_name
+            if not is_newer_release_tag(APP_VERSION_TAG, release.tag_name):
+                self.update_status_var.set(f"Aktuelle Version: {APP_VERSION_TAG} (kein neueres Release)")
+                self.status_var.set(f"Kein neueres Release gefunden. Aktuell installiert: {APP_VERSION_TAG}")
+                messagebox.showinfo(APP_TITLE, f"Du nutzt bereits die neueste Version.\n\nInstalliert: {APP_VERSION_TAG}")
+                return
+
+            asset = choose_release_asset(release)
+            self.update_status_var.set(f"Update verfuegbar: {release.tag_name}")
+
+            body_lines = [line.strip("- ").strip() for line in release.body.splitlines() if line.strip()]
+            notes_preview = "\n".join(body_lines[:4])
+            message_parts = [
+                f"Aktuell installiert: {APP_VERSION_TAG}",
+                f"Neues Release: {release.tag_name}",
+                f"Titel: {latest_label}",
+            ]
+            if asset is not None:
+                message_parts.append(f"Gefundenes Paket: {asset.name}")
+            if notes_preview:
+                message_parts.append("")
+                message_parts.append("Release-Hinweise:")
+                message_parts.append(notes_preview)
+            message_parts.append("")
+            message_parts.append("Soll das Update jetzt heruntergeladen und gestartet werden?")
+            wants_update = messagebox.askyesno(APP_TITLE, "\n".join(message_parts))
+            if not wants_update:
+                self.status_var.set(f"Update verfuegbar: {release.tag_name}")
+                return
+
+            if asset is None:
+                self.status_var.set(f"Kein direkt installierbares Paket in {release.tag_name} gefunden.")
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "Im neuesten Release wurde kein direkt installierbares Paket gefunden.\n\n"
+                    "Die Release-Seite wird jetzt geoeffnet.",
+                )
+                self._open_github_releases_page()
+                return
+
+            self._download_and_install_github_release(release, asset)
+
+        self._run_background_task(
+            "Suche auf GitHub nach neuen Releases...",
+            worker,
+            on_success,
+            "Update-Pruefung fehlgeschlagen",
+        )
+
+    def _download_and_install_github_release(self, release: GitHubReleaseInfo, asset: GitHubReleaseAsset) -> None:
+        target_dir = Path(tempfile.gettempdir()) / "ApolloImportUpdates" / safe_folder_name(release.tag_name)
+        target_path = target_dir / asset.name
+
+        def worker() -> Path:
+            return download_release_asset(asset, target_path)
+
+        def on_success(result: object) -> None:
+            downloaded_path = Path(str(result))
+            self._install_downloaded_release(release, asset, downloaded_path)
+
+        self._run_background_task(
+            f"Lade Update {release.tag_name} herunter...",
+            worker,
+            on_success,
+            "Update-Download fehlgeschlagen",
+        )
+
+    def _install_downloaded_release(
+        self,
+        release: GitHubReleaseInfo,
+        asset: GitHubReleaseAsset,
+        downloaded_path: Path,
+    ) -> None:
+        if asset.suffix == ".zip":
+            self.status_var.set(f"Update heruntergeladen: {downloaded_path.name}")
+            messagebox.showinfo(
+                APP_TITLE,
+                "Das neueste Release wurde als ZIP heruntergeladen.\n\n"
+                f"Datei: {downloaded_path}\n\n"
+                "Ich oeffne jetzt den Ordner, damit du das Paket direkt verwenden kannst.",
+            )
+            os.startfile(str(downloaded_path.parent))
+            return
+
+        if "setup" in asset.name.casefold() or "installer" in asset.name.casefold():
+            os.startfile(str(downloaded_path))
+            self.status_var.set(f"Installer gestartet: {release.tag_name}")
+            messagebox.showinfo(
+                APP_TITLE,
+                "Der Update-Installer wurde gestartet.\n\n"
+                "Nach Abschluss der Installation kannst du die neue Version direkt verwenden.",
+            )
+            return
+
+        if not getattr(sys, "frozen", False):
+            self.status_var.set(f"Update heruntergeladen: {downloaded_path.name}")
+            messagebox.showinfo(
+                APP_TITLE,
+                "Das Update wurde heruntergeladen, aber die automatische Ersetzung funktioniert nur in der gebauten EXE.\n\n"
+                f"Datei: {downloaded_path}\n\n"
+                "Ich oeffne jetzt den Ordner mit der heruntergeladenen Datei.",
+            )
+            os.startfile(str(downloaded_path.parent))
+            return
+
+        self._install_portable_exe_update(release, downloaded_path)
+
+    def _install_portable_exe_update(self, release: GitHubReleaseInfo, downloaded_path: Path) -> None:
+        current_executable = Path(sys.executable).resolve()
+        if not current_executable.exists():
+            raise ValueError("Die aktuelle EXE konnte nicht gefunden werden.")
+
+        update_dir = Path(tempfile.gettempdir()) / "ApolloImportUpdates"
+        update_dir.mkdir(parents=True, exist_ok=True)
+        script_path = update_dir / f"apply_update_{os.getpid()}.ps1"
+
+        def ps_quote(value: str) -> str:
+            return value.replace("'", "''")
+
+        source_path = ps_quote(str(downloaded_path))
+        target_path = ps_quote(str(current_executable))
+        working_dir = ps_quote(str(current_executable.parent))
+        process_id = os.getpid()
+
+        script_body = f"""$ErrorActionPreference = 'Stop'
+$source = '{source_path}'
+$target = '{target_path}'
+$workingDir = '{working_dir}'
+$oldPid = {process_id}
+for ($i = 0; $i -lt 240; $i++) {{
+    try {{
+        Get-Process -Id $oldPid -ErrorAction Stop | Out-Null
+        Start-Sleep -Milliseconds 500
+    }} catch {{
+        break
+    }}
+}}
+$copied = $false
+for ($i = 0; $i -lt 120; $i++) {{
+    try {{
+        Copy-Item -LiteralPath $source -Destination $target -Force
+        $copied = $true
+        break
+    }} catch {{
+        Start-Sleep -Milliseconds 500
+    }}
+}}
+Start-Sleep -Milliseconds 300
+if ($copied) {{
+    Start-Process -FilePath $target -WorkingDirectory $workingDir -WindowStyle Normal
+}} else {{
+    Start-Process -FilePath $source -WorkingDirectory (Split-Path -LiteralPath $source -Parent) -WindowStyle Normal
+}}
+"""
+        script_path.write_text(script_body, encoding="utf-8")
+
+        try:
+            self._save_session_state()
+        except Exception:
+            pass
+
+        subprocess.Popen(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                str(script_path),
+            ],
+            close_fds=True,
+        )
+        self.status_var.set(f"Update wird installiert: {release.tag_name}")
+        messagebox.showinfo(
+            APP_TITLE,
+            "Das Update wurde heruntergeladen.\n\n"
+            "Die Anwendung wird jetzt geschlossen, die EXE ersetzt und danach automatisch neu gestartet.",
+        )
+        self.root.after(200, self.root.destroy)
+
+    def _toggle_api_section(self) -> None:
+        self.api_section_collapsed = not self.api_section_collapsed
+        self._apply_api_section_visibility()
+
+    def _toggle_article_section(self) -> None:
+        self.article_section_collapsed = not self.article_section_collapsed
+        self._apply_article_section_visibility()
+
+    def _apply_article_section_visibility(self) -> None:
+        self.article_section_toggle_var.set("Einblenden" if self.article_section_collapsed else "Einklappen")
+        if self.article_section_collapsed:
+            self.article_content_frame.grid_remove()
+        else:
+            self.article_content_frame.grid()
+
+    def _apply_api_section_visibility(self) -> None:
+        self.api_section_toggle_var.set("Einblenden" if self.api_section_collapsed else "Einklappen")
+        if self.api_section_collapsed:
+            self.deepl_content_frame.grid_remove()
+        else:
+            self.deepl_content_frame.grid()
+
+    def _toggle_article_browser_section(self) -> None:
+        self.article_browser_collapsed = not self.article_browser_collapsed
+        self._apply_article_browser_visibility()
+
+    def _apply_article_browser_visibility(self) -> None:
+        self.article_browser_toggle_var.set("Einblenden" if self.article_browser_collapsed else "Einklappen")
+        if self.article_browser_collapsed:
+            self.browser_content_frame.grid_remove()
+        else:
+            self.browser_content_frame.grid()
+            self._schedule_article_browser_layout()
+
+    def _schedule_project_tab_layout(self) -> None:
+        if self._project_layout_after_id is not None:
+            try:
+                self.root.after_cancel(self._project_layout_after_id)
+            except Exception:
+                pass
+        self._project_layout_after_id = self.root.after_idle(self._apply_project_tab_layout)
+
+    def _handle_project_tab_resize(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        self._schedule_project_tab_layout()
+
+    def _apply_project_tab_layout(self) -> None:
+        self._project_layout_after_id = None
+        width = max(self.project_tab.winfo_width(), self.project_tab.winfo_reqwidth())
+        compact = width < 1380
+        self.project_tab_compact_mode = compact
+
+        self.project_tab.columnconfigure(0, weight=1)
+        self.project_tab.columnconfigure(1, weight=1 if not compact else 0)
+        for row_index in range(0, 6):
+            self.project_tab.rowconfigure(row_index, weight=0)
+
+        self.file_frame.grid_configure(row=0, column=0, columnspan=2, sticky="ew")
+        if compact:
+            self.article_frame.grid_configure(row=1, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
+            self.export_frame.grid_configure(row=2, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
+            self.deepl_frame.grid_configure(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(14, 0))
+            self.browser_frame.grid_configure(row=4, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
+            self.project_tab.rowconfigure(4, weight=1)
+        else:
+            self.article_frame.grid_configure(row=1, column=0, columnspan=1, rowspan=1, sticky="new", padx=(0, 9), pady=(14, 0))
+            self.export_frame.grid_configure(row=1, column=1, columnspan=1, rowspan=2, sticky="nsew", padx=(9, 0), pady=(14, 0))
+            self.deepl_frame.grid_configure(row=2, column=0, columnspan=1, sticky="ew", padx=(0, 9), pady=(14, 0))
+            self.browser_frame.grid_configure(row=3, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
+            self.project_tab.rowconfigure(3, weight=1)
+
+        self._schedule_article_browser_layout()
+
+    def _schedule_article_browser_layout(self) -> None:
+        if self._article_browser_layout_after_id is not None:
+            try:
+                self.root.after_cancel(self._article_browser_layout_after_id)
+            except Exception:
+                pass
+        self._article_browser_layout_after_id = self.root.after_idle(self._apply_article_browser_layout)
+
+    def _handle_article_browser_resize(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        self._schedule_article_browser_layout()
+
+    def _apply_article_browser_layout(self) -> None:
+        self._article_browser_layout_after_id = None
+        if self.article_browser_collapsed:
+            return
+
+        width = max(self.browser_content_frame.winfo_width(), self.browser_content_frame.winfo_reqwidth())
+        compact = self.project_tab_compact_mode or width < 1320
+        self.article_browser_compact_mode = compact
+
+        self.browser_content_frame.columnconfigure(0, weight=1)
+        self.browser_content_frame.columnconfigure(1, weight=1 if not compact else 0)
+        self.browser_content_frame.rowconfigure(0, weight=1)
+        self.browser_content_frame.rowconfigure(1, weight=0)
+
+        if compact:
+            self.browser_table_frame.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 0), pady=(0, 12))
+            self.article_detail_frame.grid_configure(row=1, column=0, sticky="nsew", padx=(0, 0), pady=(0, 0))
+        else:
+            self.browser_table_frame.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 14), pady=(0, 0))
+            self.article_detail_frame.grid_configure(row=0, column=1, sticky="nsew", padx=(0, 0), pady=(0, 0))
+
     def _build_project_tab(self) -> None:
         self.project_tab.columnconfigure(0, weight=1)
         self.project_tab.columnconfigure(1, weight=1)
         self.project_tab.rowconfigure(3, weight=1)
 
-        file_frame = ttk.LabelFrame(self.project_tab, text="Ordner", padding=14)
+        self.file_frame = ttk.LabelFrame(self.project_tab, text="Ordner", padding=14)
+        file_frame = self.file_frame
         file_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
         file_frame.columnconfigure(1, weight=1)
 
@@ -3722,29 +4269,52 @@ class ApolloImportApp:
         ttk.Button(file_frame, text="Datei waehlen", command=self.choose_genart_source_file).grid(row=3, column=2, padx=(8, 0), pady=6)
         ttk.Label(file_frame, textvariable=self.genart_count_var, foreground="#5E6472").grid(row=3, column=3, sticky="w", padx=(8, 0), pady=6)
 
-        article_frame = ttk.LabelFrame(self.project_tab, text="Artikel", padding=14)
-        article_frame.grid(row=1, column=0, sticky="new", pady=(14, 0), padx=(0, 9))
-        article_frame.columnconfigure(1, weight=1)
-        article_frame.columnconfigure(2, weight=0)
+        ttk.Label(file_frame, text="App-Update").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=6)
+        update_row = ttk.Frame(file_frame)
+        update_row.grid(row=4, column=1, columnspan=3, sticky="ew", pady=6)
+        update_row.columnconfigure(0, weight=1)
+        ttk.Label(update_row, textvariable=self.update_status_var, foreground="#5E6472").grid(row=0, column=0, sticky="w")
+        ttk.Button(update_row, text="Nach Updates suchen", command=self._check_for_github_updates).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(update_row, text="Releases", command=self._open_github_releases_page).grid(row=0, column=2, padx=(8, 0))
 
-        ttk.Label(article_frame, text="Artikelnummer").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
-        article_entry = ttk.Entry(article_frame, textvariable=self.article_number_var)
+        self.article_frame = ttk.LabelFrame(self.project_tab, text="Artikel", padding=14)
+        article_frame = self.article_frame
+        article_frame.grid(row=1, column=0, sticky="new", pady=(14, 0), padx=(0, 9))
+        article_frame.columnconfigure(0, weight=1)
+
+        article_header = ttk.Frame(article_frame)
+        article_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        article_header.columnconfigure(0, weight=1)
+        ttk.Label(article_header, text="Artikelstammdaten und Kunzer-Abruf", foreground="#5E6472").grid(row=0, column=0, sticky="w")
+        ttk.Button(article_header, textvariable=self.article_section_toggle_var, command=self._toggle_article_section).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+
+        self.article_content_frame = ttk.Frame(article_frame)
+        self.article_content_frame.grid(row=1, column=0, sticky="ew")
+        self.article_content_frame.columnconfigure(1, weight=1)
+        self.article_content_frame.columnconfigure(2, weight=0)
+
+        ttk.Label(self.article_content_frame, text="Artikelnummer").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        article_entry = ttk.Entry(self.article_content_frame, textvariable=self.article_number_var)
         article_entry.grid(row=0, column=1, sticky="ew", pady=6)
         article_entry.bind("<FocusOut>", self._on_article_entry_focus_out)
 
         ttk.Label(
-            article_frame,
+            self.article_content_frame,
             text="Kurz- und Text-ID werden automatisch im Hintergrund vergeben.",
             foreground="#5E6472",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        ttk.Label(article_frame, text="Kunzer Produkt-URL").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
-        kunzer_url_entry = ttk.Entry(article_frame, textvariable=self.kunzer_product_url_var)
+        ttk.Label(self.article_content_frame, text="Kunzer Produkt-URL").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        kunzer_url_entry = ttk.Entry(self.article_content_frame, textvariable=self.kunzer_product_url_var)
         kunzer_url_entry.grid(row=2, column=1, sticky="ew", pady=6)
         kunzer_url_entry.bind("<FocusOut>", self._on_live_field_focus_out)
 
-        ttk.Label(article_frame, text="GenArt").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
-        self.genart_combo = ttk.Combobox(article_frame, textvariable=self.genart_display_var)
+        ttk.Label(self.article_content_frame, text="GenArt").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
+        self.genart_combo = ttk.Combobox(self.article_content_frame, textvariable=self.genart_display_var)
         self.genart_combo.grid(row=3, column=1, sticky="ew", pady=6)
         self.genart_combo.bind("<<ComboboxSelected>>", lambda _event: self._write_live_section("genart"))
         self.genart_combo.bind("<KeyRelease>", self._on_genart_key_release)
@@ -3753,11 +4323,11 @@ class ApolloImportApp:
         self.genart_combo.bind("<FocusOut>", self._on_genart_focus_out)
         self.genart_combo.bind("<Control-f>", self._open_genart_search_dialog_event)
         self.genart_combo.bind("<F4>", self._open_genart_search_dialog_event)
-        ttk.Button(article_frame, text="Suchen...", command=self._open_genart_search_dialog).grid(
+        ttk.Button(self.article_content_frame, text="Suchen...", command=self._open_genart_search_dialog).grid(
             row=3, column=2, sticky="w", padx=(8, 0), pady=6
         )
 
-        genart_hint_row = ttk.Frame(article_frame)
+        genart_hint_row = ttk.Frame(self.article_content_frame)
         genart_hint_row.grid(row=4, column=0, columnspan=3, sticky="ew")
         genart_hint_row.columnconfigure(0, weight=1)
         ttk.Label(genart_hint_row, textvariable=self.genart_suggestion_var, foreground="#5E6472", wraplength=420).grid(
@@ -3767,14 +4337,14 @@ class ApolloImportApp:
             row=0, column=1, padx=(8, 0)
         )
 
-        kunzer_row = ttk.Frame(article_frame)
+        kunzer_row = ttk.Frame(self.article_content_frame)
         kunzer_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Button(kunzer_row, text="Aus Kunzer per Artikelnummer laden", command=self.load_from_kunzer_article_number).grid(
             row=0, column=0, padx=(0, 8)
         )
         ttk.Button(kunzer_row, text="Aus Kunzer per URL laden", command=self.load_from_kunzer_url).grid(row=0, column=1)
 
-        options_row = ttk.Frame(article_frame)
+        options_row = ttk.Frame(self.article_content_frame)
         options_row.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
             options_row,
@@ -3782,12 +4352,13 @@ class ApolloImportApp:
             variable=self.auto_translate_after_scrape_var,
         ).grid(row=0, column=0)
 
-        button_row = ttk.Frame(article_frame)
+        button_row = ttk.Frame(self.article_content_frame)
         button_row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Button(button_row, text="Beispiel laden", command=self.load_demo_data).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_row, text="Artikelliste aktualisieren", command=self.refresh_preview).grid(row=0, column=1)
 
-        export_frame = ttk.LabelFrame(self.project_tab, text="Export", padding=14)
+        self.export_frame = ttk.LabelFrame(self.project_tab, text="Export", padding=14)
+        export_frame = self.export_frame
         export_frame.grid(row=1, column=1, rowspan=2, sticky="nsew", pady=(14, 0), padx=(9, 0))
         export_frame.columnconfigure(0, weight=1)
 
@@ -3838,60 +4409,71 @@ class ApolloImportApp:
             foreground="#5E6472",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        deepl_frame = ttk.LabelFrame(self.project_tab, text="APIs", padding=14)
+        self.deepl_frame = ttk.LabelFrame(self.project_tab, text="APIs", padding=14)
+        deepl_frame = self.deepl_frame
         deepl_frame.grid(row=2, column=0, sticky="ew", pady=(14, 0), padx=(0, 9))
-        deepl_frame.columnconfigure(1, weight=1)
+        deepl_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(deepl_frame, text="DeepL", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        deepl_header = ttk.Frame(deepl_frame)
+        deepl_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        deepl_header.columnconfigure(0, weight=1)
+        ttk.Label(deepl_header, text="DeepL und Google Lens Einstellungen", foreground="#5E6472").grid(row=0, column=0, sticky="w")
+        ttk.Button(deepl_header, textvariable=self.api_section_toggle_var, command=self._toggle_api_section).grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(deepl_frame, text="API Key").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(deepl_frame, textvariable=self.deepl_api_key_var, show="*", width=60).grid(row=1, column=1, sticky="ew", pady=6)
+        self.deepl_content_frame = ttk.Frame(deepl_frame)
+        self.deepl_content_frame.grid(row=1, column=0, sticky="ew")
+        self.deepl_content_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(deepl_frame, text="Base URL").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(deepl_frame, textvariable=self.deepl_base_url_var).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Label(self.deepl_content_frame, text="DeepL", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        ttk.Label(self.deepl_content_frame, text="API Key").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(self.deepl_content_frame, textvariable=self.deepl_api_key_var, show="*", width=60).grid(row=1, column=1, sticky="ew", pady=6)
+
+        ttk.Label(self.deepl_content_frame, text="Base URL").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(self.deepl_content_frame, textvariable=self.deepl_base_url_var).grid(row=2, column=1, sticky="ew", pady=6)
         ttk.Label(
-            deepl_frame,
+            self.deepl_content_frame,
             text="Pro: https://api.deepl.com  |  Free: https://api-free.deepl.com",
             foreground="#5E6472",
         ).grid(row=2, column=2, sticky="w", padx=(10, 0), pady=6)
 
-        deepl_actions = ttk.Frame(deepl_frame)
+        deepl_actions = ttk.Frame(self.deepl_content_frame)
         deepl_actions.grid(row=3, column=1, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(deepl_actions, text="Kurzbezeichnung uebersetzen", command=self.translate_short_texts).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(deepl_actions, text="Text uebersetzen", command=self.translate_long_texts).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(deepl_actions, text="Alles uebersetzen", command=self.translate_all_texts).grid(row=0, column=2)
 
         ttk.Label(
-            deepl_frame,
+            self.deepl_content_frame,
             text="Die Uebersetzung laeuft jeweils aus dem deutschen Feld in EN, CZ, FR, IT und NL. UNI bleibt an Deutsch gekoppelt.",
             foreground="#5E6472",
-            wraplength=1100,
+            wraplength=1000,
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        ttk.Separator(deepl_frame, orient="horizontal").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(14, 12))
+        ttk.Separator(self.deepl_content_frame, orient="horizontal").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(14, 12))
 
-        ttk.Label(deepl_frame, text="Google Lens", font=("Segoe UI Semibold", 10)).grid(row=6, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(self.deepl_content_frame, text="Google Lens", font=("Segoe UI Semibold", 10)).grid(row=6, column=0, sticky="w", pady=(0, 4))
         ttk.Checkbutton(
-            deepl_frame,
+            self.deepl_content_frame,
             text="Google Lens ohne API-Key fuer GenArt verwenden (inoffiziell)",
             variable=self.google_lens_enabled_var,
         ).grid(row=6, column=1, sticky="w", pady=(0, 4))
 
         ttk.Label(
-            deepl_frame,
+            self.deepl_content_frame,
             text=(
                 "Wenn aktiviert, nutzt die GenArt-Vorschlagslogik einen inoffiziellen Google-Lens-Browserabruf ohne API-Key. "
                 "Dabei werden sichtbare Treffertexte und Seiten aus den Lens-Ergebnissen als zusaetzliches Signal fuer die GenArt-Suche verwendet. "
                 "Das ist absichtlich als experimenteller Weg zu verstehen und kann sich durch Google-Aenderungen jederzeit veraendern."
             ),
             foreground="#5E6472",
-            wraplength=1100,
+            wraplength=1000,
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        browser_frame = ttk.LabelFrame(self.project_tab, text="Artikelverzeichnis", padding=14)
+        self.browser_frame = ttk.LabelFrame(self.project_tab, text="Artikelverzeichnis", padding=14)
+        browser_frame = self.browser_frame
         browser_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(14, 0))
-        browser_frame.columnconfigure(0, weight=2)
-        browser_frame.columnconfigure(1, weight=1)
+        browser_frame.columnconfigure(0, weight=1)
         browser_frame.rowconfigure(1, weight=1)
 
         browser_header = ttk.Frame(browser_frame)
@@ -3903,14 +4485,24 @@ class ApolloImportApp:
             foreground="#5E6472",
             wraplength=900,
         ).grid(row=0, column=0, sticky="w")
-        ttk.Button(browser_header, text="Ausgewaehlten Artikel laden", command=self.load_selected_article_from_browser).grid(
+        ttk.Button(browser_header, textvariable=self.article_browser_toggle_var, command=self._toggle_article_browser_section).grid(
             row=0, column=1, padx=(12, 8)
         )
-        ttk.Button(browser_header, text="Liste aktualisieren", command=self.refresh_preview).grid(row=0, column=2)
+        ttk.Button(browser_header, text="Ausgewaehlten Artikel laden", command=self.load_selected_article_from_browser).grid(
+            row=0, column=2, padx=(0, 8)
+        )
+        ttk.Button(browser_header, text="Liste aktualisieren", command=self.refresh_preview).grid(row=0, column=3)
 
         columns = ("article", "source", "short_id", "long_id", "genart", "images", "documents", "videos", "links")
-        browser_table_frame = ttk.Frame(browser_frame)
-        browser_table_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        self.browser_content_frame = ttk.Frame(browser_frame)
+        self.browser_content_frame.grid(row=1, column=0, sticky="nsew")
+        self.browser_content_frame.columnconfigure(0, weight=1)
+        self.browser_content_frame.columnconfigure(1, weight=1)
+        self.browser_content_frame.rowconfigure(0, weight=1)
+
+        browser_table_frame = ttk.Frame(self.browser_content_frame)
+        self.browser_table_frame = browser_table_frame
+        browser_table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         browser_table_frame.columnconfigure(0, weight=1)
         browser_table_frame.rowconfigure(0, weight=1)
 
@@ -3952,8 +4544,9 @@ class ApolloImportApp:
         browser_scrollbar.grid(row=0, column=1, sticky="ns")
         self.article_browser_tree.configure(yscrollcommand=browser_scrollbar.set)
 
-        detail_frame = ttk.LabelFrame(browser_frame, text="Exportdaten", padding=10)
-        detail_frame.grid(row=1, column=1, sticky="nsew")
+        detail_frame = ttk.LabelFrame(self.browser_content_frame, text="Exportdaten", padding=10)
+        self.article_detail_frame = detail_frame
+        detail_frame.grid(row=0, column=1, sticky="nsew")
         detail_frame.columnconfigure(0, weight=1)
         detail_frame.rowconfigure(1, weight=1)
 
@@ -3967,6 +4560,12 @@ class ApolloImportApp:
         self.article_browser_detail = ScrolledText(detail_frame, wrap="word", height=16, font=("Consolas", 9))
         self.article_browser_detail.grid(row=1, column=0, sticky="nsew")
         self.article_browser_detail.configure(state="disabled")
+        self.project_tab.bind("<Configure>", self._handle_project_tab_resize)
+        self.browser_content_frame.bind("<Configure>", self._handle_article_browser_resize)
+        self._apply_article_section_visibility()
+        self._apply_api_section_visibility()
+        self._apply_article_browser_visibility()
+        self._schedule_project_tab_layout()
 
     def _build_short_tab(self) -> None:
         self.short_tab.columnconfigure(0, weight=1)

@@ -45,6 +45,8 @@ Alternativ unter Windows:
 - Vorhandene Artikel aus den Output-Dateien in einem Artikelverzeichnis erneut aufrufen
 - Bild-, PDF- und Web-Vorschauen werden zwischengespeichert, damit wiederholtes Oeffnen spuerbar schneller ist
 - Die GUI merkt sich beim Beenden ihren letzten Zustand, inklusive Pfaden, Optionen, aktuellem Artikel, Texten, Medien und geoeffnetem Tab
+- Ueber `Nach Updates suchen` kann die App auf GitHub nach einem neueren Release schauen und in der gebauten EXE die neue Version direkt herunterladen und starten
+- Die Projektansicht passt sich auf kleineren Displays automatisch an; grosse Bereiche und Vorschauen koennen eingeklappt werden
 
 ## Kunzer Import
 
@@ -167,3 +169,21 @@ Im festen Ausgabeordner bleiben die sieben Exportdateien bestehen. Neue Artikel 
 Bei einer neuen Artikelnummer werden die `Text Modul ID`s automatisch im bestehenden 6-stelligen Format erzeugt und gegen vorhandene IDs geprueft. Bestehende Artikel behalten ihre bereits gespeicherten IDs.
 
 Die Output-Dateien dienen dabei als Live-Datenbank: Aenderungen an Texten, Bildern, Dokumenten, Videos und Links werden aus der GUI direkt in diese Excel-Dateien zurueckgeschrieben.
+
+## Kompaktlayout
+
+Die GUI ist jetzt auf kleinere Displays wie 14-Zoll-Laptops ausgelegt:
+
+- im Projekt-Tab werden `Artikel`, `Export`, `APIs` und `Artikelverzeichnis` bei schmalerer Breite automatisch untereinander angeordnet
+- `Artikel`, `APIs` und `Artikelverzeichnis` koennen direkt eingeklappt und wieder eingeblendet werden
+- die Vorschauen in `Bilder`, `Dokumente`, `Videos` und `Web Links` lassen sich ausblenden und werden bei wenig Breite automatisch unter die Tabelle verschoben
+- diese Sichtbarkeits-Einstellungen werden zusammen mit dem restlichen GUI-Zustand gespeichert
+
+## Updates
+
+Im Projekt-Tab gibt es einen Bereich `App-Update`.
+
+- `Nach Updates suchen` fragt das neueste GitHub-Release des Repositories ab
+- wenn ein neueres Release gefunden wird, laedt die GUI bevorzugt ein `Setup`- oder `onefile`-Paket herunter
+- laeuft die Anwendung bereits als gebaute Windows-EXE, kann sie sich selbst schliessen, die EXE ersetzen und danach automatisch neu starten
+- wenn die GUI aus dem Python-Quellcode gestartet wurde, wird die Release-Datei nur heruntergeladen und der Ordner geoeffnet

@@ -30,7 +30,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Apollo-Import-GUI-v0.1',
+    name='Apollo-Import-GUI-v0.1.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -50,5 +50,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Apollo-Import-GUI-v0.1',
+    name='Apollo-Import-GUI-v0.1.2',
 )
