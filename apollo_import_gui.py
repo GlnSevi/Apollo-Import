@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
@@ -302,6 +302,19 @@ class GenArtOption:
         return self.id
 
 
+@dataclass(frozen=True)
+class GenArtSelection:
+    id: str = ""
+    bezeichnung: str = ""
+
+    def display_label(self) -> str:
+        option_id = self.id.strip()
+        bezeichnung = self.bezeichnung.strip()
+        if option_id and bezeichnung and option_id != bezeichnung:
+            return f"{option_id} | {bezeichnung}"
+        return option_id or bezeichnung
+
+
 @dataclass
 class GenArtSuggestion:
     option: GenArtOption
@@ -363,6 +376,7 @@ class ExportBundle:
     short_auto_uni: bool
     long_texts: TranslationSet
     long_auto_uni: bool
+    genart_selections: list[GenArtSelection] = field(default_factory=list)
     genart_id: str = ""
     genart_bezeichnung: str = ""
     image_rows: list[MediaRow] = field(default_factory=list)
@@ -376,6 +390,22 @@ class ExportBundle:
     include_videos: bool = True
     include_web_links: bool = True
 
+    def __post_init__(self) -> None:
+        self.sync_genart_fields()
+
+    def sync_genart_fields(self) -> None:
+        self.genart_selections = normalize_genart_selections(
+            self.genart_selections,
+            fallback_id=self.genart_id,
+            fallback_bezeichnung=self.genart_bezeichnung,
+        )
+        if self.genart_selections:
+            self.genart_id = self.genart_selections[0].id
+            self.genart_bezeichnung = self.genart_selections[0].bezeichnung
+        else:
+            self.genart_id = ""
+            self.genart_bezeichnung = ""
+
 
 @dataclass
 class StoredArticleSnapshot:
@@ -384,6 +414,7 @@ class StoredArticleSnapshot:
     source_folder: Path
     short_module_id: str = ""
     long_module_id: str = ""
+    genart_selections: list[GenArtSelection] = field(default_factory=list)
     genart_id: str = ""
     genart_bezeichnung: str = ""
     short_texts: TranslationSet = field(default_factory=TranslationSet)
@@ -394,6 +425,87 @@ class StoredArticleSnapshot:
     document_rows: list[MediaRow] = field(default_factory=list)
     video_rows: list[MediaRow] = field(default_factory=list)
     web_rows: list[MediaRow] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.sync_genart_fields()
+
+    def sync_genart_fields(self) -> None:
+        self.genart_selections = normalize_genart_selections(
+            self.genart_selections,
+            fallback_id=self.genart_id,
+            fallback_bezeichnung=self.genart_bezeichnung,
+        )
+        if self.genart_selections:
+            self.genart_id = self.genart_selections[0].id
+            self.genart_bezeichnung = self.genart_selections[0].bezeichnung
+        else:
+            self.genart_id = ""
+            self.genart_bezeichnung = ""
+
+
+def parse_genart_selection_label(raw: str) -> GenArtSelection | None:
+    value = raw.strip()
+    if not value:
+        return None
+    parts = [part.strip() for part in value.split("|") if part.strip()]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return GenArtSelection(id=parts[0], bezeichnung=parts[0])
+    return GenArtSelection(id=parts[0], bezeichnung=parts[-1])
+
+
+def normalize_genart_selections(
+    selections: list[GenArtSelection],
+    fallback_id: str = "",
+    fallback_bezeichnung: str = "",
+) -> list[GenArtSelection]:
+    normalized: list[GenArtSelection] = []
+    seen_keys: set[str] = set()
+    candidates = list(selections)
+    if fallback_id.strip() or fallback_bezeichnung.strip():
+        candidates.append(GenArtSelection(id=fallback_id, bezeichnung=fallback_bezeichnung))
+
+    for candidate in candidates:
+        option_id = candidate.id.strip()
+        bezeichnung = candidate.bezeichnung.strip()
+        if not option_id and not bezeichnung:
+            continue
+        if not bezeichnung:
+            bezeichnung = option_id
+        if not option_id:
+            option_id = bezeichnung
+        dedupe_key = option_id.casefold() or bezeichnung.casefold()
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        normalized.append(GenArtSelection(id=option_id, bezeichnung=bezeichnung))
+    return normalized
+
+
+def summarize_genart_selections(
+    selections: list[GenArtSelection],
+    *,
+    empty_label: str = "-",
+    limit: int = 2,
+) -> str:
+    normalized = normalize_genart_selections(selections)
+    if not normalized:
+        return empty_label
+    labels = [selection.display_label() for selection in normalized]
+    if len(labels) <= limit:
+        return ", ".join(labels)
+    return ", ".join(labels[:limit]) + f" (+{len(labels) - limit} weitere)"
+
+
+def format_genart_selections(label: str, selections: list[GenArtSelection]) -> str:
+    normalized = normalize_genart_selections(selections)
+    if not normalized:
+        return f"{label}: -"
+    lines = [f"{label}:"]
+    for selection in normalized:
+        lines.append(f"- {selection.display_label()}")
+    return "\n".join(lines)
 
 
 def normalize_article_number(value: str) -> str:
@@ -1906,11 +2018,14 @@ def build_short_mapping_export_row(bundle: ExportBundle) -> list[str]:
 
 
 def build_genart_export_rows(bundle: ExportBundle) -> list[list[str]]:
-    genart_id = bundle.genart_id.strip()
-    genart_bezeichnung = bundle.genart_bezeichnung.strip()
-    if not genart_id and not genart_bezeichnung:
-        return []
-    return [[bundle.article_number, genart_id, genart_bezeichnung]]
+    export_rows: list[list[str]] = []
+    for selection in bundle.genart_selections:
+        genart_id = selection.id.strip()
+        genart_bezeichnung = selection.bezeichnung.strip()
+        if not genart_id and not genart_bezeichnung:
+            continue
+        export_rows.append([bundle.article_number, genart_id, genart_bezeichnung])
+    return export_rows
 
 
 def build_image_export_rows(bundle: ExportBundle) -> list[list[str]]:
@@ -2067,7 +2182,7 @@ def build_preview(bundle: ExportBundle) -> str:
         "IDs",
         f"- Kurzbezeichnung: {bundle.short_module_id or '(noch nicht generiert)'}",
         f"- Text: {bundle.long_module_id or '(noch nicht generiert)'}",
-        f"- GenArt: {bundle.genart_id or '(nicht gesetzt)'} {bundle.genart_bezeichnung}".rstrip(),
+        f"- GenArten: {summarize_genart_selections(bundle.genart_selections, empty_label='(nicht gesetzt)', limit=3)}",
         "",
         "Texte",
         f"- Kurzbezeichnung: {bundle.short_texts.populated_count(bundle.short_auto_uni)} / 7 Sprachfelder befuellt",
@@ -2124,7 +2239,7 @@ def format_article_snapshot(snapshot: StoredArticleSnapshot) -> str:
         "",
         f"Kurz-ID: {snapshot.short_module_id or '-'}",
         f"Text-ID: {snapshot.long_module_id or '-'}",
-        f"GenArt: {(snapshot.genart_id + ' | ' + snapshot.genart_bezeichnung).strip(' |') or '-'}",
+        format_genart_selections("GenArten", snapshot.genart_selections),
         "",
         format_translation_set("Kurzbezeichnung", snapshot.short_texts),
         "",
@@ -2194,8 +2309,7 @@ def load_article_snapshots_from_folder(folder: Path, source_label: str) -> dict[
         if not article_number:
             continue
         snapshot = ensure_snapshot(article_number)
-        snapshot.genart_id = row[1].strip()
-        snapshot.genart_bezeichnung = row[2].strip()
+        snapshot.genart_selections.append(GenArtSelection(id=row[1].strip(), bezeichnung=row[2].strip()))
 
     image_rows = read_workbook_rows(folder / IMAGE_FILE[0], IMAGE_FILE[1], len(IMAGE_HEADERS))
     for row in image_rows:
@@ -2224,6 +2338,9 @@ def load_article_snapshots_from_folder(folder: Path, source_label: str) -> dict[
         if not article_number:
             continue
         ensure_snapshot(article_number).web_rows.append(MediaRow(path_or_link=row[1].strip()))
+
+    for snapshot in snapshots.values():
+        snapshot.sync_genart_fields()
 
     return snapshots
 
@@ -2469,7 +2586,9 @@ class MediaTableFrame(ttk.LabelFrame):
         self.inline_editor_column = ""
         self.preview_visible = True
         self.preview_toggle_var = tk.StringVar(value="Vorschau ausblenden")
-        self.compact_preview_layout = False
+        self.compact_preview_layout: bool | None = None
+        self._last_preview_visibility: bool | None = None
+        self._last_path_column_width: int | None = None
         self._layout_after_id: str | None = None
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
@@ -2665,19 +2784,24 @@ class MediaTableFrame(ttk.LabelFrame):
         self._layout_after_id = None
         width = max(self.winfo_width(), self.winfo_reqwidth())
         compact = width < 1220
+        layout_changed = self.compact_preview_layout is None or self.compact_preview_layout != compact or self._last_preview_visibility != self.preview_visible
         self.compact_preview_layout = compact
+        self._last_preview_visibility = self.preview_visible
 
-        if self.preview_visible:
-            if compact:
-                self.preview_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=(0, 0), pady=(12, 0))
+        if layout_changed:
+            if self.preview_visible:
+                if compact:
+                    self.preview_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=(0, 0), pady=(12, 0))
+                else:
+                    self.preview_frame.grid(row=1, column=2, columnspan=1, sticky="nsew", padx=(12, 0), pady=(0, 0))
             else:
-                self.preview_frame.grid(row=1, column=2, columnspan=1, sticky="nsew", padx=(12, 0), pady=(0, 0))
-        else:
-            self.preview_frame.grid_remove()
+                self.preview_frame.grid_remove()
 
         reserved_preview_width = 0 if (compact or not self.preview_visible) else 320
         path_width = max(360, width - reserved_preview_width - 260)
-        self.tree.column("path", width=path_width, anchor="w")
+        if self._last_path_column_width != path_width:
+            self.tree.column("path", width=path_width, anchor="w")
+            self._last_path_column_width = path_width
 
     def _handle_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         selected = self.tree.selection()
@@ -2935,7 +3059,9 @@ class LinkTableFrame(ttk.LabelFrame):
         self.page_title_cache: dict[str, str] = {}
         self.preview_visible = True
         self.preview_toggle_var = tk.StringVar(value="Vorschau ausblenden")
-        self.compact_preview_layout = False
+        self.compact_preview_layout: bool | None = None
+        self._last_preview_visibility: bool | None = None
+        self._last_link_column_width: int | None = None
         self._layout_after_id: str | None = None
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
@@ -3167,19 +3293,24 @@ class LinkTableFrame(ttk.LabelFrame):
         self._layout_after_id = None
         width = max(self.winfo_width(), self.winfo_reqwidth())
         compact = width < 1160
+        layout_changed = self.compact_preview_layout is None or self.compact_preview_layout != compact or self._last_preview_visibility != self.preview_visible
         self.compact_preview_layout = compact
+        self._last_preview_visibility = self.preview_visible
 
-        if self.preview_visible:
-            if compact:
-                self.preview_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=(0, 0), pady=(12, 0))
+        if layout_changed:
+            if self.preview_visible:
+                if compact:
+                    self.preview_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=(0, 0), pady=(12, 0))
+                else:
+                    self.preview_frame.grid(row=1, column=2, columnspan=1, sticky="nsew", padx=(12, 0), pady=(0, 0))
             else:
-                self.preview_frame.grid(row=1, column=2, columnspan=1, sticky="nsew", padx=(12, 0), pady=(0, 0))
-        else:
-            self.preview_frame.grid_remove()
+                self.preview_frame.grid_remove()
 
         reserved_preview_width = 0 if (compact or not self.preview_visible) else 320
         link_width = max(360, width - reserved_preview_width - 40)
-        self.tree.column("link", width=link_width, anchor="w")
+        if self._last_link_column_width != link_width:
+            self.tree.column("link", width=link_width, anchor="w")
+            self._last_link_column_width = link_width
 
     def _update_preview(self, link: str) -> None:
         parsed = urlparse(link)
@@ -3488,6 +3619,7 @@ class ApolloImportApp:
         self.kunzer_product_url_var = tk.StringVar()
         self.genart_display_var = tk.StringVar()
         self.genart_suggestion_var = tk.StringVar(value="Keine GenArt geladen.")
+        self.selected_genart_count_var = tk.StringVar(value="0 GenArten gesetzt")
         self.auto_translate_after_scrape_var = tk.BooleanVar(value=True)
         self.google_lens_enabled_var = tk.BooleanVar(value=True)
         self.fixed_export_path_var = tk.BooleanVar(value=True)
@@ -3512,6 +3644,7 @@ class ApolloImportApp:
         self.article_browser_toggle_var = tk.StringVar()
         self.current_id_article_number = ""
         self.article_browser_records: dict[str, StoredArticleSnapshot] = {}
+        self.selected_genart_selections: list[GenArtSelection] = []
         self.current_kunzer_category_context = ""
         self.google_lens_web_cache: dict[str, GoogleLensWebResult | None] = {}
         self.genart_image_signature_cache: dict[str, ImageSignature | None] = {}
@@ -3523,8 +3656,8 @@ class ApolloImportApp:
         self.article_browser_context_menu: tk.Menu | None = None
         self.background_task_running = False
         self.pending_article_browser_selection = ""
-        self.project_tab_compact_mode = False
-        self.article_browser_compact_mode = False
+        self.project_tab_compact_mode: bool | None = None
+        self.article_browser_compact_mode: bool | None = None
         self._project_layout_after_id: str | None = None
         self._article_browser_layout_after_id: str | None = None
 
@@ -3592,6 +3725,7 @@ class ApolloImportApp:
         self.project_tab = ttk.Frame(self.main_notebook, padding=18)
         self.short_tab = ttk.Frame(self.main_notebook, padding=18)
         self.long_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.genart_tab = ttk.Frame(self.main_notebook, padding=18)
         self.image_tab = ttk.Frame(self.main_notebook, padding=18)
         self.document_tab = ttk.Frame(self.main_notebook, padding=18)
         self.links_tab = ttk.Frame(self.main_notebook, padding=18)
@@ -3599,6 +3733,7 @@ class ApolloImportApp:
         self.main_notebook.add(self.project_tab, text="Projekt")
         self.main_notebook.add(self.short_tab, text="Kurzbezeichnung")
         self.main_notebook.add(self.long_tab, text="Text")
+        self.main_notebook.add(self.genart_tab, text="GenArten")
         self.main_notebook.add(self.image_tab, text="Bilder")
         self.main_notebook.add(self.document_tab, text="Dokumente")
         self.main_notebook.add(self.links_tab, text="Links")
@@ -3606,6 +3741,7 @@ class ApolloImportApp:
         self._build_project_tab()
         self._build_short_tab()
         self._build_long_tab()
+        self._build_genart_tab()
         self._build_media_tabs()
 
         status_bar = ttk.Label(shell, textvariable=self.status_var, anchor="w", foreground="#5E6472")
@@ -3698,6 +3834,30 @@ class ApolloImportApp:
             )
         return rows
 
+    def _genart_selections_to_state(self, selections: list[GenArtSelection]) -> list[dict[str, str]]:
+        return [
+            {
+                "id": selection.id,
+                "bezeichnung": selection.bezeichnung,
+            }
+            for selection in normalize_genart_selections(selections)
+        ]
+
+    def _genart_selections_from_state(self, payload: object) -> list[GenArtSelection]:
+        if not isinstance(payload, list):
+            return []
+        selections: list[GenArtSelection] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            selections.append(
+                GenArtSelection(
+                    id=str(item.get("id", "")),
+                    bezeichnung=str(item.get("bezeichnung", "")),
+                )
+            )
+        return normalize_genart_selections(selections)
+
     def _collect_session_state(self) -> dict[str, object]:
         selected_tab = 0
         try:
@@ -3710,7 +3870,7 @@ class ApolloImportApp:
             selected_browser_article = str(self.article_browser_tree.selection()[0]).strip()
 
         return {
-            "version": 1,
+            "version": 2,
             "window_geometry": self.root.winfo_geometry(),
             "selected_tab": selected_tab,
             "paths": {
@@ -3739,6 +3899,7 @@ class ApolloImportApp:
                 "short_module_id": self.short_module_id_var.get(),
                 "long_module_id": self.long_module_id_var.get(),
                 "kunzer_product_url": self.kunzer_product_url_var.get(),
+                "genart_selections": self._genart_selections_to_state(self.selected_genart_selections),
                 "genart_display": self.genart_display_var.get(),
                 "genart_suggestion": self.genart_suggestion_var.get(),
                 "current_kunzer_category_context": self.current_kunzer_category_context,
@@ -3848,6 +4009,12 @@ class ApolloImportApp:
                 self.short_module_id_var.set(str(article.get("short_module_id", "")))
                 self.long_module_id_var.set(str(article.get("long_module_id", "")))
                 self.kunzer_product_url_var.set(str(article.get("kunzer_product_url", "")))
+                restored_genart_selections = self._genart_selections_from_state(article.get("genart_selections"))
+                if not restored_genart_selections:
+                    legacy_selection = parse_genart_selection_label(str(article.get("genart_display", "")))
+                    if legacy_selection is not None:
+                        restored_genart_selections = [legacy_selection]
+                self._set_selected_genart_selections(restored_genart_selections)
                 self.genart_display_var.set(str(article.get("genart_display", "")))
                 self.genart_suggestion_var.set(str(article.get("genart_suggestion", self.genart_suggestion_var.get())))
                 self.current_kunzer_category_context = str(article.get("current_kunzer_category_context", ""))
@@ -4184,6 +4351,7 @@ if ($copied) {{
         self._project_layout_after_id = None
         width = max(self.project_tab.winfo_width(), self.project_tab.winfo_reqwidth())
         compact = width < 1380
+        layout_changed = self.project_tab_compact_mode is None or self.project_tab_compact_mode != compact
         self.project_tab_compact_mode = compact
 
         self.project_tab.columnconfigure(0, weight=1)
@@ -4191,19 +4359,20 @@ if ($copied) {{
         for row_index in range(0, 6):
             self.project_tab.rowconfigure(row_index, weight=0)
 
-        self.file_frame.grid_configure(row=0, column=0, columnspan=2, sticky="ew")
-        if compact:
-            self.article_frame.grid_configure(row=1, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
-            self.export_frame.grid_configure(row=2, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
-            self.deepl_frame.grid_configure(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(14, 0))
-            self.browser_frame.grid_configure(row=4, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
-            self.project_tab.rowconfigure(4, weight=1)
-        else:
-            self.article_frame.grid_configure(row=1, column=0, columnspan=1, rowspan=1, sticky="new", padx=(0, 9), pady=(14, 0))
-            self.export_frame.grid_configure(row=1, column=1, columnspan=1, rowspan=2, sticky="nsew", padx=(9, 0), pady=(14, 0))
-            self.deepl_frame.grid_configure(row=2, column=0, columnspan=1, sticky="ew", padx=(0, 9), pady=(14, 0))
-            self.browser_frame.grid_configure(row=3, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
-            self.project_tab.rowconfigure(3, weight=1)
+        if layout_changed:
+            self.file_frame.grid_configure(row=0, column=0, columnspan=2, sticky="ew")
+            if compact:
+                self.article_frame.grid_configure(row=1, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
+                self.export_frame.grid_configure(row=2, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
+                self.deepl_frame.grid_configure(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(14, 0))
+                self.browser_frame.grid_configure(row=4, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
+                self.project_tab.rowconfigure(4, weight=1)
+            else:
+                self.article_frame.grid_configure(row=1, column=0, columnspan=1, rowspan=1, sticky="new", padx=(0, 9), pady=(14, 0))
+                self.export_frame.grid_configure(row=1, column=1, columnspan=1, rowspan=2, sticky="nsew", padx=(9, 0), pady=(14, 0))
+                self.deepl_frame.grid_configure(row=2, column=0, columnspan=1, sticky="ew", padx=(0, 9), pady=(14, 0))
+                self.browser_frame.grid_configure(row=3, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
+                self.project_tab.rowconfigure(3, weight=1)
 
         self._schedule_article_browser_layout()
 
@@ -4225,6 +4394,7 @@ if ($copied) {{
 
         width = max(self.browser_content_frame.winfo_width(), self.browser_content_frame.winfo_reqwidth())
         compact = self.project_tab_compact_mode or width < 1320
+        layout_changed = self.article_browser_compact_mode is None or self.article_browser_compact_mode != compact
         self.article_browser_compact_mode = compact
 
         self.browser_content_frame.columnconfigure(0, weight=1)
@@ -4232,12 +4402,13 @@ if ($copied) {{
         self.browser_content_frame.rowconfigure(0, weight=1)
         self.browser_content_frame.rowconfigure(1, weight=0)
 
-        if compact:
-            self.browser_table_frame.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 0), pady=(0, 12))
-            self.article_detail_frame.grid_configure(row=1, column=0, sticky="nsew", padx=(0, 0), pady=(0, 0))
-        else:
-            self.browser_table_frame.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 14), pady=(0, 0))
-            self.article_detail_frame.grid_configure(row=0, column=1, sticky="nsew", padx=(0, 0), pady=(0, 0))
+        if layout_changed:
+            if compact:
+                self.browser_table_frame.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 0), pady=(0, 12))
+                self.article_detail_frame.grid_configure(row=1, column=0, sticky="nsew", padx=(0, 0), pady=(0, 0))
+            else:
+                self.browser_table_frame.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 14), pady=(0, 0))
+                self.article_detail_frame.grid_configure(row=0, column=1, sticky="nsew", padx=(0, 0), pady=(0, 0))
 
     def _build_project_tab(self) -> None:
         self.project_tab.columnconfigure(0, weight=1)
@@ -4313,39 +4484,15 @@ if ($copied) {{
         kunzer_url_entry.grid(row=2, column=1, sticky="ew", pady=6)
         kunzer_url_entry.bind("<FocusOut>", self._on_live_field_focus_out)
 
-        ttk.Label(self.article_content_frame, text="GenArt").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
-        self.genart_combo = ttk.Combobox(self.article_content_frame, textvariable=self.genart_display_var)
-        self.genart_combo.grid(row=3, column=1, sticky="ew", pady=6)
-        self.genart_combo.bind("<<ComboboxSelected>>", lambda _event: self._write_live_section("genart"))
-        self.genart_combo.bind("<KeyRelease>", self._on_genart_key_release)
-        self.genart_combo.bind("<Return>", self._on_genart_return)
-        self.genart_combo.bind("<FocusIn>", self._on_genart_focus_in)
-        self.genart_combo.bind("<FocusOut>", self._on_genart_focus_out)
-        self.genart_combo.bind("<Control-f>", self._open_genart_search_dialog_event)
-        self.genart_combo.bind("<F4>", self._open_genart_search_dialog_event)
-        ttk.Button(self.article_content_frame, text="Suchen...", command=self._open_genart_search_dialog).grid(
-            row=3, column=2, sticky="w", padx=(8, 0), pady=6
-        )
-
-        genart_hint_row = ttk.Frame(self.article_content_frame)
-        genart_hint_row.grid(row=4, column=0, columnspan=3, sticky="ew")
-        genart_hint_row.columnconfigure(0, weight=1)
-        ttk.Label(genart_hint_row, textvariable=self.genart_suggestion_var, foreground="#5E6472", wraplength=420).grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Button(genart_hint_row, text="GenArt vorschlagen", command=self.suggest_genart_for_current_article).grid(
-            row=0, column=1, padx=(8, 0)
-        )
-
         kunzer_row = ttk.Frame(self.article_content_frame)
-        kunzer_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        kunzer_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Button(kunzer_row, text="Aus Kunzer per Artikelnummer laden", command=self.load_from_kunzer_article_number).grid(
             row=0, column=0, padx=(0, 8)
         )
         ttk.Button(kunzer_row, text="Aus Kunzer per URL laden", command=self.load_from_kunzer_url).grid(row=0, column=1)
 
         options_row = ttk.Frame(self.article_content_frame)
-        options_row.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        options_row.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
             options_row,
             text="Nach dem Laden automatisch mit DeepL uebersetzen",
@@ -4353,7 +4500,7 @@ if ($copied) {{
         ).grid(row=0, column=0)
 
         button_row = ttk.Frame(self.article_content_frame)
-        button_row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        button_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Button(button_row, text="Beispiel laden", command=self.load_demo_data).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_row, text="Artikelliste aktualisieren", command=self.refresh_preview).grid(row=0, column=1)
 
@@ -4518,7 +4665,7 @@ if ($copied) {{
         self.article_browser_tree.heading("source", text="Quelle")
         self.article_browser_tree.heading("short_id", text="Kurz-ID")
         self.article_browser_tree.heading("long_id", text="Text-ID")
-        self.article_browser_tree.heading("genart", text="GenArt")
+        self.article_browser_tree.heading("genart", text="GenArten")
         self.article_browser_tree.heading("images", text="Bilder")
         self.article_browser_tree.heading("documents", text="Dokumente")
         self.article_browser_tree.heading("videos", text="Videos")
@@ -4587,6 +4734,76 @@ if ($copied) {{
             on_change=lambda: self._write_live_section("long_text"),
         )
         self.long_text_frame.grid(row=0, column=0, sticky="nsew")
+
+    def _build_genart_tab(self) -> None:
+        self.genart_tab.columnconfigure(0, weight=1)
+        self.genart_tab.rowconfigure(0, weight=1)
+
+        genart_frame = ttk.LabelFrame(self.genart_tab, text="GenArten pro Artikel", padding=14)
+        genart_frame.grid(row=0, column=0, sticky="nsew")
+        genart_frame.columnconfigure(0, weight=1)
+        genart_frame.rowconfigure(3, weight=1)
+
+        header = ttk.Frame(genart_frame)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(
+            header,
+            text="Mehrere GenArten koennen pro Artikel gesetzt und gemeinsam exportiert werden.",
+            foreground="#5E6472",
+            wraplength=920,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.selected_genart_count_var, foreground="#5E6472").grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        input_row = ttk.Frame(genart_frame)
+        input_row.grid(row=1, column=0, sticky="ew")
+        input_row.columnconfigure(1, weight=1)
+        ttk.Label(input_row, text="GenArt").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        self.genart_combo = ttk.Combobox(input_row, textvariable=self.genart_display_var)
+        self.genart_combo.grid(row=0, column=1, sticky="ew", pady=6)
+        self.genart_combo.bind("<<ComboboxSelected>>", lambda _event: self.add_current_genart_selection())
+        self.genart_combo.bind("<KeyRelease>", self._on_genart_key_release)
+        self.genart_combo.bind("<Return>", self._on_genart_return)
+        self.genart_combo.bind("<FocusIn>", self._on_genart_focus_in)
+        self.genart_combo.bind("<FocusOut>", self._on_genart_focus_out)
+        self.genart_combo.bind("<Control-f>", self._open_genart_search_dialog_event)
+        self.genart_combo.bind("<F4>", self._open_genart_search_dialog_event)
+        ttk.Button(input_row, text="Hinzufuegen", command=self.add_current_genart_selection).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=6)
+        ttk.Button(input_row, text="Suchen...", command=self._open_genart_search_dialog).grid(row=0, column=3, sticky="w", padx=(8, 0), pady=6)
+
+        hint_row = ttk.Frame(genart_frame)
+        hint_row.grid(row=2, column=0, sticky="ew")
+        hint_row.columnconfigure(0, weight=1)
+        ttk.Label(hint_row, textvariable=self.genart_suggestion_var, foreground="#5E6472", wraplength=840).grid(row=0, column=0, sticky="w")
+        ttk.Button(hint_row, text="GenArt vorschlagen", command=self.suggest_genart_for_current_article).grid(row=0, column=1, padx=(8, 0))
+
+        table_frame = ttk.Frame(genart_frame)
+        table_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+        self.selected_genart_tree = ttk.Treeview(
+            table_frame,
+            columns=("id", "bezeichnung"),
+            show="headings",
+            height=10,
+            selectmode="extended",
+        )
+        self.selected_genart_tree.grid(row=0, column=0, sticky="nsew")
+        self.selected_genart_tree.heading("id", text="GenArt ID")
+        self.selected_genart_tree.heading("bezeichnung", text="GenArt Bezeichnung")
+        self.selected_genart_tree.column("id", width=160, anchor="w")
+        self.selected_genart_tree.column("bezeichnung", width=700, anchor="w")
+        self.selected_genart_tree.bind("<Delete>", self._remove_selected_genarts_event)
+
+        tree_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.selected_genart_tree.yview)
+        tree_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.selected_genart_tree.configure(yscrollcommand=tree_scrollbar.set)
+
+        action_row = ttk.Frame(genart_frame)
+        action_row.grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(action_row, text="Auswahl entfernen", command=self.remove_selected_genarts).grid(row=0, column=0)
+        ttk.Button(action_row, text="Alle GenArten entfernen", command=self.clear_selected_genarts).grid(row=0, column=1, padx=(8, 0))
 
     def _build_media_tabs(self) -> None:
         self.image_tab.columnconfigure(0, weight=1)
@@ -4690,7 +4907,12 @@ if ($copied) {{
             self.genart_registry = GenArtRegistry()
             self.genart_image_index_dirty = True
             self.genart_count_var.set("0 GenArts geladen")
-            self.genart_suggestion_var.set("Keine GenArt-Datei geladen.")
+            if self.selected_genart_selections:
+                self.genart_suggestion_var.set(
+                    f"Gesetzte GenArten: {summarize_genart_selections(self.selected_genart_selections, empty_label='-', limit=3)}"
+                )
+            else:
+                self.genart_suggestion_var.set("Keine GenArt-Datei geladen.")
             if hasattr(self, "genart_combo"):
                 self.genart_combo.configure(values=[])
             if not initial and source_path is not None:
@@ -4702,7 +4924,12 @@ if ($copied) {{
         except Exception as exc:
             self.genart_image_index_dirty = True
             self.genart_count_var.set("0 GenArts geladen")
-            self.genart_suggestion_var.set("GenArt-Datei konnte nicht geladen werden.")
+            if self.selected_genart_selections:
+                self.genart_suggestion_var.set(
+                    f"Gesetzte GenArten: {summarize_genart_selections(self.selected_genart_selections, empty_label='-', limit=3)}"
+                )
+            else:
+                self.genart_suggestion_var.set("GenArt-Datei konnte nicht geladen werden.")
             if hasattr(self, "genart_combo"):
                 self.genart_combo.configure(values=[])
             if not initial:
@@ -4711,11 +4938,17 @@ if ($copied) {{
 
         self.genart_count_var.set(f"{count} GenArts geladen")
         self.genart_image_index_dirty = True
-        self.genart_suggestion_var.set(
-            "GenArt-Katalog geladen. Du kannst im Feld tippen, ueber 'Suchen...' gezielt filtern oder Vorschlaege nutzen."
-        )
         if hasattr(self, "genart_combo"):
             self._refresh_genart_combobox_values()
+        if self.selected_genart_selections:
+            self._set_selected_genart_selections(self.selected_genart_selections)
+            self.genart_suggestion_var.set(
+                f"Gesetzte GenArten: {summarize_genart_selections(self.selected_genart_selections, empty_label='-', limit=3)}"
+            )
+        else:
+            self.genart_suggestion_var.set(
+                "GenArt-Katalog geladen. Du kannst im Feld tippen, ueber 'Suchen...' gezielt filtern oder Vorschlaege nutzen."
+            )
         if self.genart_display_var.get().strip():
             self._normalize_genart_selection()
         if not initial:
@@ -4726,6 +4959,144 @@ if ($copied) {{
             return
         values = self.genart_registry.search_display_values(self.genart_display_var.get(), limit=250)
         self.genart_combo.configure(values=values)
+
+    def _canonicalize_genart_selection(self, selection: GenArtSelection) -> GenArtSelection:
+        option = self.genart_registry.resolve(selection.id) or self.genart_registry.resolve(selection.bezeichnung)
+        if option is not None:
+            return GenArtSelection(id=option.id, bezeichnung=option.bezeichnung)
+        normalized = normalize_genart_selections([selection])
+        return normalized[0] if normalized else GenArtSelection()
+
+    def _refresh_selected_genart_tree(self, selected_indices: set[int] | None = None) -> None:
+        self.selected_genart_count_var.set(f"{len(self.selected_genart_selections)} GenArten gesetzt")
+        if not hasattr(self, "selected_genart_tree"):
+            return
+
+        selected_iids = {str(index) for index in (selected_indices or set())}
+        for item_id in self.selected_genart_tree.get_children():
+            self.selected_genart_tree.delete(item_id)
+
+        for index, selection in enumerate(self.selected_genart_selections):
+            item_id = str(index)
+            self.selected_genart_tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(selection.id, selection.bezeichnung),
+            )
+
+        if selected_iids:
+            existing = [item_id for item_id in selected_iids if self.selected_genart_tree.exists(item_id)]
+            if existing:
+                self.selected_genart_tree.selection_set(existing)
+                self.selected_genart_tree.focus(existing[0])
+
+    def _set_selected_genart_selections(self, selections: list[GenArtSelection], focus_last: bool = False) -> None:
+        canonicalized = [self._canonicalize_genart_selection(selection) for selection in selections]
+        self.selected_genart_selections = normalize_genart_selections(canonicalized)
+        selected_indices = {len(self.selected_genart_selections) - 1} if focus_last and self.selected_genart_selections else set()
+        self._refresh_selected_genart_tree(selected_indices=selected_indices)
+
+    def _get_selected_genart_selections(self) -> list[GenArtSelection]:
+        return list(self.selected_genart_selections)
+
+    def _resolve_current_genart_selection(self, prefer_first_suggestion: bool = False) -> GenArtSelection | None:
+        current_value = self.genart_display_var.get().strip()
+        option = self.genart_registry.resolve(current_value) if current_value else None
+        if option is not None:
+            return GenArtSelection(id=option.id, bezeichnung=option.bezeichnung)
+
+        if current_value:
+            parsed_selection = parse_genart_selection_label(current_value)
+            if parsed_selection is not None and (not self.genart_registry.options or "|" in current_value):
+                return self._canonicalize_genart_selection(parsed_selection)
+
+        if prefer_first_suggestion and hasattr(self, "genart_combo"):
+            values_raw = self.genart_combo.cget("values")
+            values = list(self.root.tk.splitlist(values_raw)) if isinstance(values_raw, str) else list(values_raw)
+            for value in values:
+                option = self.genart_registry.resolve(str(value))
+                if option is not None:
+                    return GenArtSelection(id=option.id, bezeichnung=option.bezeichnung)
+        return None
+
+    def _add_genart_selection(
+        self,
+        selection: GenArtSelection | None,
+        *,
+        write_live: bool = True,
+        suggestion_message: str | None = None,
+    ) -> bool:
+        if selection is None:
+            return False
+
+        normalized = normalize_genart_selections([selection])
+        if not normalized:
+            return False
+
+        canonical = self._canonicalize_genart_selection(normalized[0])
+        if not canonical.display_label():
+            return False
+
+        self.genart_display_var.set(canonical.display_label())
+        selection_key = canonical.id.casefold() or canonical.bezeichnung.casefold()
+        existing_keys = {
+            existing_selection.id.casefold() or existing_selection.bezeichnung.casefold()
+            for existing_selection in self.selected_genart_selections
+        }
+        if selection_key in existing_keys:
+            self.genart_suggestion_var.set(f"GenArt bereits gesetzt: {canonical.display_label()}")
+            return False
+
+        self._set_selected_genart_selections([*self.selected_genart_selections, canonical], focus_last=True)
+        self.genart_suggestion_var.set(suggestion_message or f"GenArt hinzugefuegt: {canonical.display_label()}")
+        if write_live:
+            self._write_live_section("genart")
+        return True
+
+    def add_current_genart_selection(self) -> None:
+        if not self.genart_registry.options:
+            self._load_genart_catalog()
+        selection = self._resolve_current_genart_selection(prefer_first_suggestion=True)
+        if selection is None:
+            self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
+            return
+        self._add_genart_selection(selection)
+
+    def _remove_selected_genarts_event(self, _event: tk.Event[tk.Misc]) -> str:
+        self.remove_selected_genarts()
+        return "break"
+
+    def remove_selected_genarts(self) -> None:
+        if not hasattr(self, "selected_genart_tree"):
+            return
+        selection = list(self.selected_genart_tree.selection())
+        if not selection:
+            return
+
+        remove_indices = sorted(
+            (int(item_id) for item_id in selection if str(item_id).isdigit()),
+            reverse=True,
+        )
+        if not remove_indices:
+            return
+
+        remaining = [
+            genart_selection
+            for index, genart_selection in enumerate(self.selected_genart_selections)
+            if index not in set(remove_indices)
+        ]
+        self._set_selected_genart_selections(remaining)
+        self.genart_suggestion_var.set(f"{len(remove_indices)} GenArt(en) entfernt.")
+        self._write_live_section("genart")
+
+    def clear_selected_genarts(self) -> None:
+        if not self.selected_genart_selections:
+            return
+        self._set_selected_genart_selections([])
+        self.genart_display_var.set("")
+        self.genart_suggestion_var.set("Keine GenArt fuer diesen Artikel gesetzt.")
+        self._write_live_section("genart")
 
     def _open_genart_search_dialog_event(self, _event: tk.Event[tk.Misc]) -> str:
         self._open_genart_search_dialog()
@@ -4744,11 +5115,10 @@ if ($copied) {{
         if selected_option is None:
             return
 
-        self._set_genart_option(selected_option)
-        self.genart_suggestion_var.set(
-            f"GenArt ausgewaehlt: {(selected_option.id + ' | ' + selected_option.bezeichnung).strip(' |')}"
+        self._add_genart_selection(
+            GenArtSelection(id=selected_option.id, bezeichnung=selected_option.bezeichnung),
+            suggestion_message=f"GenArt hinzugefuegt: {selected_option.display_label()}",
         )
-        self._write_live_section("genart")
 
     def _on_genart_focus_in(self, _event: tk.Event[tk.Misc]) -> None:
         self._refresh_genart_combobox_values()
@@ -4759,46 +5129,32 @@ if ($copied) {{
         self._refresh_genart_combobox_values()
 
     def _on_genart_return(self, _event: tk.Event[tk.Misc]) -> str:
-        if self._normalize_genart_selection():
-            self._write_live_section("genart")
-            return "break"
-
-        values_raw = self.genart_combo.cget("values")
-        values = list(self.root.tk.splitlist(values_raw)) if isinstance(values_raw, str) else list(values_raw)
-        if values:
-            self.genart_display_var.set(str(values[0]))
-            self._write_live_section("genart")
+        selection = self._resolve_current_genart_selection(prefer_first_suggestion=True)
+        if selection is not None:
+            self._add_genart_selection(selection)
+        else:
+            self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
         return "break"
 
     def _normalize_genart_selection(self) -> bool:
         current_value = self.genart_display_var.get().strip()
         if not current_value:
             return True
+
         option = self.genart_registry.resolve(current_value)
-        if option is None:
+        if option is not None:
+            self.genart_display_var.set(option.display_label())
+            return True
+
+        parsed_selection = parse_genart_selection_label(current_value)
+        if parsed_selection is None or (self.genart_registry.options and "|" not in current_value):
             self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
             return False
-        self.genart_display_var.set(option.display_label())
+        self.genart_display_var.set(self._canonicalize_genart_selection(parsed_selection).display_label())
         return True
 
     def _get_selected_genart(self) -> GenArtOption | None:
         return self.genart_registry.resolve(self.genart_display_var.get())
-
-    def _get_selected_genart_values(self) -> tuple[str, str]:
-        option = self._get_selected_genart()
-        if option is not None:
-            return option.id, option.bezeichnung
-        raw = self.genart_display_var.get().strip()
-        if not raw:
-            return "", ""
-        if self.genart_registry.options and "|" not in raw:
-            return "", ""
-        parts = [part.strip() for part in raw.split("|") if part.strip()]
-        if not parts:
-            return "", ""
-        if len(parts) == 1:
-            return parts[0], parts[0]
-        return parts[0], parts[-1]
 
     def _set_genart_option(self, option: GenArtOption | None) -> None:
         if option is None:
@@ -4833,18 +5189,21 @@ if ($copied) {{
             if len(references) >= 400:
                 break
             snapshot = self.article_browser_records[article_number]
-            option = self.genart_registry.resolve(snapshot.genart_id) or self.genart_registry.resolve(snapshot.genart_bezeichnung)
-            if option is None or not snapshot.image_rows:
-                continue
-            if references_per_genart.get(option.id, 0) >= 10:
+            if not snapshot.genart_selections or not snapshot.image_rows:
                 continue
 
             for row in snapshot.image_rows[:3]:
                 signature = self._get_image_signature_for_path(row.path_or_link)
                 if signature is None:
                     continue
-                references.append((article_number, option.id, signature))
-                references_per_genart[option.id] = references_per_genart.get(option.id, 0) + 1
+                for selection in snapshot.genart_selections:
+                    option = self.genart_registry.resolve(selection.id) or self.genart_registry.resolve(selection.bezeichnung)
+                    if option is None:
+                        continue
+                    if references_per_genart.get(option.id, 0) >= 10:
+                        continue
+                    references.append((article_number, option.id, signature))
+                    references_per_genart[option.id] = references_per_genart.get(option.id, 0) + 1
                 break
 
         self.genart_image_reference_index = references
@@ -5130,18 +5489,20 @@ if ($copied) {{
         source_label = self._build_genart_source_label(suggestion)
         alternative_labels = ", ".join(candidate.option.display_label() for candidate in suggestions[1:3])
 
-        self._set_genart_option(option)
         message = f"Vorschlag uebernommen: {option.display_label()} ({source_label}, Score {suggestion.total_score:.0f})"
         if suggestion.web_reason:
             message += f" | Google: {suggestion.web_reason}"
         if alternative_labels:
             message += f" | Alternativen: {alternative_labels}"
-        self.genart_suggestion_var.set(message)
-        self._write_live_section("genart")
+        added = self._add_genart_selection(
+            GenArtSelection(id=option.id, bezeichnung=option.bezeichnung),
+            suggestion_message=message,
+        )
+        if not added:
+            self.genart_suggestion_var.set(f"GenArt bereits gesetzt: {option.display_label()}")
 
     def _on_genart_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
-        if self._normalize_genart_selection():
-            self._write_live_section("genart")
+        self._normalize_genart_selection()
 
     def _resolve_output_root(self) -> Path:
         output_root = Path(self.output_dir_var.get().strip())
@@ -5165,6 +5526,7 @@ if ($copied) {{
             source_folder=source_folder,
             short_module_id=bundle.short_module_id,
             long_module_id=bundle.long_module_id,
+            genart_selections=[GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in bundle.genart_selections],
             genart_id=bundle.genart_id,
             genart_bezeichnung=bundle.genart_bezeichnung,
             short_texts=bundle.short_texts,
@@ -5184,6 +5546,7 @@ if ($copied) {{
             source_folder=snapshot.source_folder,
             short_module_id=snapshot.short_module_id,
             long_module_id=snapshot.long_module_id,
+            genart_selections=[GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in snapshot.genart_selections],
             genart_id=snapshot.genart_id,
             genart_bezeichnung=snapshot.genart_bezeichnung,
             short_texts=TranslationSet(**vars(snapshot.short_texts)),
@@ -5214,7 +5577,7 @@ if ($copied) {{
                     snapshot.source_label,
                     snapshot.short_module_id,
                     snapshot.long_module_id,
-                    (snapshot.genart_bezeichnung or snapshot.genart_id),
+                    summarize_genart_selections(snapshot.genart_selections, empty_label="-", limit=2),
                     len(snapshot.image_rows),
                     len(snapshot.document_rows),
                     len(snapshot.video_rows),
@@ -5270,8 +5633,10 @@ if ($copied) {{
             snapshot.short_module_id = bundle.short_module_id
         if bundle.long_module_id:
             snapshot.long_module_id = bundle.long_module_id
+        snapshot.genart_selections = [GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in bundle.genart_selections]
         snapshot.genart_id = bundle.genart_id
         snapshot.genart_bezeichnung = bundle.genart_bezeichnung
+        snapshot.sync_genart_fields()
 
         if section in {"short_text", "all"}:
             snapshot.short_texts = bundle.short_texts
@@ -5282,8 +5647,10 @@ if ($copied) {{
             snapshot.long_auto_uni = bundle.long_auto_uni
             snapshot.long_module_id = bundle.long_module_id
         if section in {"genart", "all"}:
+            snapshot.genart_selections = [GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in bundle.genart_selections]
             snapshot.genart_id = bundle.genart_id
             snapshot.genart_bezeichnung = bundle.genart_bezeichnung
+            snapshot.sync_genart_fields()
         if section in {"images", "all"}:
             snapshot.image_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.image_rows]
         if section in {"documents", "all"}:
@@ -5525,6 +5892,7 @@ if ($copied) {{
             short_auto_uni=True,
             long_texts=long_texts,
             long_auto_uni=True,
+            genart_selections=[GenArtSelection(id=suggested_genart.id, bezeichnung=suggested_genart.bezeichnung)] if suggested_genart else [],
             genart_id=suggested_genart.id if suggested_genart else "",
             genart_bezeichnung=suggested_genart.bezeichnung if suggested_genart else "",
             image_rows=image_rows,
@@ -5564,6 +5932,8 @@ if ($copied) {{
                 TranslationSet(de=result.long_text_de, uni=result.long_text_de),
                 auto_uni=True,
             )
+            self._set_selected_genart_selections([])
+            self.genart_display_var.set("")
             if short_translations:
                 self.short_text_frame.apply_translations(short_translations)
             if long_translations:
@@ -5590,6 +5960,7 @@ if ($copied) {{
             )
             if suggestions and suggestions[0].total_score >= GENART_AUTO_APPLY_MIN_SCORE:
                 suggestion = suggestions[0]
+                self._set_selected_genart_selections([GenArtSelection(id=suggestion.option.id, bezeichnung=suggestion.option.bezeichnung)])
                 self._set_genart_option(suggestion.option)
                 source_label = self._build_genart_source_label(suggestion)
                 self.genart_suggestion_var.set(
@@ -5597,6 +5968,7 @@ if ($copied) {{
                 )
             elif suggestions:
                 suggestion = suggestions[0]
+                self._set_genart_option(suggestion.option)
                 source_label = self._build_genart_source_label(suggestion)
                 self.genart_suggestion_var.set(
                     f"Vorschlag pruefen: {suggestion.option.display_label()} ({source_label}, Score {suggestion.total_score:.0f})"
@@ -5875,6 +6247,8 @@ if ($copied) {{
             self.current_kunzer_category_context = ""
             self.article_number_var.set("WK DEMO-1000")
             self._ensure_ids_for_article(self.article_number_var.get())
+            self._set_selected_genart_selections([])
+            self.genart_display_var.set("")
             self.short_text_frame.set_value(
                 TranslationSet(
                     de="Hydraulischer Demo-Heber 10 t",
@@ -5973,14 +6347,11 @@ if ($copied) {{
         self.short_module_id_var.set(snapshot.short_module_id)
         self.long_module_id_var.set(snapshot.long_module_id)
         self.id_registry.remember_article_ids(snapshot.article_number, snapshot.short_module_id, snapshot.long_module_id)
-        resolved_genart = self.genart_registry.resolve(snapshot.genart_id) or self.genart_registry.resolve(snapshot.genart_bezeichnung)
-        if resolved_genart is not None:
-            self._set_genart_option(resolved_genart)
-        else:
-            self.genart_display_var.set((snapshot.genart_id + " | " + snapshot.genart_bezeichnung).strip(" |"))
-        if snapshot.genart_id or snapshot.genart_bezeichnung:
+        self._set_selected_genart_selections(snapshot.genart_selections)
+        self.genart_display_var.set("")
+        if snapshot.genart_selections:
             self.genart_suggestion_var.set(
-                f"Gespeicherte GenArt: {(snapshot.genart_id + ' | ' + snapshot.genart_bezeichnung).strip(' |')}"
+                f"Gespeicherte GenArten: {summarize_genart_selections(snapshot.genart_selections, empty_label='-', limit=3)}"
             )
         else:
             self.genart_suggestion_var.set("Keine GenArt fuer diesen Artikel gespeichert.")
@@ -6106,7 +6477,6 @@ if ($copied) {{
             raise ValueError("Bitte eine Artikelnummer eingeben.")
 
         short_module_id, long_module_id = self._ensure_ids_for_article(article_number)
-        selected_genart_id, selected_genart_bezeichnung = self._get_selected_genart_values()
 
         return ExportBundle(
             article_number=article_number,
@@ -6116,8 +6486,7 @@ if ($copied) {{
             short_auto_uni=self.short_text_frame.auto_uni_var.get(),
             long_texts=self.long_text_frame.get_value(),
             long_auto_uni=self.long_text_frame.auto_uni_var.get(),
-            genart_id=selected_genart_id,
-            genart_bezeichnung=selected_genart_bezeichnung,
+            genart_selections=self._get_selected_genart_selections(),
             image_rows=self.image_frame.get_rows(),
             document_rows=self.document_frame.get_rows(),
             video_rows=self.video_frame.get_rows(),

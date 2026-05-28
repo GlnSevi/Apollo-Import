@@ -31,7 +31,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Apollo-Import-GUI-v0.1.2-onefile',
+    name='Apollo-Import-GUI-v0.1.3-onefile',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
