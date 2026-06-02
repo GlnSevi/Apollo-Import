@@ -18,6 +18,7 @@ import tempfile
 import threading
 import sys
 import tkinter as tk
+import unicodedata
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
@@ -47,11 +48,14 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
 DEFAULT_GENART_SOURCE = Path(r"C:\Users\heimbuchner\Downloads\Genarten.xlsx")
+DEFAULT_COMPETITOR_SOURCE = Path(r"C:\Users\heimbuchner\Downloads\KHer.csv")
+DEFAULT_ATTRIBUTE_SOURCE = Path(r"G:\Apollo\Export aus SQL\Attribute alle.xlsx")
+DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE = Path("G:/Apollo/Export aus SQL/Schl\u00fcsselwerte.xlsx")
 DEEPL_DEFAULT_BASE_URL = "https://api.deepl.com"
 ID_ALPHABET = string.ascii_uppercase + string.digits
 ID_LENGTH = 6
@@ -70,6 +74,23 @@ SHORT_TEXT_UMLAUT_REPLACEMENTS = str.maketrans(
         "ß": "ss",
     }
 )
+LOOKUP_TEXT_REPLACEMENTS = (
+    ("\u00c3\u00a4", "ae"),
+    ("\u00c3\u00b6", "oe"),
+    ("\u00c3\u00bc", "ue"),
+    ("\u00c3\u0084", "Ae"),
+    ("\u00c3\u0096", "Oe"),
+    ("\u00c3\u009c", "Ue"),
+    ("\u00c3\u009f", "ss"),
+    ("\u00e4", "ae"),
+    ("\u00f6", "oe"),
+    ("\u00fc", "ue"),
+    ("\u00c4", "Ae"),
+    ("\u00d6", "Oe"),
+    ("\u00dc", "Ue"),
+    ("\u00df", "ss"),
+)
+ATTRIBUTE_KEY_VALUE_FORMAT_KEYS = {"schluesselwert"}
 SESSION_STATE_FILE = Path.cwd() / "apollo_import_gui_state.json"
 APP_ICON_PNG_RELATIVE_PATH = Path("assets") / "apollo_import_logo.png"
 APP_ICON_ICO_RELATIVE_PATH = Path("assets") / "apollo_import_logo.ico"
@@ -107,6 +128,9 @@ DOCUMENT_FILE = ("Dokumente.xlsx", "Sheet1")
 VIDEO_FILE = ("Videos.xlsx", "Tabelle1")
 WEB_LINK_FILE = ("Web Link.xlsx", "Tabelle1")
 GENART_FILE = ("GenArt_Artikel.xlsx", "GenArt")
+OE_FILE = ("OE-Nummern.xlsx", "Sheet1")
+COMPARISON_FILE = ("Vergleichsnummern.xlsx", "Sheet1")
+ATTRIBUTE_FILE = ("Attribute.xlsx", "Sheet1")
 
 IMAGE_HEADERS = ["Artikelnummer", "BILDPFAD", "Art", "Sprache", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
 DOCUMENT_HEADERS = ["Artikelnummer", "Pfad zum Dokument", "Sprache", "Art", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
@@ -114,6 +138,9 @@ VIDEO_HEADERS = ["Produktnummer", "Link", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WR
 WEB_HEADERS = ["Artikelnummer ", "Link", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
 SHORT_MAPPING_HEADERS = ["Artikelnummer", "Text Modul ID", LAST_WRITTEN_HEADER]
 GENART_HEADERS = ["Artikelnummer", "GenArt ID", "GenArt Bezeichnung", LAST_WRITTEN_HEADER]
+OE_HEADERS = ["Artikelnummer", "TecDoc ID", "OE-Nummer", LAST_WRITTEN_HEADER]
+COMPARISON_HEADERS = ["Artikelnummer", "TecDoc ID", "Mitbewerber ID", "Vergleichsnummer", LAST_WRITTEN_HEADER]
+ATTRIBUTE_HEADERS = ["Artikelnummer", "TecDoc Kriterien ID", "Attribut Bezeichnung", "Format", "Wert", LAST_WRITTEN_HEADER]
 CSV_ARTICLE_HEADER_ALIASES = {
     "artikelnummer",
     "artikelnr",
@@ -279,6 +306,133 @@ class MediaRow:
 
 
 @dataclass(frozen=True)
+class OeNumberRow:
+    value: str = ""
+
+
+@dataclass(frozen=True)
+class ComparisonNumberRow:
+    competitor_id: str = ""
+    competitor_code: str = ""
+    competitor_name: str = ""
+    reference_number: str = ""
+
+    def display_competitor_label(self) -> str:
+        parts = [self.competitor_id.strip(), self.competitor_code.strip(), self.competitor_name.strip()]
+        return " | ".join(part for part in parts if part) or "-"
+
+
+@dataclass(frozen=True)
+class CompetitorOption:
+    competitor_id: str
+    code: str = ""
+    name: str = ""
+
+    @property
+    def search_blob(self) -> str:
+        return " ".join(part for part in [self.competitor_id, self.code, self.name] if part).casefold()
+
+    def display_label(self) -> str:
+        parts = [self.competitor_id.strip(), self.code.strip(), self.name.strip()]
+        return " | ".join(part for part in parts if part)
+
+
+@dataclass(frozen=True)
+class AttributeOption:
+    criteria_id: str
+    label: str = ""
+    value_format: str = ""
+    max_length: int | None = None
+    source: str = ""
+    type_name: str = ""
+
+    @property
+    def search_blob(self) -> str:
+        return " ".join(
+            part
+            for part in [
+                self.criteria_id,
+                self.label,
+                self.value_format,
+                self.source,
+                self.type_name,
+            ]
+            if part
+        ).casefold()
+
+    def display_label(self) -> str:
+        parts = [self.criteria_id.strip(), self.label.strip()]
+        return " | ".join(part for part in parts if part) or self.criteria_id
+
+    def format_summary(self) -> str:
+        details = [self.value_format.strip() or "-"]
+        if self.max_length is not None:
+            details.append(f"max. {self.max_length}")
+        return " | ".join(details)
+
+    def key_value_group_candidates(self) -> list[str]:
+        candidates: list[str] = []
+        for value in [self.type_name.strip(), self.label.strip()]:
+            if not value:
+                continue
+            normalized = normalize_attribute_key_value_group(value)
+            if normalized in candidates:
+                continue
+            candidates.append(normalized)
+        return candidates
+
+
+@dataclass(frozen=True)
+class AttributeKeyValueOption:
+    key_value_id: str
+    label: str = ""
+    attribute_group: str = ""
+    source: str = ""
+
+    @property
+    def search_blob(self) -> str:
+        return " ".join(
+            part
+            for part in [self.key_value_id, self.label, self.attribute_group, self.source]
+            if part
+        ).casefold()
+
+    def display_label(self) -> str:
+        parts = [self.key_value_id.strip(), self.label.strip()]
+        return " | ".join(part for part in parts if part) or self.key_value_id
+
+
+@dataclass(frozen=True)
+class AttributeRow:
+    criteria_id: str = ""
+    label: str = ""
+    value_format: str = ""
+    max_length: int | None = None
+    type_name: str = ""
+    value: str = ""
+
+    def display_label(self) -> str:
+        parts = [self.criteria_id.strip(), self.label.strip()]
+        return " | ".join(part for part in parts if part) or "-"
+
+    def display_value(self) -> str:
+        if self.value.strip():
+            return self.value.strip()
+        if self.value_format.strip().casefold() == "kein wert":
+            return "(kein Wert)"
+        return "-"
+
+    def key_value_group_candidates(self) -> list[str]:
+        candidates: list[str] = []
+        for value in [self.type_name.strip(), self.label.strip()]:
+            normalized = normalize_attribute_key_value_group(value)
+            if not normalized or normalized in candidates:
+                continue
+            candidates.append(normalized)
+        return candidates
+
+
+@dataclass(frozen=True)
 class ImageSignature:
     average_hash: int
     difference_hash: int
@@ -383,6 +537,10 @@ class ExportBundle:
     document_rows: list[MediaRow] = field(default_factory=list)
     video_rows: list[MediaRow] = field(default_factory=list)
     web_rows: list[MediaRow] = field(default_factory=list)
+    oe_number_rows: list[OeNumberRow] = field(default_factory=list)
+    comparison_number_rows: list[ComparisonNumberRow] = field(default_factory=list)
+    attribute_rows: list[AttributeRow] = field(default_factory=list)
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] = field(default_factory=dict)
     include_short_text: bool = True
     include_long_text: bool = True
     include_images: bool = True
@@ -392,6 +550,9 @@ class ExportBundle:
 
     def __post_init__(self) -> None:
         self.sync_genart_fields()
+        self.oe_number_rows = normalize_oe_number_rows(self.oe_number_rows)
+        self.comparison_number_rows = normalize_comparison_number_rows(self.comparison_number_rows)
+        self.attribute_rows = normalize_attribute_rows(self.attribute_rows)
 
     def sync_genart_fields(self) -> None:
         self.genart_selections = normalize_genart_selections(
@@ -425,9 +586,15 @@ class StoredArticleSnapshot:
     document_rows: list[MediaRow] = field(default_factory=list)
     video_rows: list[MediaRow] = field(default_factory=list)
     web_rows: list[MediaRow] = field(default_factory=list)
+    oe_number_rows: list[OeNumberRow] = field(default_factory=list)
+    comparison_number_rows: list[ComparisonNumberRow] = field(default_factory=list)
+    attribute_rows: list[AttributeRow] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.sync_genart_fields()
+        self.oe_number_rows = normalize_oe_number_rows(self.oe_number_rows)
+        self.comparison_number_rows = normalize_comparison_number_rows(self.comparison_number_rows)
+        self.attribute_rows = normalize_attribute_rows(self.attribute_rows)
 
     def sync_genart_fields(self) -> None:
         self.genart_selections = normalize_genart_selections(
@@ -508,8 +675,498 @@ def format_genart_selections(label: str, selections: list[GenArtSelection]) -> s
     return "\n".join(lines)
 
 
+def normalize_oe_number_rows(rows: list[OeNumberRow]) -> list[OeNumberRow]:
+    normalized: list[OeNumberRow] = []
+    seen_values: set[str] = set()
+    for row in rows:
+        value = row.value.strip()
+        if not value:
+            continue
+        dedupe_key = value.casefold()
+        if dedupe_key in seen_values:
+            continue
+        seen_values.add(dedupe_key)
+        normalized.append(OeNumberRow(value=value))
+    return normalized
+
+
+def normalize_comparison_number_rows(rows: list[ComparisonNumberRow]) -> list[ComparisonNumberRow]:
+    normalized: list[ComparisonNumberRow] = []
+    seen_values: set[tuple[str, str]] = set()
+    for row in rows:
+        competitor_id = row.competitor_id.strip()
+        competitor_code = row.competitor_code.strip()
+        competitor_name = row.competitor_name.strip()
+        reference_number = row.reference_number.strip()
+        if not competitor_id or not reference_number:
+            continue
+        dedupe_key = (competitor_id.casefold(), reference_number.casefold())
+        if dedupe_key in seen_values:
+            continue
+        seen_values.add(dedupe_key)
+        normalized.append(
+            ComparisonNumberRow(
+                competitor_id=competitor_id,
+                competitor_code=competitor_code,
+                competitor_name=competitor_name,
+                reference_number=reference_number,
+            )
+        )
+    return normalized
+
+
+def normalize_attribute_rows(rows: list[AttributeRow]) -> list[AttributeRow]:
+    normalized: list[AttributeRow] = []
+    seen_values: set[tuple[str, str]] = set()
+    for row in rows:
+        criteria_id = row.criteria_id.strip()
+        label = row.label.strip()
+        value_format = row.value_format.strip()
+        value = row.value.strip()
+        if not criteria_id:
+            continue
+        dedupe_key = (criteria_id.casefold(), value.casefold())
+        if dedupe_key in seen_values:
+            continue
+        seen_values.add(dedupe_key)
+        normalized.append(
+            AttributeRow(
+                criteria_id=criteria_id,
+                label=label,
+                value_format=value_format,
+                max_length=row.max_length,
+                type_name=row.type_name.strip(),
+                value=value,
+            )
+        )
+    return normalized
+
+
+def format_oe_number_rows(label: str, rows: list[OeNumberRow]) -> str:
+    normalized = normalize_oe_number_rows(rows)
+    lines = [label]
+    if not normalized:
+        lines.append("-")
+        return "\n".join(lines)
+    for index, row in enumerate(normalized, start=1):
+        lines.append(f"{index}. {row.value}")
+    return "\n".join(lines)
+
+
+def format_comparison_number_rows(label: str, rows: list[ComparisonNumberRow]) -> str:
+    normalized = normalize_comparison_number_rows(rows)
+    lines = [label]
+    if not normalized:
+        lines.append("-")
+        return "\n".join(lines)
+    for index, row in enumerate(normalized, start=1):
+        competitor_label = row.display_competitor_label()
+        lines.append(f"{index}. {row.reference_number}")
+        lines.append(f"   Mitbewerber: {competitor_label}")
+    return "\n".join(lines)
+
+
+def format_attribute_rows(label: str, rows: list[AttributeRow]) -> str:
+    normalized = normalize_attribute_rows(rows)
+    lines = [label]
+    if not normalized:
+        lines.append("-")
+        return "\n".join(lines)
+    for index, row in enumerate(normalized, start=1):
+        lines.append(f"{index}. {row.display_label()}")
+        lines.append(f"   Format: {row.value_format or '-'} | Wert: {row.display_value()}")
+    return "\n".join(lines)
+
+
+def split_search_terms(value: str) -> list[str]:
+    return [part for part in re.split(r"\s+", value.strip().casefold()) if part]
+
+
+def score_attribute_option_match(option: AttributeOption, query: str) -> float:
+    query_text = query.strip().casefold()
+    if not query_text:
+        return 0.0
+
+    label = option.label.casefold()
+    criteria_id = option.criteria_id.casefold()
+    display_label = option.display_label().casefold()
+    tokens = split_search_terms(query_text)
+    if not tokens:
+        return 0.0
+
+    score = 0.0
+    for token in tokens:
+        if token == criteria_id:
+            score += 5000
+        elif token == label:
+            score += 4500
+        elif criteria_id.startswith(token):
+            score += 2400
+        elif label.startswith(token):
+            score += 2200
+        elif any(word.startswith(token) for word in re.split(r"[^a-z0-9]+", display_label) if word):
+            score += 1500
+        elif token in display_label:
+            score += 900
+        elif token in option.search_blob:
+            score += 450
+        else:
+            score -= 200
+
+    score += SequenceMatcher(None, query_text, display_label).ratio() * 200
+    return score
+
+
+def normalize_lookup_text(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    for source, replacement in LOOKUP_TEXT_REPLACEMENTS:
+        normalized = normalized.replace(source, replacement)
+    normalized = normalized.casefold()
+    normalized = unicodedata.normalize("NFKD", normalized)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def normalize_attribute_key_value_group(value: str) -> str:
+    return normalize_lookup_text(value)
+
+
+def is_attribute_key_value_format(value: str) -> bool:
+    return normalize_lookup_text(value) in ATTRIBUTE_KEY_VALUE_FORMAT_KEYS
+
+
+def parse_attribute_key_value_display(value: str) -> tuple[str, str]:
+    parts = [part.strip() for part in value.split("|", 1)]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+def score_attribute_key_value_match(option: AttributeKeyValueOption, query: str) -> float:
+    query_text = normalize_lookup_text(query)
+    if not query_text:
+        return 0.0
+
+    label = normalize_lookup_text(option.label)
+    key_value_id = normalize_lookup_text(option.key_value_id)
+    display_label = normalize_lookup_text(option.display_label())
+    tokens = split_search_terms(query_text)
+    if not tokens:
+        return 0.0
+
+    score = 0.0
+    for token in tokens:
+        if token == key_value_id:
+            score += 5000
+        elif token == label:
+            score += 4500
+        elif key_value_id.startswith(token):
+            score += 2400
+        elif label.startswith(token):
+            score += 2200
+        elif any(word.startswith(token) for word in re.split(r"[^a-z0-9]+", display_label) if word):
+            score += 1500
+        elif token in display_label:
+            score += 900
+        elif token in option.search_blob:
+            score += 450
+        else:
+            score -= 200
+
+    score += SequenceMatcher(None, query_text, display_label).ratio() * 200
+    return score
+
+
+def resolve_attribute_key_value_option(
+    row: AttributeRow,
+    raw_value: str,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+) -> AttributeKeyValueOption | None:
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    group_options: list[AttributeKeyValueOption] = []
+    for group_key in row.key_value_group_candidates():
+        group_options = attribute_key_values_by_group.get(group_key, [])
+        if group_options:
+            break
+    if not group_options:
+        return None
+
+    value_key = normalize_lookup_text(value)
+    key_value_id, key_value_label = parse_attribute_key_value_display(value)
+    key_value_id_key = normalize_lookup_text(key_value_id)
+    key_value_label_key = normalize_lookup_text(key_value_label)
+
+    for option in group_options:
+        if value_key and value_key == normalize_lookup_text(option.display_label()):
+            return option
+    for option in group_options:
+        if key_value_id_key and key_value_id_key == normalize_lookup_text(option.key_value_id):
+            return option
+
+    exact_label_matches = [option for option in group_options if value_key and value_key == normalize_lookup_text(option.label)]
+    if len(exact_label_matches) == 1:
+        return exact_label_matches[0]
+
+    parsed_label_matches = [option for option in group_options if key_value_label_key and key_value_label_key == normalize_lookup_text(option.label)]
+    if len(parsed_label_matches) == 1:
+        return parsed_label_matches[0]
+
+    partial_matches = [
+        option
+        for option in group_options
+        if value_key
+        and (
+            value_key in normalize_lookup_text(option.display_label())
+            or value_key in normalize_lookup_text(option.label)
+            or value_key in normalize_lookup_text(option.key_value_id)
+        )
+    ]
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+    return None
+
+
+def resolve_attribute_export_value(
+    row: AttributeRow,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+) -> str:
+    raw_value = row.value.strip()
+    if not raw_value:
+        return ""
+    option = resolve_attribute_key_value_option(row, raw_value, attribute_key_values_by_group)
+    if option is not None:
+        return option.key_value_id
+    key_value_id, _key_value_label = parse_attribute_key_value_display(raw_value)
+    return key_value_id or raw_value
+
+
+def resolve_attribute_key_value_display_value(
+    row: AttributeRow,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+) -> str:
+    raw_value = row.value.strip()
+    if not raw_value:
+        return ""
+    option = resolve_attribute_key_value_option(row, raw_value, attribute_key_values_by_group)
+    return option.display_label() if option is not None else raw_value
+
+
+def build_attribute_key_value_group_index(
+    options: list[AttributeKeyValueOption],
+) -> dict[str, list[AttributeKeyValueOption]]:
+    grouped: dict[str, list[AttributeKeyValueOption]] = {}
+    for option in options:
+        group_key = normalize_attribute_key_value_group(option.attribute_group)
+        if not group_key:
+            continue
+        grouped.setdefault(group_key, []).append(option)
+    return grouped
+
+
 def normalize_article_number(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def normalize_header_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def parse_csv_flag(value: object) -> bool:
+    return str(value or "").strip().casefold() in {"1", "true", "wahr", "yes", "ja", "x"}
+
+
+def parse_bool_flag(value: object) -> bool:
+    return str(value or "").strip().casefold() in {"1", "true", "wahr", "yes", "ja", "x"}
+
+
+def load_competitor_options(csv_path: Path) -> list[CompetitorOption]:
+    if not csv_path.exists():
+        return []
+
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            with csv_path.open("r", encoding=encoding, newline="") as handle:
+                reader = csv.DictReader(handle, delimiter=";")
+                if not reader.fieldnames:
+                    raise ValueError("Die Mitbewerber-CSV hat keine Kopfzeile.")
+                header_map = {normalize_header_key(field_name): field_name for field_name in reader.fieldnames if field_name}
+                id_key = header_map.get("khernr")
+                code_key = header_map.get("khkz")
+                name_key = header_map.get("bez")
+                compare_key = header_map.get("vgl")
+                if id_key is None:
+                    raise ValueError("In der Mitbewerber-CSV fehlt die Spalte 'KHerNr'.")
+                if name_key is None:
+                    raise ValueError("In der Mitbewerber-CSV fehlt die Spalte 'Bez'.")
+
+                options: list[CompetitorOption] = []
+                seen_ids: set[str] = set()
+                for row in reader:
+                    competitor_id = str(row.get(id_key, "")).strip()
+                    if not competitor_id or competitor_id in seen_ids:
+                        continue
+                    if compare_key is not None and not parse_csv_flag(row.get(compare_key)):
+                        continue
+                    seen_ids.add(competitor_id)
+                    options.append(
+                        CompetitorOption(
+                            competitor_id=competitor_id,
+                            code=str(row.get(code_key, "")).strip() if code_key else "",
+                            name=str(row.get(name_key, "")).strip(),
+                        )
+                    )
+
+                options.sort(key=lambda option: (option.name.casefold(), option.code.casefold(), option.competitor_id.casefold()))
+                return options
+        except UnicodeError as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            break
+
+    if last_error is not None:
+        raise ValueError(f"Mitbewerber-CSV konnte nicht geladen werden: {last_error}") from last_error
+    return []
+
+
+def load_attribute_options(workbook_path: Path) -> list[AttributeOption]:
+    if not workbook_path.exists():
+        return []
+
+    try:
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError(f"Attributdatei konnte nicht geladen werden: {exc}") from exc
+
+    try:
+        worksheet = workbook[workbook.sheetnames[0]]
+        row_iter = worksheet.iter_rows(values_only=True)
+        header_row = next(row_iter, None)
+        if header_row is None:
+            raise ValueError("Die Attributdatei hat keine Kopfzeile.")
+        header_map = {
+            normalize_header_key(str(value)): index
+            for index, value in enumerate(header_row)
+            if str(value or "").strip()
+        }
+        criteria_index = header_map.get("tecdockriterienid")
+        label_index = header_map.get("bezeichnung")
+        format_index = header_map.get("format")
+        max_length_index = header_map.get("maxlnge") or header_map.get("maxlnge".replace("ä", "a"))
+        source_index = header_map.get("herkunft")
+        type_index = header_map.get("typ")
+        deleted_index = header_map.get("gelscht") or header_map.get("geloescht")
+        deletion_date_index = header_map.get("lschdatum") or header_map.get("loeschdatum")
+        if criteria_index is None or label_index is None or format_index is None:
+            raise ValueError("In der Attributdatei fehlen benoetigte Spalten.")
+
+        options: list[AttributeOption] = []
+        seen_ids: set[str] = set()
+        for row in row_iter:
+            values = list(row)
+            criteria_id = str(values[criteria_index] or "").strip() if criteria_index < len(values) else ""
+            if not criteria_id or criteria_id in seen_ids:
+                continue
+            deleted = parse_bool_flag(values[deleted_index]) if deleted_index is not None and deleted_index < len(values) else False
+            deletion_date = str(values[deletion_date_index] or "").strip() if deletion_date_index is not None and deletion_date_index < len(values) else ""
+            if deleted or deletion_date:
+                continue
+            raw_max_length = values[max_length_index] if max_length_index is not None and max_length_index < len(values) else None
+            max_length: int | None = None
+            if raw_max_length not in {None, ""}:
+                try:
+                    max_length = int(float(str(raw_max_length).strip()))
+                except Exception:
+                    max_length = None
+
+            seen_ids.add(criteria_id)
+            options.append(
+                AttributeOption(
+                    criteria_id=criteria_id,
+                    label=str(values[label_index] or "").strip() if label_index < len(values) else "",
+                    value_format=str(values[format_index] or "").strip() if format_index < len(values) else "",
+                    max_length=max_length,
+                    source=str(values[source_index] or "").strip() if source_index is not None and source_index < len(values) else "",
+                    type_name=str(values[type_index] or "").strip() if type_index is not None and type_index < len(values) else "",
+                )
+            )
+
+        options.sort(key=lambda option: (option.label.casefold(), option.criteria_id.casefold()))
+        return options
+    finally:
+        workbook.close()
+
+
+def load_attribute_key_value_options(workbook_path: Path) -> list[AttributeKeyValueOption]:
+    if not workbook_path.exists():
+        return []
+
+    try:
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError(f"Schluesselwertdatei konnte nicht geladen werden: {exc}") from exc
+
+    try:
+        worksheet = workbook[workbook.sheetnames[0]]
+        row_iter = worksheet.iter_rows(values_only=True)
+        header_row = next(row_iter, None)
+        if header_row is None:
+            raise ValueError("Die Schluesselwertdatei hat keine Kopfzeile.")
+
+        header_map = {
+            normalize_header_key(str(value)): index
+            for index, value in enumerate(header_row)
+            if str(value or "").strip()
+        }
+        key_value_index = header_map.get("tecdocschlsselwert") or header_map.get("tecdocschluesselwert")
+        label_index = header_map.get("bezeichnung")
+        group_index = header_map.get("attributtabellenbezeichnung")
+        source_index = header_map.get("herkunft")
+        deleted_index = header_map.get("gelscht") or header_map.get("geloescht")
+        deletion_date_index = header_map.get("lschdatum") or header_map.get("loeschdatum")
+        if key_value_index is None or label_index is None or group_index is None:
+            raise ValueError("In der Schluesselwertdatei fehlen benoetigte Spalten.")
+
+        options: list[AttributeKeyValueOption] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for row in row_iter:
+            values = list(row)
+            key_value_id = str(values[key_value_index] or "").strip() if key_value_index < len(values) else ""
+            label = str(values[label_index] or "").strip() if label_index < len(values) else ""
+            attribute_group = str(values[group_index] or "").strip() if group_index < len(values) else ""
+            if not key_value_id or not attribute_group:
+                continue
+            deleted = parse_bool_flag(values[deleted_index]) if deleted_index is not None and deleted_index < len(values) else False
+            deletion_date = str(values[deletion_date_index] or "").strip() if deletion_date_index is not None and deletion_date_index < len(values) else ""
+            if deleted or deletion_date:
+                continue
+            dedupe_key = (normalize_attribute_key_value_group(attribute_group), key_value_id.casefold())
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            options.append(
+                AttributeKeyValueOption(
+                    key_value_id=key_value_id,
+                    label=label,
+                    attribute_group=attribute_group,
+                    source=str(values[source_index] or "").strip() if source_index is not None and source_index < len(values) else "",
+                )
+            )
+
+        options.sort(key=lambda option: (option.attribute_group.casefold(), option.label.casefold(), option.key_value_id.casefold()))
+        return options
+    finally:
+        workbook.close()
 
 
 def replace_short_text_umlauts(value: str) -> str:
@@ -2069,6 +2726,27 @@ def build_web_export_rows(bundle: ExportBundle) -> list[list[str]]:
     return export_rows
 
 
+def build_oe_export_rows(bundle: ExportBundle) -> list[list[str]]:
+    return [[bundle.article_number, "4", row.value] for row in normalize_oe_number_rows(bundle.oe_number_rows)]
+
+
+def build_comparison_export_rows(bundle: ExportBundle) -> list[list[str]]:
+    return [
+        [bundle.article_number, "10", row.competitor_id, row.reference_number]
+        for row in normalize_comparison_number_rows(bundle.comparison_number_rows)
+    ]
+
+
+def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
+    export_rows: list[list[str]] = []
+    for row in normalize_attribute_rows(bundle.attribute_rows):
+        export_value = row.value
+        if is_attribute_key_value_format(row.value_format):
+            export_value = resolve_attribute_export_value(row, bundle.attribute_key_values_by_group)
+        export_rows.append([bundle.article_number, row.criteria_id, row.label, row.value_format, export_value])
+    return export_rows
+
+
 def append_written_at(row: list[str], written_at: str) -> list[str]:
     return [*row, written_at]
 
@@ -2090,6 +2768,9 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
     document_rows = [append_written_at(row, written_at) for row in build_document_export_rows(bundle)] if bundle.include_documents else []
     video_rows = [append_written_at(row, written_at) for row in build_video_export_rows(bundle)] if bundle.include_videos else []
     web_rows = [append_written_at(row, written_at) for row in build_web_export_rows(bundle)] if bundle.include_web_links else []
+    oe_rows = [append_written_at(row, written_at) for row in build_oe_export_rows(bundle)]
+    comparison_rows = [append_written_at(row, written_at) for row in build_comparison_export_rows(bundle)]
+    attribute_rows = [append_written_at(row, written_at) for row in build_attribute_export_rows(bundle)]
 
     if use_timestamp_subdir:
         if bundle.include_short_text:
@@ -2099,6 +2780,12 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
             write_workbook(export_dir / LONG_TEXT_FILE[0], LONG_TEXT_FILE[1], SHORT_TEXT_HEADERS, [long_row])
         if genart_rows:
             write_workbook(export_dir / GENART_FILE[0], GENART_FILE[1], GENART_HEADERS, genart_rows)
+        if oe_rows:
+            write_workbook(export_dir / OE_FILE[0], OE_FILE[1], OE_HEADERS, oe_rows)
+        if comparison_rows:
+            write_workbook(export_dir / COMPARISON_FILE[0], COMPARISON_FILE[1], COMPARISON_HEADERS, comparison_rows)
+        if attribute_rows:
+            write_workbook(export_dir / ATTRIBUTE_FILE[0], ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS, attribute_rows)
         if bundle.include_images:
             write_workbook(export_dir / IMAGE_FILE[0], IMAGE_FILE[1], IMAGE_HEADERS, image_rows)
         if bundle.include_documents:
@@ -2137,6 +2824,27 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
             GENART_FILE[1],
             GENART_HEADERS,
             genart_rows,
+            replace_article_keys=article_keys,
+        )
+        write_workbook_with_upsert(
+            export_dir / OE_FILE[0],
+            OE_FILE[1],
+            OE_HEADERS,
+            oe_rows,
+            replace_article_keys=article_keys,
+        )
+        write_workbook_with_upsert(
+            export_dir / COMPARISON_FILE[0],
+            COMPARISON_FILE[1],
+            COMPARISON_HEADERS,
+            comparison_rows,
+            replace_article_keys=article_keys,
+        )
+        write_workbook_with_upsert(
+            export_dir / ATTRIBUTE_FILE[0],
+            ATTRIBUTE_FILE[1],
+            ATTRIBUTE_HEADERS,
+            attribute_rows,
             replace_article_keys=article_keys,
         )
         if bundle.include_images:
@@ -2188,6 +2896,11 @@ def build_preview(bundle: ExportBundle) -> str:
         f"- Kurzbezeichnung: {bundle.short_texts.populated_count(bundle.short_auto_uni)} / 7 Sprachfelder befuellt",
         f"- Text: {bundle.long_texts.populated_count(bundle.long_auto_uni)} / 7 Sprachfelder befuellt",
         "",
+        "Referenzen",
+        f"- OE-Nummern: {len(normalize_oe_number_rows(bundle.oe_number_rows))}",
+        f"- Vergleichsnummern: {len(normalize_comparison_number_rows(bundle.comparison_number_rows))}",
+        f"- Attribute: {len(normalize_attribute_rows(bundle.attribute_rows))}",
+        "",
         "Medien",
         f"- Bilder: {len(bundle.image_rows)}",
         f"- Dokumente: {len(bundle.document_rows)}",
@@ -2199,6 +2912,9 @@ def build_preview(bundle: ExportBundle) -> str:
         f"- {SHORT_MAPPING_FILE[0]}",
         f"- {LONG_TEXT_FILE[0]}",
         f"- {GENART_FILE[0]}",
+        f"- {OE_FILE[0]}",
+        f"- {COMPARISON_FILE[0]}",
+        f"- {ATTRIBUTE_FILE[0]}",
         f"- {IMAGE_FILE[0]}",
         f"- {DOCUMENT_FILE[0]}",
         f"- {VIDEO_FILE[0]}",
@@ -2245,6 +2961,12 @@ def format_article_snapshot(snapshot: StoredArticleSnapshot) -> str:
         "",
         format_translation_set("Text", snapshot.long_texts),
         "",
+        format_oe_number_rows("OE-Nummern", snapshot.oe_number_rows),
+        "",
+        format_comparison_number_rows("Vergleichsnummern", snapshot.comparison_number_rows),
+        "",
+        format_attribute_rows("Attribute", snapshot.attribute_rows),
+        "",
         format_media_rows("Bilder", snapshot.image_rows),
         "",
         format_media_rows("Dokumente", snapshot.document_rows),
@@ -2269,7 +2991,13 @@ def translation_set_from_export_row(row: list[str]) -> TranslationSet:
     )
 
 
-def load_article_snapshots_from_folder(folder: Path, source_label: str) -> dict[str, StoredArticleSnapshot]:
+def load_article_snapshots_from_folder(
+    folder: Path,
+    source_label: str,
+    competitor_lookup: dict[str, CompetitorOption] | None = None,
+    attribute_lookup: dict[str, AttributeOption] | None = None,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] | None = None,
+) -> dict[str, StoredArticleSnapshot]:
     if not folder.exists():
         return {}
 
@@ -2311,6 +3039,61 @@ def load_article_snapshots_from_folder(folder: Path, source_label: str) -> dict[
         snapshot = ensure_snapshot(article_number)
         snapshot.genart_selections.append(GenArtSelection(id=row[1].strip(), bezeichnung=row[2].strip()))
 
+    oe_rows = read_workbook_rows(folder / OE_FILE[0], OE_FILE[1], len(OE_HEADERS))
+    for row in oe_rows:
+        article_number = normalize_article_number(row[0])
+        if not article_number:
+            continue
+        ensure_snapshot(article_number).oe_number_rows.append(OeNumberRow(value=row[2].strip()))
+
+    comparison_rows = read_workbook_rows(folder / COMPARISON_FILE[0], COMPARISON_FILE[1], len(COMPARISON_HEADERS))
+    for row in comparison_rows:
+        article_number = normalize_article_number(row[0])
+        if not article_number:
+            continue
+        competitor_id = row[2].strip()
+        competitor = competitor_lookup.get(competitor_id) if competitor_lookup is not None else None
+        ensure_snapshot(article_number).comparison_number_rows.append(
+            ComparisonNumberRow(
+                competitor_id=competitor_id,
+                competitor_code=competitor.code if competitor is not None else "",
+                competitor_name=competitor.name if competitor is not None else "",
+                reference_number=row[3].strip(),
+            )
+        )
+
+    attribute_rows = read_workbook_rows(folder / ATTRIBUTE_FILE[0], ATTRIBUTE_FILE[1], len(ATTRIBUTE_HEADERS))
+    for row in attribute_rows:
+        article_number = normalize_article_number(row[0])
+        if not article_number:
+            continue
+        criteria_id = row[1].strip()
+        attribute_option = attribute_lookup.get(criteria_id) if attribute_lookup is not None else None
+        label = row[2].strip() or (attribute_option.label if attribute_option is not None else "")
+        value_format = row[3].strip() or (attribute_option.value_format if attribute_option is not None else "")
+        max_length = attribute_option.max_length if attribute_option is not None else None
+        type_name = attribute_option.type_name if attribute_option is not None else ""
+        attribute_row = AttributeRow(
+            criteria_id=criteria_id,
+            label=label,
+            value_format=value_format,
+            max_length=max_length,
+            type_name=type_name,
+            value=row[4].strip(),
+        )
+        if is_attribute_key_value_format(value_format) and attribute_key_values_by_group:
+            attribute_row = AttributeRow(
+                criteria_id=attribute_row.criteria_id,
+                label=attribute_row.label,
+                value_format=attribute_row.value_format,
+                max_length=attribute_row.max_length,
+                type_name=attribute_row.type_name,
+                value=resolve_attribute_key_value_display_value(attribute_row, attribute_key_values_by_group),
+            )
+        ensure_snapshot(article_number).attribute_rows.append(
+            attribute_row
+        )
+
     image_rows = read_workbook_rows(folder / IMAGE_FILE[0], IMAGE_FILE[1], len(IMAGE_HEADERS))
     for row in image_rows:
         article_number = normalize_article_number(row[0])
@@ -2341,6 +3124,9 @@ def load_article_snapshots_from_folder(folder: Path, source_label: str) -> dict[
 
     for snapshot in snapshots.values():
         snapshot.sync_genart_fields()
+        snapshot.oe_number_rows = normalize_oe_number_rows(snapshot.oe_number_rows)
+        snapshot.comparison_number_rows = normalize_comparison_number_rows(snapshot.comparison_number_rows)
+        snapshot.attribute_rows = normalize_attribute_rows(snapshot.attribute_rows)
 
     return snapshots
 
@@ -3459,6 +4245,1262 @@ class LinkTableFrame(ttk.LabelFrame):
         self._select_first_row()
 
 
+class SimpleValueTableFrame(ttk.LabelFrame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        title: str,
+        entry_label: str,
+        on_change: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(master, text=title, padding=14)
+        self.on_change = on_change
+        self.value_var = tk.StringVar()
+        self.inline_editor: ttk.Entry | None = None
+        self.inline_editor_item = ""
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
+        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        form = ttk.Frame(self)
+        form.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        form.columnconfigure(1, weight=1)
+
+        ttk.Label(form, text=entry_label).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(form, textvariable=self.value_var).grid(row=0, column=1, sticky="ew")
+        ttk.Button(form, text="Hinzufuegen", command=self.add_row).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(form, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(form, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(form, text="Leeren", command=self.clear_form).grid(row=0, column=5, padx=(8, 0))
+
+        self.tree = ttk.Treeview(self, columns=("value",), show="headings", height=12, selectmode="extended")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.tree.heading("value", text=entry_label)
+        self.tree.column("value", width=980, anchor="w")
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.bind("<<TreeviewSelect>>", self._handle_selection)
+        self.tree.bind("<Double-1>", self._begin_inline_edit)
+        self.tree.bind("<Button-3>", self._open_context_menu)
+
+    def _emit_change(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def add_row(self) -> None:
+        value = self.value_var.get().strip()
+        if not value:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Wert eingeben.")
+            return
+        self.tree.insert("", "end", values=(value,))
+        self._select_first_row(select_last=True)
+        self._emit_change()
+
+    def update_selected_row(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            return
+        value = self.value_var.get().strip()
+        if not value:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Wert eingeben.")
+            return
+        self.tree.item(selected[0], values=(value,))
+        self.tree.focus(selected[0])
+        self._handle_selection()
+        self._emit_change()
+
+    def remove_selected(self) -> None:
+        for item_id in self.tree.selection():
+            self.tree.delete(item_id)
+        self.clear_form()
+        self._select_first_row()
+        self._emit_change()
+
+    def copy_selected_rows(self) -> None:
+        selected_items = list(self.tree.selection())
+        if not selected_items:
+            return
+        rows = []
+        for item_id in selected_items:
+            values = [str(value).strip() for value in self.tree.item(item_id, "values")]
+            rows.append("\t".join(values))
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(rows))
+
+    def clear_form(self) -> None:
+        self.value_var.set("")
+
+    def get_rows(self) -> list[OeNumberRow]:
+        rows = []
+        for item_id in self.tree.get_children():
+            (value,) = self.tree.item(item_id, "values")
+            rows.append(OeNumberRow(value=str(value).strip()))
+        return normalize_oe_number_rows(rows)
+
+    def set_rows(self, rows: list[OeNumberRow]) -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        for row in normalize_oe_number_rows(rows):
+            self.tree.insert("", "end", values=(row.value,))
+        self._select_first_row()
+
+    def _select_first_row(self, select_last: bool = False) -> None:
+        children = list(self.tree.get_children())
+        if not children:
+            return
+        target = children[-1] if select_last else children[0]
+        self.tree.selection_set(target)
+        self.tree.focus(target)
+        self._handle_selection()
+
+    def _handle_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        (value,) = self.tree.item(selected[0], "values")
+        self.value_var.set(str(value).strip())
+
+    def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            if item_id not in self.tree.selection():
+                self.tree.selection_set(item_id)
+            self.tree.focus(item_id)
+            self._handle_selection()
+        has_selection = bool(self.tree.selection())
+        self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.grab_release()
+
+    def _begin_inline_edit(self, event: tk.Event[tk.Misc]) -> None:
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        item_id = self.tree.identify_row(event.y)
+        column_id = self.tree.identify_column(event.x)
+        if not item_id or column_id != "#1":
+            return
+        bbox = self.tree.bbox(item_id, column_id)
+        if not bbox:
+            return
+        self._destroy_inline_editor()
+        (current_value,) = self.tree.item(item_id, "values")
+        x_pos, y_pos, width, height = bbox
+        editor = ttk.Entry(self.tree)
+        editor.place(x=x_pos, y=y_pos, width=width, height=height)
+        editor.insert(0, str(current_value))
+        editor.select_range(0, "end")
+        editor.focus_set()
+        editor.bind("<Return>", lambda _event: self._commit_inline_edit())
+        editor.bind("<Escape>", lambda _event: self._destroy_inline_editor())
+        editor.bind("<FocusOut>", lambda _event: self._commit_inline_edit())
+        self.inline_editor = editor
+        self.inline_editor_item = item_id
+
+    def _commit_inline_edit(self) -> None:
+        if self.inline_editor is None or not self.inline_editor.winfo_exists():
+            self.inline_editor = None
+            return
+        item_id = self.inline_editor_item
+        value = self.inline_editor.get().strip()
+        self._destroy_inline_editor()
+        if not item_id:
+            return
+        if not value:
+            messagebox.showwarning(APP_TITLE, "Der Wert darf nicht leer sein.")
+            return
+        self.tree.item(item_id, values=(value,))
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        self._handle_selection()
+        self._emit_change()
+
+    def _destroy_inline_editor(self) -> None:
+        if self.inline_editor is not None and self.inline_editor.winfo_exists():
+            self.inline_editor.destroy()
+        self.inline_editor = None
+        self.inline_editor_item = ""
+
+
+class ComparisonTableFrame(ttk.LabelFrame):
+    def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
+        super().__init__(master, text="Vergleichsnummern", padding=14)
+        self.on_change = on_change
+        self.catalog_options: list[CompetitorOption] = []
+        self.catalog_by_id: dict[str, CompetitorOption] = {}
+        self.catalog_by_code: dict[str, CompetitorOption] = {}
+        self.catalog_by_label: dict[str, CompetitorOption] = {}
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
+        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+
+        self.competitor_display_var = tk.StringVar()
+        self.competitor_id_var = tk.StringVar()
+        self.competitor_code_var = tk.StringVar()
+        self.competitor_name_var = tk.StringVar()
+        self.reference_number_var = tk.StringVar()
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(1, weight=1)
+        header.columnconfigure(5, weight=1)
+
+        ttk.Label(
+            header,
+            text="Mitbewerber kann direkt aus KHer.csv ausgewaehlt oder manuell ueber die ID gepflegt werden.",
+            foreground="#5E6472",
+            wraplength=980,
+        ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 10))
+
+        ttk.Label(header, text="Mitbewerber").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.competitor_combo = ttk.Combobox(header, textvariable=self.competitor_display_var)
+        self.competitor_combo.grid(row=1, column=1, columnspan=6, sticky="ew", pady=4)
+        self.competitor_combo.bind("<<ComboboxSelected>>", self._apply_current_competitor_selection)
+        self.competitor_combo.bind("<KeyRelease>", self._on_competitor_key_release)
+        self.competitor_combo.bind("<Return>", self._apply_current_competitor_selection)
+        self.competitor_combo.bind("<FocusOut>", self._apply_current_competitor_selection)
+
+        ttk.Label(header, text="Mitbewerber ID").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(header, textvariable=self.competitor_id_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(header, text="Kuerzel").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(header, textvariable=self.competitor_code_var, width=18).grid(row=2, column=3, sticky="w", pady=4)
+        ttk.Label(header, text="Name").grid(row=2, column=4, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(header, textvariable=self.competitor_name_var).grid(row=2, column=5, columnspan=2, sticky="ew", pady=4)
+
+        ttk.Label(header, text="Vergleichsnummer").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(header, textvariable=self.reference_number_var).grid(row=3, column=1, columnspan=3, sticky="ew", pady=4)
+
+        actions = ttk.Frame(header)
+        actions.grid(row=3, column=4, columnspan=3, sticky="e", pady=4)
+        ttk.Button(actions, text="Hinzufuegen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text="Leeren", command=self.clear_form).grid(row=0, column=3)
+
+        columns = ("competitor_id", "competitor_code", "competitor_name", "reference_number")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=11, selectmode="extended")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.tree.heading("competitor_id", text="Mitbewerber ID")
+        self.tree.heading("competitor_code", text="Kuerzel")
+        self.tree.heading("competitor_name", text="Mitbewerber")
+        self.tree.heading("reference_number", text="Vergleichsnummer")
+        self.tree.column("competitor_id", width=120, anchor="center")
+        self.tree.column("competitor_code", width=120, anchor="center")
+        self.tree.column("competitor_name", width=380, anchor="w")
+        self.tree.column("reference_number", width=300, anchor="w")
+        self.tree.bind("<<TreeviewSelect>>", self._handle_selection)
+        self.tree.bind("<Button-3>", self._open_context_menu)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+    def set_competitor_catalog(self, options: list[CompetitorOption]) -> None:
+        self.catalog_options = list(options)
+        self.catalog_by_id = {option.competitor_id: option for option in self.catalog_options}
+        self.catalog_by_code = {option.code.casefold(): option for option in self.catalog_options if option.code}
+        self.catalog_by_label = {option.display_label(): option for option in self.catalog_options}
+        self._update_competitor_combo_values(self.competitor_display_var.get())
+
+    def prefill_competitor(self, option: CompetitorOption) -> None:
+        self.competitor_display_var.set(option.display_label())
+        self.competitor_id_var.set(option.competitor_id)
+        self.competitor_code_var.set(option.code)
+        self.competitor_name_var.set(option.name)
+        self._update_competitor_combo_values(option.display_label())
+
+    def _update_competitor_combo_values(self, query: str = "") -> None:
+        query_text = query.strip().casefold()
+        filtered = [
+            option.display_label()
+            for option in self.catalog_options
+            if not query_text or query_text in option.search_blob
+        ]
+        self.competitor_combo.configure(values=filtered[:200])
+
+    def _resolve_competitor(self, raw_value: str) -> CompetitorOption | None:
+        value = raw_value.strip()
+        if not value:
+            return None
+        if value in self.catalog_by_label:
+            return self.catalog_by_label[value]
+        if value in self.catalog_by_id:
+            return self.catalog_by_id[value]
+        by_code = self.catalog_by_code.get(value.casefold())
+        if by_code is not None:
+            return by_code
+
+        exact_matches = [option for option in self.catalog_options if value.casefold() == option.name.casefold()]
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+
+        partial_matches = [option for option in self.catalog_options if value.casefold() in option.search_blob]
+        if len(partial_matches) == 1:
+            return partial_matches[0]
+        return None
+
+    def _apply_current_competitor_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        option = self._resolve_competitor(self.competitor_display_var.get())
+        if option is None:
+            return
+        self.prefill_competitor(option)
+
+    def _on_competitor_key_release(self, _event: tk.Event[tk.Misc]) -> None:
+        self._update_competitor_combo_values(self.competitor_display_var.get())
+
+    def _emit_change(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def _build_current_row(self) -> ComparisonNumberRow:
+        return ComparisonNumberRow(
+            competitor_id=self.competitor_id_var.get().strip(),
+            competitor_code=self.competitor_code_var.get().strip(),
+            competitor_name=self.competitor_name_var.get().strip(),
+            reference_number=self.reference_number_var.get().strip(),
+        )
+
+    def add_row(self) -> None:
+        self._apply_current_competitor_selection()
+        row = self._build_current_row()
+        if not row.competitor_id or not row.reference_number:
+            messagebox.showwarning(APP_TITLE, "Bitte Mitbewerber-ID und Vergleichsnummer eingeben.")
+            return
+        self.tree.insert("", "end", values=(row.competitor_id, row.competitor_code, row.competitor_name, row.reference_number))
+        self._select_first_row(select_last=True)
+        self._emit_change()
+
+    def update_selected_row(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            return
+        self._apply_current_competitor_selection()
+        row = self._build_current_row()
+        if not row.competitor_id or not row.reference_number:
+            messagebox.showwarning(APP_TITLE, "Bitte Mitbewerber-ID und Vergleichsnummer eingeben.")
+            return
+        self.tree.item(selected[0], values=(row.competitor_id, row.competitor_code, row.competitor_name, row.reference_number))
+        self.tree.focus(selected[0])
+        self._handle_selection()
+        self._emit_change()
+
+    def remove_selected(self) -> None:
+        for item_id in self.tree.selection():
+            self.tree.delete(item_id)
+        self.clear_form()
+        self._select_first_row()
+        self._emit_change()
+
+    def copy_selected_rows(self) -> None:
+        selected_items = list(self.tree.selection())
+        if not selected_items:
+            return
+        rows = []
+        for item_id in selected_items:
+            values = [str(value).strip() for value in self.tree.item(item_id, "values")]
+            rows.append("\t".join(values))
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(rows))
+
+    def clear_form(self) -> None:
+        self.competitor_display_var.set("")
+        self.competitor_id_var.set("")
+        self.competitor_code_var.set("")
+        self.competitor_name_var.set("")
+        self.reference_number_var.set("")
+
+    def get_rows(self) -> list[ComparisonNumberRow]:
+        rows = []
+        for item_id in self.tree.get_children():
+            competitor_id, competitor_code, competitor_name, reference_number = self.tree.item(item_id, "values")
+            rows.append(
+                ComparisonNumberRow(
+                    competitor_id=str(competitor_id).strip(),
+                    competitor_code=str(competitor_code).strip(),
+                    competitor_name=str(competitor_name).strip(),
+                    reference_number=str(reference_number).strip(),
+                )
+            )
+        return normalize_comparison_number_rows(rows)
+
+    def set_rows(self, rows: list[ComparisonNumberRow]) -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        for row in normalize_comparison_number_rows(rows):
+            self.tree.insert("", "end", values=(row.competitor_id, row.competitor_code, row.competitor_name, row.reference_number))
+        self._select_first_row()
+
+    def _select_first_row(self, select_last: bool = False) -> None:
+        children = list(self.tree.get_children())
+        if not children:
+            return
+        target = children[-1] if select_last else children[0]
+        self.tree.selection_set(target)
+        self.tree.focus(target)
+        self._handle_selection()
+
+    def _handle_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        competitor_id, competitor_code, competitor_name, reference_number = self.tree.item(selected[0], "values")
+        self.competitor_id_var.set(str(competitor_id).strip())
+        self.competitor_code_var.set(str(competitor_code).strip())
+        self.competitor_name_var.set(str(competitor_name).strip())
+        self.reference_number_var.set(str(reference_number).strip())
+        display_parts = [self.competitor_id_var.get(), self.competitor_code_var.get(), self.competitor_name_var.get()]
+        self.competitor_display_var.set(" | ".join(part for part in display_parts if part))
+
+    def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            if item_id not in self.tree.selection():
+                self.tree.selection_set(item_id)
+            self.tree.focus(item_id)
+            self._handle_selection()
+        has_selection = bool(self.tree.selection())
+        self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.grab_release()
+
+
+class AttributeTableFrame(ttk.LabelFrame):
+    def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
+        super().__init__(master, text="Attribute", padding=14)
+        self.on_change = on_change
+        self.catalog_options: list[AttributeOption] = []
+        self.catalog_by_id: dict[str, AttributeOption] = {}
+        self.catalog_by_label: dict[str, AttributeOption] = {}
+        self.key_value_options_by_group: dict[str, list[AttributeKeyValueOption]] = {}
+        self.row_type_names: dict[str, str] = {}
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
+        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+
+        self.attribute_display_var = tk.StringVar()
+        self.criteria_id_var = tk.StringVar()
+        self.label_var = tk.StringVar()
+        self.format_var = tk.StringVar()
+        self.max_length_var = tk.StringVar()
+        self.type_name_var = tk.StringVar()
+        self.value_var = tk.StringVar()
+        self.hint_var = tk.StringVar(value="Waehle ein Attribut aus oder gib die Kriterien-ID manuell ein.")
+        self.attribute_suggestion_popup: tk.Toplevel | None = None
+        self.attribute_suggestion_listbox: tk.Listbox | None = None
+        self.attribute_suggestion_values: list[str] = []
+        self.value_suggestion_popup: tk.Toplevel | None = None
+        self.value_suggestion_listbox: tk.Listbox | None = None
+        self.value_suggestion_values: list[str] = []
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(1, weight=1)
+        header.columnconfigure(5, weight=1)
+
+        ttk.Label(
+            header,
+            text="Attribute werden ueber die TecDoc Kriterien ID ausgewaehlt. Format und maximale Laenge dienen als Pflegehilfe.",
+            foreground="#5E6472",
+            wraplength=980,
+        ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 10))
+
+        ttk.Label(header, text="Attribut").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.attribute_entry = ttk.Entry(header, textvariable=self.attribute_display_var)
+        self.attribute_entry.grid(row=1, column=1, columnspan=6, sticky="ew", pady=4)
+        self.attribute_entry.bind("<KeyRelease>", self._on_attribute_key_release)
+        self.attribute_entry.bind("<Down>", self._open_attribute_dropdown_event)
+        self.attribute_entry.bind("<F4>", self._open_attribute_dropdown_event)
+        self.attribute_entry.bind("<Escape>", self._close_attribute_dropdown_event)
+        self.attribute_entry.bind("<Return>", self._handle_attribute_return)
+        self.attribute_entry.bind("<FocusOut>", self._handle_attribute_focus_out)
+
+        ttk.Label(header, text="Kriterien ID").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(header, textvariable=self.criteria_id_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(header, text="Bezeichnung").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(header, textvariable=self.label_var).grid(row=2, column=3, columnspan=4, sticky="ew", pady=4)
+
+        ttk.Label(header, text="Format").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(header, textvariable=self.format_var, width=24).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(header, text="Max. Laenge").grid(row=3, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(header, textvariable=self.max_length_var, width=12).grid(row=3, column=3, sticky="w", pady=4)
+        ttk.Label(header, text="Wert").grid(row=3, column=4, sticky="w", padx=(12, 8), pady=4)
+        self.value_entry = ttk.Entry(header, textvariable=self.value_var)
+        self.value_entry.grid(row=3, column=5, sticky="ew", pady=4)
+        self.value_entry.bind("<KeyRelease>", self._on_value_key_release)
+        self.value_entry.bind("<Down>", self._open_value_dropdown_event)
+        self.value_entry.bind("<F4>", self._open_value_dropdown_event)
+        self.value_entry.bind("<Escape>", self._close_value_dropdown_event)
+        self.value_entry.bind("<Return>", self._handle_value_return)
+        self.value_entry.bind("<FocusOut>", self._handle_value_focus_out)
+
+        quick_row = ttk.Frame(header)
+        quick_row.grid(row=3, column=6, sticky="e", pady=4)
+        ttk.Button(quick_row, text="Ja", command=lambda: self.value_var.set("Ja")).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(quick_row, text="Nein", command=lambda: self.value_var.set("Nein")).grid(row=0, column=1)
+
+        ttk.Label(header, textvariable=self.hint_var, foreground="#5E6472", wraplength=980).grid(
+            row=4,
+            column=0,
+            columnspan=7,
+            sticky="w",
+            pady=(6, 8),
+        )
+
+        actions = ttk.Frame(header)
+        actions.grid(row=5, column=0, columnspan=7, sticky="w")
+        ttk.Button(actions, text="Hinzufuegen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text="Leeren", command=self.clear_form).grid(row=0, column=3)
+
+        columns = ("criteria_id", "label", "value_format", "value")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=11, selectmode="extended")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.tree.heading("criteria_id", text="Kriterien ID")
+        self.tree.heading("label", text="Attribut")
+        self.tree.heading("value_format", text="Format")
+        self.tree.heading("value", text="Wert")
+        self.tree.column("criteria_id", width=120, anchor="center")
+        self.tree.column("label", width=430, anchor="w")
+        self.tree.column("value_format", width=180, anchor="center")
+        self.tree.column("value", width=260, anchor="w")
+        self.tree.bind("<<TreeviewSelect>>", self._handle_selection)
+        self.tree.bind("<Button-3>", self._open_context_menu)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+    def set_attribute_catalog(self, options: list[AttributeOption]) -> None:
+        self.catalog_options = list(options)
+        self.catalog_by_id = {option.criteria_id: option for option in self.catalog_options}
+        self.catalog_by_label = {option.display_label(): option for option in self.catalog_options}
+        self._update_attribute_combo_values(self.attribute_display_var.get())
+        self._sync_current_attribute_metadata()
+
+    def set_attribute_key_value_catalog(
+        self,
+        options_by_group: dict[str, list[AttributeKeyValueOption]],
+    ) -> None:
+        self.key_value_options_by_group = {key: list(values) for key, values in options_by_group.items()}
+        self._normalize_current_value_selection()
+
+    def _update_attribute_combo_values(self, query: str = "") -> list[str]:
+        query_text = query.strip().casefold()
+        if not query_text:
+            filtered_options = self.catalog_options[:120]
+        else:
+            ranked_matches = [
+                (score_attribute_option_match(option, query_text), option)
+                for option in self.catalog_options
+                if all(token in option.search_blob for token in split_search_terms(query_text))
+            ]
+            ranked_matches = [entry for entry in ranked_matches if entry[0] > 0]
+            ranked_matches.sort(
+                key=lambda entry: (
+                    -entry[0],
+                    entry[1].label.casefold(),
+                    entry[1].criteria_id.casefold(),
+                )
+            )
+            filtered_options = [option for _score, option in ranked_matches[:150]]
+
+        self.attribute_suggestion_values = [option.display_label() for option in filtered_options]
+        return list(self.attribute_suggestion_values)
+
+    def _resolve_attribute_option(self, raw_value: str) -> AttributeOption | None:
+        value = raw_value.strip()
+        if not value:
+            return None
+        if value in self.catalog_by_label:
+            return self.catalog_by_label[value]
+        if value in self.catalog_by_id:
+            return self.catalog_by_id[value]
+        exact_matches = [option for option in self.catalog_options if value.casefold() == option.label.casefold()]
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+        partial_matches = [option for option in self.catalog_options if value.casefold() in option.search_blob]
+        if len(partial_matches) == 1:
+            return partial_matches[0]
+        return None
+
+    def _sync_current_attribute_metadata(self) -> None:
+        option = self.catalog_by_id.get(self.criteria_id_var.get().strip())
+        if option is None:
+            return
+        self.label_var.set(option.label)
+        self.format_var.set(option.value_format)
+        self.max_length_var.set("" if option.max_length is None else str(option.max_length))
+        self.type_name_var.set(option.type_name)
+        if not self.attribute_display_var.get().strip():
+            self.attribute_display_var.set(option.display_label())
+        self._normalize_current_value_selection()
+        self._update_hint()
+
+    def _apply_current_attribute_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        option = self._resolve_attribute_option(self.attribute_display_var.get())
+        if option is None:
+            self.type_name_var.set("")
+            self._hide_value_suggestions()
+            self._update_hint()
+            return
+        self.attribute_display_var.set(option.display_label())
+        self.criteria_id_var.set(option.criteria_id)
+        self.label_var.set(option.label)
+        self.format_var.set(option.value_format)
+        self.max_length_var.set("" if option.max_length is None else str(option.max_length))
+        self.type_name_var.set(option.type_name)
+        self._update_attribute_combo_values(option.display_label())
+        self._hide_attribute_suggestions()
+        self._normalize_current_value_selection()
+        self._update_hint()
+
+    def _ensure_attribute_suggestion_popup(self) -> None:
+        if self.attribute_suggestion_popup is not None and self.attribute_suggestion_popup.winfo_exists():
+            return
+
+        popup = tk.Toplevel(self)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.transient(self.winfo_toplevel())
+        popup.configure(background="#C7BFAF", padx=1, pady=1)
+
+        listbox = tk.Listbox(
+            popup,
+            activestyle="none",
+            exportselection=False,
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+        )
+        listbox.pack(fill="both", expand=True)
+        listbox.bind("<ButtonRelease-1>", self._accept_attribute_listbox_click)
+        listbox.bind("<Double-Button-1>", self._accept_attribute_listbox_click)
+        listbox.bind("<Return>", self._accept_attribute_listbox_keyboard)
+        listbox.bind("<Escape>", self._close_attribute_dropdown_event)
+        listbox.bind("<FocusOut>", self._handle_attribute_popup_focus_out)
+
+        self.attribute_suggestion_popup = popup
+        self.attribute_suggestion_listbox = listbox
+
+    def _show_attribute_suggestions(self, values: list[str]) -> None:
+        if not values:
+            self._hide_attribute_suggestions()
+            return
+
+        self._ensure_attribute_suggestion_popup()
+        if self.attribute_suggestion_popup is None or self.attribute_suggestion_listbox is None:
+            return
+
+        listbox = self.attribute_suggestion_listbox
+        listbox.delete(0, "end")
+        for value in values:
+            listbox.insert("end", value)
+
+        visible_rows = min(max(len(values), 1), 8)
+        listbox.configure(height=visible_rows)
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(0)
+        listbox.activate(0)
+        listbox.see(0)
+
+        self.attribute_suggestion_popup.update_idletasks()
+        x_pos = self.attribute_entry.winfo_rootx()
+        y_pos = self.attribute_entry.winfo_rooty() + self.attribute_entry.winfo_height()
+        width = max(self.attribute_entry.winfo_width(), 420)
+        height = self.attribute_suggestion_popup.winfo_reqheight()
+        self.attribute_suggestion_popup.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
+        self.attribute_suggestion_popup.deiconify()
+        self.attribute_suggestion_popup.lift()
+
+    def _hide_attribute_suggestions(self) -> None:
+        if self.attribute_suggestion_popup is None or not self.attribute_suggestion_popup.winfo_exists():
+            self.attribute_suggestion_popup = None
+            self.attribute_suggestion_listbox = None
+            return
+        self.attribute_suggestion_popup.withdraw()
+
+    def _is_attribute_popup_widget(self, widget: tk.Misc | None) -> bool:
+        if widget is None:
+            return False
+        if widget is self.attribute_entry:
+            return True
+        if self.attribute_suggestion_listbox is not None and widget is self.attribute_suggestion_listbox:
+            return True
+        if self.attribute_suggestion_popup is not None and widget is self.attribute_suggestion_popup:
+            return True
+        master = getattr(widget, "master", None)
+        while master is not None:
+            if self.attribute_suggestion_popup is not None and master is self.attribute_suggestion_popup:
+                return True
+            master = getattr(master, "master", None)
+        return False
+
+    def _selected_attribute_suggestion_value(self) -> str | None:
+        if self.attribute_suggestion_listbox is None or not self.attribute_suggestion_listbox.winfo_exists():
+            return None
+        selection = self.attribute_suggestion_listbox.curselection()
+        if selection:
+            return str(self.attribute_suggestion_listbox.get(selection[0]))
+        if self.attribute_suggestion_values:
+            return self.attribute_suggestion_values[0]
+        return None
+
+    def _accept_attribute_suggestion(self, value: str | None) -> None:
+        if not value:
+            self._hide_attribute_suggestions()
+            return
+        self.attribute_display_var.set(value)
+        self._apply_current_attribute_selection()
+        self.attribute_entry.focus_set()
+        self.attribute_entry.icursor("end")
+
+    def _accept_attribute_listbox_click(self, _event: tk.Event[tk.Misc]) -> str:
+        self._accept_attribute_suggestion(self._selected_attribute_suggestion_value())
+        return "break"
+
+    def _accept_attribute_listbox_keyboard(self, _event: tk.Event[tk.Misc]) -> str:
+        self._accept_attribute_suggestion(self._selected_attribute_suggestion_value())
+        return "break"
+
+    def _open_attribute_dropdown_event(self, _event: tk.Event[tk.Misc]) -> str:
+        values = self._update_attribute_combo_values(self.attribute_display_var.get())
+        if values:
+            self._show_attribute_suggestions(values)
+            if self.attribute_suggestion_listbox is not None:
+                self.attribute_suggestion_listbox.focus_set()
+        else:
+            self._hide_attribute_suggestions()
+        return "break"
+
+    def _close_attribute_dropdown_event(self, _event: tk.Event[tk.Misc]) -> str:
+        self._hide_attribute_suggestions()
+        self.attribute_entry.focus_set()
+        return "break"
+
+    def _handle_attribute_return(self, _event: tk.Event[tk.Misc]) -> str:
+        suggestion = self._selected_attribute_suggestion_value()
+        if suggestion is not None:
+            self._accept_attribute_suggestion(suggestion)
+        else:
+            self._apply_current_attribute_selection()
+        return "break"
+
+    def _handle_attribute_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
+        self.after(120, self._finalize_attribute_focus_out)
+
+    def _handle_attribute_popup_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
+        self.after(120, self._finalize_attribute_focus_out)
+
+    def _finalize_attribute_focus_out(self) -> None:
+        focus_widget = self.focus_get()
+        if self._is_attribute_popup_widget(focus_widget):
+            return
+        self._hide_attribute_suggestions()
+        self._apply_current_attribute_selection()
+
+    def _on_attribute_key_release(self, event: tk.Event[tk.Misc]) -> None:
+        ignored_keys = {
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Tab",
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+            "Alt_L",
+            "Alt_R",
+        }
+        if event.keysym in ignored_keys:
+            return
+
+        values = self._update_attribute_combo_values(self.attribute_display_var.get())
+        if self.attribute_display_var.get().strip():
+            self._show_attribute_suggestions(values)
+        else:
+            self._hide_attribute_suggestions()
+
+    def _current_attribute_row_context(self) -> AttributeRow:
+        return AttributeRow(
+            criteria_id=self.criteria_id_var.get().strip(),
+            label=self.label_var.get().strip(),
+            value_format=self.format_var.get().strip(),
+            max_length=self._current_max_length(),
+            type_name=self.type_name_var.get().strip(),
+            value=self.value_var.get().strip(),
+        )
+
+    def _current_key_value_options(self) -> list[AttributeKeyValueOption]:
+        row = self._current_attribute_row_context()
+        if not is_attribute_key_value_format(row.value_format):
+            return []
+        for group_key in row.key_value_group_candidates():
+            options = self.key_value_options_by_group.get(group_key, [])
+            if options:
+                return options
+        return []
+
+    def _resolve_value_option(self, raw_value: str) -> AttributeKeyValueOption | None:
+        row = self._current_attribute_row_context()
+        if not is_attribute_key_value_format(row.value_format):
+            return None
+        return resolve_attribute_key_value_option(row, raw_value, self.key_value_options_by_group)
+
+    def _normalize_current_value_selection(self) -> None:
+        if not is_attribute_key_value_format(self.format_var.get()):
+            self._hide_value_suggestions()
+            return
+        raw_value = self.value_var.get().strip()
+        if not raw_value:
+            return
+        option = self._resolve_value_option(raw_value)
+        if option is not None and option.display_label() != raw_value:
+            self.value_var.set(option.display_label())
+
+    def _update_value_suggestion_values(self, query: str = "") -> list[str]:
+        group_options = self._current_key_value_options()
+        if not group_options:
+            self.value_suggestion_values = []
+            return []
+
+        query_text = normalize_lookup_text(query)
+        if not query_text:
+            filtered_options = group_options[:120]
+        else:
+            tokens = split_search_terms(query_text)
+            ranked_matches = []
+            for option in group_options:
+                normalized_blob = " ".join(
+                    part
+                    for part in [
+                        normalize_lookup_text(option.key_value_id),
+                        normalize_lookup_text(option.label),
+                        normalize_lookup_text(option.display_label()),
+                    ]
+                    if part
+                )
+                if tokens and not all(token in normalized_blob for token in tokens):
+                    continue
+                score = score_attribute_key_value_match(option, query_text)
+                if score > 0:
+                    ranked_matches.append((score, option))
+            ranked_matches.sort(
+                key=lambda entry: (
+                    -entry[0],
+                    entry[1].label.casefold(),
+                    entry[1].key_value_id.casefold(),
+                )
+            )
+            filtered_options = [option for _score, option in ranked_matches[:150]]
+
+        self.value_suggestion_values = [option.display_label() for option in filtered_options]
+        return list(self.value_suggestion_values)
+
+    def _ensure_value_suggestion_popup(self) -> None:
+        if self.value_suggestion_popup is not None and self.value_suggestion_popup.winfo_exists():
+            return
+
+        popup = tk.Toplevel(self)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.transient(self.winfo_toplevel())
+        popup.configure(background="#C7BFAF", padx=1, pady=1)
+
+        listbox = tk.Listbox(
+            popup,
+            activestyle="none",
+            exportselection=False,
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+        )
+        listbox.pack(fill="both", expand=True)
+        listbox.bind("<ButtonRelease-1>", self._accept_value_listbox_click)
+        listbox.bind("<Double-Button-1>", self._accept_value_listbox_click)
+        listbox.bind("<Return>", self._accept_value_listbox_keyboard)
+        listbox.bind("<Escape>", self._close_value_dropdown_event)
+        listbox.bind("<FocusOut>", self._handle_value_popup_focus_out)
+
+        self.value_suggestion_popup = popup
+        self.value_suggestion_listbox = listbox
+
+    def _show_value_suggestions(self, values: list[str]) -> None:
+        if not values:
+            self._hide_value_suggestions()
+            return
+
+        self._ensure_value_suggestion_popup()
+        if self.value_suggestion_popup is None or self.value_suggestion_listbox is None:
+            return
+
+        listbox = self.value_suggestion_listbox
+        listbox.delete(0, "end")
+        for value in values:
+            listbox.insert("end", value)
+
+        visible_rows = min(max(len(values), 1), 8)
+        listbox.configure(height=visible_rows)
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(0)
+        listbox.activate(0)
+        listbox.see(0)
+
+        self.value_suggestion_popup.update_idletasks()
+        x_pos = self.value_entry.winfo_rootx()
+        y_pos = self.value_entry.winfo_rooty() + self.value_entry.winfo_height()
+        width = max(self.value_entry.winfo_width(), 360)
+        height = self.value_suggestion_popup.winfo_reqheight()
+        self.value_suggestion_popup.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
+        self.value_suggestion_popup.deiconify()
+        self.value_suggestion_popup.lift()
+
+    def _hide_value_suggestions(self) -> None:
+        if self.value_suggestion_popup is None or not self.value_suggestion_popup.winfo_exists():
+            self.value_suggestion_popup = None
+            self.value_suggestion_listbox = None
+            return
+        self.value_suggestion_popup.withdraw()
+
+    def _is_value_popup_widget(self, widget: tk.Misc | None) -> bool:
+        if widget is None:
+            return False
+        if widget is self.value_entry:
+            return True
+        if self.value_suggestion_listbox is not None and widget is self.value_suggestion_listbox:
+            return True
+        if self.value_suggestion_popup is not None and widget is self.value_suggestion_popup:
+            return True
+        master = getattr(widget, "master", None)
+        while master is not None:
+            if self.value_suggestion_popup is not None and master is self.value_suggestion_popup:
+                return True
+            master = getattr(master, "master", None)
+        return False
+
+    def _selected_value_suggestion_value(self) -> str | None:
+        if self.value_suggestion_listbox is None or not self.value_suggestion_listbox.winfo_exists():
+            return None
+        selection = self.value_suggestion_listbox.curselection()
+        if selection:
+            return str(self.value_suggestion_listbox.get(selection[0]))
+        if self.value_suggestion_values:
+            return self.value_suggestion_values[0]
+        return None
+
+    def _accept_value_suggestion(self, value: str | None) -> None:
+        if not value:
+            self._hide_value_suggestions()
+            return
+        self.value_var.set(value)
+        self._normalize_current_value_selection()
+        self._hide_value_suggestions()
+        self.value_entry.focus_set()
+        self.value_entry.icursor("end")
+
+    def _accept_value_listbox_click(self, _event: tk.Event[tk.Misc]) -> str:
+        self._accept_value_suggestion(self._selected_value_suggestion_value())
+        return "break"
+
+    def _accept_value_listbox_keyboard(self, _event: tk.Event[tk.Misc]) -> str:
+        self._accept_value_suggestion(self._selected_value_suggestion_value())
+        return "break"
+
+    def _open_value_dropdown_event(self, _event: tk.Event[tk.Misc]) -> str:
+        values = self._update_value_suggestion_values(self.value_var.get())
+        if values:
+            self._show_value_suggestions(values)
+            if self.value_suggestion_listbox is not None:
+                self.value_suggestion_listbox.focus_set()
+        else:
+            self._hide_value_suggestions()
+        return "break"
+
+    def _close_value_dropdown_event(self, _event: tk.Event[tk.Misc]) -> str:
+        self._hide_value_suggestions()
+        self.value_entry.focus_set()
+        return "break"
+
+    def _handle_value_return(self, _event: tk.Event[tk.Misc]) -> str:
+        suggestion = self._selected_value_suggestion_value()
+        if suggestion is not None:
+            self._accept_value_suggestion(suggestion)
+        else:
+            self._normalize_current_value_selection()
+        return "break"
+
+    def _handle_value_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
+        self.after(120, self._finalize_value_focus_out)
+
+    def _handle_value_popup_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
+        self.after(120, self._finalize_value_focus_out)
+
+    def _finalize_value_focus_out(self) -> None:
+        focus_widget = self.focus_get()
+        if self._is_value_popup_widget(focus_widget):
+            return
+        self._hide_value_suggestions()
+        self._normalize_current_value_selection()
+
+    def _on_value_key_release(self, event: tk.Event[tk.Misc]) -> None:
+        ignored_keys = {
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Tab",
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+            "Alt_L",
+            "Alt_R",
+        }
+        if event.keysym in ignored_keys:
+            return
+        if not is_attribute_key_value_format(self.format_var.get()):
+            self._hide_value_suggestions()
+            return
+
+        values = self._update_value_suggestion_values(self.value_var.get())
+        if self.value_var.get().strip():
+            self._show_value_suggestions(values)
+        else:
+            self._hide_value_suggestions()
+
+    def _emit_change(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def _current_max_length(self) -> int | None:
+        raw_value = self.max_length_var.get().strip()
+        if not raw_value:
+            return None
+        try:
+            return int(raw_value)
+        except ValueError:
+            return None
+
+    def _normalize_current_value(self, value_format: str, value: str) -> str:
+        normalized = value.strip()
+        format_key = value_format.strip().casefold()
+        if format_key == "flag (ja / nein)":
+            mapping = {
+                "1": "Ja",
+                "true": "Ja",
+                "wahr": "Ja",
+                "yes": "Ja",
+                "ja": "Ja",
+                "x": "Ja",
+                "0": "Nein",
+                "false": "Nein",
+                "falsch": "Nein",
+                "no": "Nein",
+                "nein": "Nein",
+            }
+            return mapping.get(normalized.casefold(), normalized)
+        if format_key == "kein wert":
+            return ""
+        return normalized
+
+    def _build_current_row(self) -> AttributeRow:
+        value_format = self.format_var.get().strip()
+        return AttributeRow(
+            criteria_id=self.criteria_id_var.get().strip(),
+            label=self.label_var.get().strip(),
+            value_format=value_format,
+            max_length=self._current_max_length(),
+            type_name=self.type_name_var.get().strip(),
+            value=self._normalize_current_value(value_format, self.value_var.get()),
+        )
+
+    def _validate_row(self, row: AttributeRow) -> None:
+        if not row.criteria_id:
+            raise ValueError("Bitte mindestens eine TecDoc Kriterien ID angeben.")
+        if row.max_length is not None and row.value and len(row.value) > row.max_length:
+            raise ValueError(f"Der Wert fuer {row.display_label()} ist laenger als erlaubt ({row.max_length}).")
+        if row.value_format.strip().casefold() != "kein wert" and not row.value.strip():
+            raise ValueError("Bitte fuer dieses Attribut einen Wert eingeben.")
+
+    def add_row(self) -> None:
+        self._apply_current_attribute_selection()
+        row = self._build_current_row()
+        try:
+            self._validate_row(row)
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        item_id = self.tree.insert("", "end", values=(row.criteria_id, row.label, row.value_format, row.value))
+        self.row_type_names[item_id] = row.type_name
+        self._select_first_row(select_last=True)
+        self._emit_change()
+
+    def update_selected_row(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            return
+        self._apply_current_attribute_selection()
+        row = self._build_current_row()
+        try:
+            self._validate_row(row)
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        self.tree.item(selected[0], values=(row.criteria_id, row.label, row.value_format, row.value))
+        self.row_type_names[selected[0]] = row.type_name
+        self.tree.focus(selected[0])
+        self._handle_selection()
+        self._emit_change()
+
+    def remove_selected(self) -> None:
+        for item_id in self.tree.selection():
+            self.row_type_names.pop(item_id, None)
+            self.tree.delete(item_id)
+        self.clear_form()
+        self._select_first_row()
+        self._emit_change()
+
+    def copy_selected_rows(self) -> None:
+        selected_items = list(self.tree.selection())
+        if not selected_items:
+            return
+        rows = []
+        for item_id in selected_items:
+            values = [str(value).strip() for value in self.tree.item(item_id, "values")]
+            rows.append("\t".join(values))
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(rows))
+
+    def clear_form(self) -> None:
+        self.attribute_display_var.set("")
+        self.criteria_id_var.set("")
+        self.label_var.set("")
+        self.format_var.set("")
+        self.max_length_var.set("")
+        self.type_name_var.set("")
+        self.value_var.set("")
+        self._hide_attribute_suggestions()
+        self._hide_value_suggestions()
+        self._update_hint()
+
+    def _update_hint(self) -> None:
+        format_label = self.format_var.get().strip()
+        if not format_label:
+            self.hint_var.set("Waehle ein Attribut aus oder gib die Kriterien-ID manuell ein.")
+            return
+        format_key = format_label.casefold()
+        max_length = self.max_length_var.get().strip() or "-"
+        if format_key == "kein wert":
+            self.hint_var.set(f"Format: {format_label}. Dieses Attribut wird ohne Wert gespeichert. Max. Laenge: {max_length}.")
+            return
+        if format_key == "flag (ja / nein)":
+            self.hint_var.set(f"Format: {format_label}. Bitte bevorzugt 'Ja' oder 'Nein' verwenden. Max. Laenge: {max_length}.")
+            return
+        if is_attribute_key_value_format(format_label):
+            options = self._current_key_value_options()
+            group_label = self.type_name_var.get().strip() or self.label_var.get().strip() or "-"
+            self.hint_var.set(
+                f"Format: {format_label}. Schluesselwertgruppe: {group_label}. "
+                f"{len(options)} moegliche Werte, Suche mit Live-Vorschlaegen. Max. Laenge: {max_length}."
+            )
+            return
+        self.hint_var.set(f"Format: {format_label}. Max. Laenge laut Katalog: {max_length}.")
+
+    def get_rows(self) -> list[AttributeRow]:
+        rows = []
+        for item_id in self.tree.get_children():
+            criteria_id, label, value_format, value = self.tree.item(item_id, "values")
+            catalog_entry = self.catalog_by_id.get(str(criteria_id).strip())
+            rows.append(
+                AttributeRow(
+                    criteria_id=str(criteria_id).strip(),
+                    label=str(label).strip() or (catalog_entry.label if catalog_entry is not None else ""),
+                    value_format=str(value_format).strip() or (catalog_entry.value_format if catalog_entry is not None else ""),
+                    max_length=catalog_entry.max_length if catalog_entry is not None else None,
+                    type_name=(
+                        catalog_entry.type_name
+                        if catalog_entry is not None
+                        else self.row_type_names.get(item_id, "").strip()
+                    ),
+                    value=str(value).strip(),
+                )
+            )
+        return normalize_attribute_rows(rows)
+
+    def set_rows(self, rows: list[AttributeRow]) -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        self.row_type_names = {}
+        for row in normalize_attribute_rows(rows):
+            item_id = self.tree.insert("", "end", values=(row.criteria_id, row.label, row.value_format, row.value))
+            self.row_type_names[item_id] = row.type_name
+        self._select_first_row()
+
+    def _select_first_row(self, select_last: bool = False) -> None:
+        children = list(self.tree.get_children())
+        if not children:
+            return
+        target = children[-1] if select_last else children[0]
+        self.tree.selection_set(target)
+        self.tree.focus(target)
+        self._handle_selection()
+
+    def _handle_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        criteria_id, label, value_format, value = self.tree.item(selected[0], "values")
+        self.criteria_id_var.set(str(criteria_id).strip())
+        self.label_var.set(str(label).strip())
+        self.format_var.set(str(value_format).strip())
+        self.value_var.set(str(value).strip())
+        catalog_entry = self.catalog_by_id.get(self.criteria_id_var.get())
+        self.max_length_var.set("" if catalog_entry is None or catalog_entry.max_length is None else str(catalog_entry.max_length))
+        self.type_name_var.set(
+            catalog_entry.type_name
+            if catalog_entry is not None
+            else self.row_type_names.get(selected[0], "").strip()
+        )
+        display_parts = [self.criteria_id_var.get(), self.label_var.get()]
+        self.attribute_display_var.set(" | ".join(part for part in display_parts if part))
+        self._normalize_current_value_selection()
+        self._update_hint()
+
+    def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            if item_id not in self.tree.selection():
+                self.tree.selection_set(item_id)
+            self.tree.focus(item_id)
+            self._handle_selection()
+        has_selection = bool(self.tree.selection())
+        self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.grab_release()
+
+
 class GenArtSearchDialog:
     def __init__(self, master: tk.Misc, registry: GenArtRegistry, initial_query: str = "") -> None:
         self.master = master
@@ -3613,6 +5655,11 @@ class ApolloImportApp:
         self.import_dir_var = tk.StringVar(value=str(DEFAULT_IMPORT_DIR))
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
         self.genart_source_path_var = tk.StringVar(value=str(DEFAULT_GENART_SOURCE) if DEFAULT_GENART_SOURCE.exists() else "")
+        self.competitor_source_path_var = tk.StringVar(value=str(DEFAULT_COMPETITOR_SOURCE) if DEFAULT_COMPETITOR_SOURCE.exists() else "")
+        self.attribute_source_path_var = tk.StringVar(value=str(DEFAULT_ATTRIBUTE_SOURCE) if DEFAULT_ATTRIBUTE_SOURCE.exists() else "")
+        self.attribute_key_value_source_path_var = tk.StringVar(
+            value=str(DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE) if DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE.exists() else ""
+        )
         self.product_list_path_var = tk.StringVar()
         self.deepl_api_key_var = tk.StringVar(value=os.getenv("DEEPL_API_KEY", ""))
         self.deepl_base_url_var = tk.StringVar(value=os.getenv("DEEPL_API_BASE_URL", DEEPL_DEFAULT_BASE_URL))
@@ -3636,6 +5683,9 @@ class ApolloImportApp:
         self.update_status_var = tk.StringVar(value=f"Aktuelle Version: {APP_VERSION_TAG}")
         self.known_id_count_var = tk.StringVar(value="0 IDs geladen")
         self.genart_count_var = tk.StringVar(value="0 GenArts geladen")
+        self.competitor_count_var = tk.StringVar(value="0 Mitbewerber geladen")
+        self.attribute_count_var = tk.StringVar(value="0 Attribute geladen")
+        self.attribute_key_value_count_var = tk.StringVar(value="0 Schluesselwerte geladen")
         self.article_section_collapsed = False
         self.api_section_collapsed = False
         self.article_browser_collapsed = False
@@ -3645,6 +5695,12 @@ class ApolloImportApp:
         self.current_id_article_number = ""
         self.article_browser_records: dict[str, StoredArticleSnapshot] = {}
         self.selected_genart_selections: list[GenArtSelection] = []
+        self.competitor_options: list[CompetitorOption] = []
+        self.competitor_options_by_id: dict[str, CompetitorOption] = {}
+        self.attribute_options: list[AttributeOption] = []
+        self.attribute_options_by_id: dict[str, AttributeOption] = {}
+        self.attribute_key_value_options: list[AttributeKeyValueOption] = []
+        self.attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] = {}
         self.current_kunzer_category_context = ""
         self.google_lens_web_cache: dict[str, GoogleLensWebResult | None] = {}
         self.genart_image_signature_cache: dict[str, ImageSignature | None] = {}
@@ -3668,6 +5724,9 @@ class ApolloImportApp:
         self._restore_session_state()
         self._load_known_ids(initial=True)
         self._load_genart_catalog(initial=True)
+        self._load_competitor_catalog(initial=True)
+        self._load_attribute_catalog(initial=True)
+        self._load_attribute_key_value_catalog(initial=True)
         self.refresh_preview()
         self._apply_pending_session_selection()
 
@@ -3726,6 +5785,10 @@ class ApolloImportApp:
         self.short_tab = ttk.Frame(self.main_notebook, padding=18)
         self.long_tab = ttk.Frame(self.main_notebook, padding=18)
         self.genart_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.attribute_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.oe_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.comparison_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.competitor_tab = ttk.Frame(self.main_notebook, padding=18)
         self.image_tab = ttk.Frame(self.main_notebook, padding=18)
         self.document_tab = ttk.Frame(self.main_notebook, padding=18)
         self.links_tab = ttk.Frame(self.main_notebook, padding=18)
@@ -3734,6 +5797,10 @@ class ApolloImportApp:
         self.main_notebook.add(self.short_tab, text="Kurzbezeichnung")
         self.main_notebook.add(self.long_tab, text="Text")
         self.main_notebook.add(self.genart_tab, text="GenArten")
+        self.main_notebook.add(self.attribute_tab, text="Attribute")
+        self.main_notebook.add(self.oe_tab, text="OE-Nummern")
+        self.main_notebook.add(self.comparison_tab, text="Vergleichsnummern")
+        self.main_notebook.add(self.competitor_tab, text="Mitbewerber")
         self.main_notebook.add(self.image_tab, text="Bilder")
         self.main_notebook.add(self.document_tab, text="Dokumente")
         self.main_notebook.add(self.links_tab, text="Links")
@@ -3742,6 +5809,9 @@ class ApolloImportApp:
         self._build_short_tab()
         self._build_long_tab()
         self._build_genart_tab()
+        self._build_attribute_tab()
+        self._build_reference_tabs()
+        self._build_competitor_tab()
         self._build_media_tabs()
 
         status_bar = ttk.Label(shell, textvariable=self.status_var, anchor="w", foreground="#5E6472")
@@ -3834,6 +5904,88 @@ class ApolloImportApp:
             )
         return rows
 
+    def _oe_number_rows_to_state(self, rows: list[OeNumberRow]) -> list[dict[str, str]]:
+        return [{"value": row.value} for row in normalize_oe_number_rows(rows)]
+
+    def _oe_number_rows_from_state(self, payload: object) -> list[OeNumberRow]:
+        if not isinstance(payload, list):
+            return []
+        rows: list[OeNumberRow] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            rows.append(OeNumberRow(value=str(item.get("value", ""))))
+        return normalize_oe_number_rows(rows)
+
+    def _comparison_rows_to_state(self, rows: list[ComparisonNumberRow]) -> list[dict[str, str]]:
+        return [
+            {
+                "competitor_id": row.competitor_id,
+                "competitor_code": row.competitor_code,
+                "competitor_name": row.competitor_name,
+                "reference_number": row.reference_number,
+            }
+            for row in normalize_comparison_number_rows(rows)
+        ]
+
+    def _comparison_rows_from_state(self, payload: object) -> list[ComparisonNumberRow]:
+        if not isinstance(payload, list):
+            return []
+        rows: list[ComparisonNumberRow] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                ComparisonNumberRow(
+                    competitor_id=str(item.get("competitor_id", "")),
+                    competitor_code=str(item.get("competitor_code", "")),
+                    competitor_name=str(item.get("competitor_name", "")),
+                    reference_number=str(item.get("reference_number", "")),
+                )
+            )
+        return normalize_comparison_number_rows(rows)
+
+    def _attribute_rows_to_state(self, rows: list[AttributeRow]) -> list[dict[str, object]]:
+        return [
+            {
+                "criteria_id": row.criteria_id,
+                "label": row.label,
+                "value_format": row.value_format,
+                "max_length": row.max_length,
+                "type_name": row.type_name,
+                "value": row.value,
+            }
+            for row in normalize_attribute_rows(rows)
+        ]
+
+    def _attribute_rows_from_state(self, payload: object) -> list[AttributeRow]:
+        if not isinstance(payload, list):
+            return []
+        rows: list[AttributeRow] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            max_length_raw = item.get("max_length")
+            max_length: int | None
+            if isinstance(max_length_raw, int):
+                max_length = max_length_raw
+            else:
+                try:
+                    max_length = int(str(max_length_raw).strip()) if str(max_length_raw).strip() else None
+                except Exception:
+                    max_length = None
+            rows.append(
+                AttributeRow(
+                    criteria_id=str(item.get("criteria_id", "")),
+                    label=str(item.get("label", "")),
+                    value_format=str(item.get("value_format", "")),
+                    max_length=max_length,
+                    type_name=str(item.get("type_name", "")),
+                    value=str(item.get("value", "")),
+                )
+            )
+        return normalize_attribute_rows(rows)
+
     def _genart_selections_to_state(self, selections: list[GenArtSelection]) -> list[dict[str, str]]:
         return [
             {
@@ -3870,13 +6022,16 @@ class ApolloImportApp:
             selected_browser_article = str(self.article_browser_tree.selection()[0]).strip()
 
         return {
-            "version": 2,
+            "version": 5,
             "window_geometry": self.root.winfo_geometry(),
             "selected_tab": selected_tab,
             "paths": {
                 "import_dir": self.import_dir_var.get(),
                 "output_dir": self.output_dir_var.get(),
                 "genart_source_path": self.genart_source_path_var.get(),
+                "competitor_source_path": self.competitor_source_path_var.get(),
+                "attribute_source_path": self.attribute_source_path_var.get(),
+                "attribute_key_value_source_path": self.attribute_key_value_source_path_var.get(),
                 "product_list_path": self.product_list_path_var.get(),
             },
             "api": {
@@ -3909,6 +6064,37 @@ class ApolloImportApp:
                 "short_values": self._translation_set_to_state(self.short_text_frame.get_value()),
                 "long_auto_uni": self.long_text_frame.auto_uni_var.get(),
                 "long_values": self._translation_set_to_state(self.long_text_frame.get_value()),
+            },
+            "references": {
+                "attributes": {
+                    "rows": self._attribute_rows_to_state(self.attribute_frame.get_rows()),
+                    "form": {
+                        "attribute_display": self.attribute_frame.attribute_display_var.get(),
+                        "criteria_id": self.attribute_frame.criteria_id_var.get(),
+                        "label": self.attribute_frame.label_var.get(),
+                        "value_format": self.attribute_frame.format_var.get(),
+                        "max_length": self.attribute_frame.max_length_var.get(),
+                        "type_name": self.attribute_frame.type_name_var.get(),
+                        "value": self.attribute_frame.value_var.get(),
+                    },
+                },
+                "oe_numbers": {
+                    "rows": self._oe_number_rows_to_state(self.oe_frame.get_rows()),
+                    "form": {
+                        "value": self.oe_frame.value_var.get(),
+                    },
+                },
+                "comparison_numbers": {
+                    "rows": self._comparison_rows_to_state(self.comparison_frame.get_rows()),
+                    "form": {
+                        "competitor_display": self.comparison_frame.competitor_display_var.get(),
+                        "competitor_id": self.comparison_frame.competitor_id_var.get(),
+                        "competitor_code": self.comparison_frame.competitor_code_var.get(),
+                        "competitor_name": self.comparison_frame.competitor_name_var.get(),
+                        "reference_number": self.comparison_frame.reference_number_var.get(),
+                    },
+                },
+                "competitor_search": getattr(self, "competitor_search_var", tk.StringVar()).get() if hasattr(self, "competitor_search_var") else "",
             },
             "media": {
                 "images": {
@@ -3983,6 +6169,11 @@ class ApolloImportApp:
                 self.import_dir_var.set(str(paths.get("import_dir", self.import_dir_var.get())))
                 self.output_dir_var.set(str(paths.get("output_dir", self.output_dir_var.get())))
                 self.genart_source_path_var.set(str(paths.get("genart_source_path", self.genart_source_path_var.get())))
+                self.competitor_source_path_var.set(str(paths.get("competitor_source_path", self.competitor_source_path_var.get())))
+                self.attribute_source_path_var.set(str(paths.get("attribute_source_path", self.attribute_source_path_var.get())))
+                self.attribute_key_value_source_path_var.set(
+                    str(paths.get("attribute_key_value_source_path", self.attribute_key_value_source_path_var.get()))
+                )
                 self.product_list_path_var.set(str(paths.get("product_list_path", self.product_list_path_var.get())))
 
             api = payload.get("api")
@@ -4030,6 +6221,43 @@ class ApolloImportApp:
                     self._translation_set_from_state(translations.get("long_values")),
                     auto_uni=bool(translations.get("long_auto_uni", True)),
                 )
+
+            references = payload.get("references")
+            if isinstance(references, dict):
+                attribute_payload = references.get("attributes")
+                if isinstance(attribute_payload, dict):
+                    self.attribute_frame.set_rows(self._attribute_rows_from_state(attribute_payload.get("rows")))
+                    form = attribute_payload.get("form")
+                    if isinstance(form, dict):
+                        self.attribute_frame.attribute_display_var.set(str(form.get("attribute_display", "")))
+                        self.attribute_frame.criteria_id_var.set(str(form.get("criteria_id", "")))
+                        self.attribute_frame.label_var.set(str(form.get("label", "")))
+                        self.attribute_frame.format_var.set(str(form.get("value_format", "")))
+                        self.attribute_frame.max_length_var.set(str(form.get("max_length", "")))
+                        self.attribute_frame.type_name_var.set(str(form.get("type_name", "")))
+                        self.attribute_frame.value_var.set(str(form.get("value", "")))
+                        self.attribute_frame._update_hint()
+
+                oe_payload = references.get("oe_numbers")
+                if isinstance(oe_payload, dict):
+                    self.oe_frame.set_rows(self._oe_number_rows_from_state(oe_payload.get("rows")))
+                    form = oe_payload.get("form")
+                    if isinstance(form, dict):
+                        self.oe_frame.value_var.set(str(form.get("value", "")))
+
+                comparison_payload = references.get("comparison_numbers")
+                if isinstance(comparison_payload, dict):
+                    self.comparison_frame.set_rows(self._comparison_rows_from_state(comparison_payload.get("rows")))
+                    form = comparison_payload.get("form")
+                    if isinstance(form, dict):
+                        self.comparison_frame.competitor_display_var.set(str(form.get("competitor_display", "")))
+                        self.comparison_frame.competitor_id_var.set(str(form.get("competitor_id", "")))
+                        self.comparison_frame.competitor_code_var.set(str(form.get("competitor_code", "")))
+                        self.comparison_frame.competitor_name_var.set(str(form.get("competitor_name", "")))
+                        self.comparison_frame.reference_number_var.set(str(form.get("reference_number", "")))
+
+                if hasattr(self, "competitor_search_var"):
+                    self.competitor_search_var.set(str(references.get("competitor_search", "")))
 
             media = payload.get("media")
             if isinstance(media, dict):
@@ -4511,7 +6739,7 @@ if ($copied) {{
 
         ttk.Label(
             export_frame,
-            text="Du kannst die sieben Exportdateien entweder in einen neuen Zeitstempel-Unterordner schreiben oder immer direkt im Ausgabeordner aktualisieren.",
+            text="Du kannst die zehn Exportdateien entweder in einen neuen Zeitstempel-Unterordner schreiben oder immer direkt im Ausgabeordner aktualisieren.",
             wraplength=500,
             foreground="#5E6472",
         ).grid(row=0, column=0, sticky="w")
@@ -4640,7 +6868,7 @@ if ($copied) {{
         )
         ttk.Button(browser_header, text="Liste aktualisieren", command=self.refresh_preview).grid(row=0, column=3)
 
-        columns = ("article", "source", "short_id", "long_id", "genart", "images", "documents", "videos", "links")
+        columns = ("article", "source", "short_id", "long_id", "genart", "attr", "oe", "comparison", "images", "documents", "videos", "links")
         self.browser_content_frame = ttk.Frame(browser_frame)
         self.browser_content_frame.grid(row=1, column=0, sticky="nsew")
         self.browser_content_frame.columnconfigure(0, weight=1)
@@ -4666,6 +6894,9 @@ if ($copied) {{
         self.article_browser_tree.heading("short_id", text="Kurz-ID")
         self.article_browser_tree.heading("long_id", text="Text-ID")
         self.article_browser_tree.heading("genart", text="GenArten")
+        self.article_browser_tree.heading("attr", text="Attr.")
+        self.article_browser_tree.heading("oe", text="OE")
+        self.article_browser_tree.heading("comparison", text="Vgl.")
         self.article_browser_tree.heading("images", text="Bilder")
         self.article_browser_tree.heading("documents", text="Dokumente")
         self.article_browser_tree.heading("videos", text="Videos")
@@ -4675,6 +6906,9 @@ if ($copied) {{
         self.article_browser_tree.column("short_id", width=100, anchor="center")
         self.article_browser_tree.column("long_id", width=100, anchor="center")
         self.article_browser_tree.column("genart", width=180, anchor="w")
+        self.article_browser_tree.column("attr", width=60, anchor="center")
+        self.article_browser_tree.column("oe", width=60, anchor="center")
+        self.article_browser_tree.column("comparison", width=60, anchor="center")
         self.article_browser_tree.column("images", width=70, anchor="center")
         self.article_browser_tree.column("documents", width=90, anchor="center")
         self.article_browser_tree.column("videos", width=70, anchor="center")
@@ -4805,6 +7039,129 @@ if ($copied) {{
         ttk.Button(action_row, text="Auswahl entfernen", command=self.remove_selected_genarts).grid(row=0, column=0)
         ttk.Button(action_row, text="Alle GenArten entfernen", command=self.clear_selected_genarts).grid(row=0, column=1, padx=(8, 0))
 
+    def _build_attribute_tab(self) -> None:
+        self.attribute_tab.columnconfigure(0, weight=1)
+        self.attribute_tab.rowconfigure(1, weight=1)
+
+        source_frame = ttk.LabelFrame(self.attribute_tab, text="Attributkatalog", padding=14)
+        source_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        source_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(source_frame, text="Attributdatei").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(source_frame, textvariable=self.attribute_source_path_var).grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Button(source_frame, text="Datei waehlen", command=self.choose_attribute_source_file).grid(row=0, column=2, padx=(8, 0), pady=4)
+        ttk.Button(source_frame, text="Neu laden", command=self._reload_attribute_catalog).grid(row=0, column=3, padx=(8, 0), pady=4)
+        ttk.Label(source_frame, text="Schluesselwerte").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(source_frame, textvariable=self.attribute_key_value_source_path_var).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Button(source_frame, text="Datei waehlen", command=self.choose_attribute_key_value_source_file).grid(
+            row=1, column=2, padx=(8, 0), pady=4
+        )
+        ttk.Button(source_frame, text="Neu laden", command=self._reload_attribute_key_value_catalog).grid(
+            row=1, column=3, padx=(8, 0), pady=4
+        )
+        ttk.Label(
+            source_frame,
+            text="Quelle fuer TecDoc Kriterien ID, Bezeichnung, Format, Typ und die moeglichen Schluesselwerte.",
+            foreground="#5E6472",
+            wraplength=980,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 4))
+        ttk.Label(source_frame, textvariable=self.attribute_count_var, foreground="#5E6472").grid(
+            row=3, column=0, columnspan=4, sticky="w"
+        )
+        ttk.Label(source_frame, textvariable=self.attribute_key_value_count_var, foreground="#5E6472").grid(
+            row=4, column=0, columnspan=4, sticky="w"
+        )
+
+        self.attribute_frame = AttributeTableFrame(
+            self.attribute_tab,
+            on_change=lambda: self._write_live_section("attributes"),
+        )
+        self.attribute_frame.grid(row=1, column=0, sticky="nsew")
+
+    def _build_reference_tabs(self) -> None:
+        self.oe_tab.columnconfigure(0, weight=1)
+        self.oe_tab.rowconfigure(0, weight=1)
+        self.comparison_tab.columnconfigure(0, weight=1)
+        self.comparison_tab.rowconfigure(0, weight=1)
+
+        self.oe_frame = SimpleValueTableFrame(
+            self.oe_tab,
+            title="OE-Nummern",
+            entry_label="OE-Nummer",
+            on_change=lambda: self._write_live_section("oe_numbers"),
+        )
+        self.oe_frame.grid(row=0, column=0, sticky="nsew")
+
+        self.comparison_frame = ComparisonTableFrame(
+            self.comparison_tab,
+            on_change=lambda: self._write_live_section("comparison_numbers"),
+        )
+        self.comparison_frame.grid(row=0, column=0, sticky="nsew")
+
+    def _build_competitor_tab(self) -> None:
+        self.competitor_tab.columnconfigure(0, weight=1)
+        self.competitor_tab.rowconfigure(1, weight=1)
+
+        header = ttk.LabelFrame(self.competitor_tab, text="Mitbewerber aus KHer.csv", padding=14)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        header.columnconfigure(1, weight=1)
+
+        ttk.Label(header, text="CSV-Datei").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        ttk.Entry(header, textvariable=self.competitor_source_path_var).grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Button(header, text="Datei waehlen", command=self.choose_competitor_source_file).grid(row=0, column=2, padx=(8, 0), pady=4)
+        ttk.Button(header, text="Neu laden", command=self._reload_competitor_catalog).grid(row=0, column=3, padx=(8, 0), pady=4)
+        ttk.Label(
+            header,
+            text="Es werden nur Zeilen mit gesetztem VGL-Flag geladen, also die fuer Vergleichsnummern relevanten Mitbewerber.",
+            foreground="#5E6472",
+            wraplength=980,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 4))
+        ttk.Label(header, textvariable=self.competitor_count_var, foreground="#5E6472").grid(row=2, column=0, columnspan=4, sticky="w")
+
+        content = ttk.LabelFrame(self.competitor_tab, text="Mitbewerberliste", padding=14)
+        content.grid(row=1, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(1, weight=1)
+
+        search_row = ttk.Frame(content)
+        search_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        search_row.columnconfigure(1, weight=1)
+        self.competitor_search_var = tk.StringVar()
+        ttk.Label(search_row, text="Suche").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        competitor_search_entry = ttk.Entry(search_row, textvariable=self.competitor_search_var)
+        competitor_search_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(search_row, text="In Vergleichsnummern uebernehmen", command=self._use_selected_competitor_for_comparison).grid(
+            row=0,
+            column=2,
+            padx=(8, 0),
+        )
+        self.competitor_search_var.trace_add("write", lambda *_args: self._refresh_competitor_tree())
+
+        table_frame = ttk.Frame(content)
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+        self.competitor_tree = ttk.Treeview(
+            table_frame,
+            columns=("competitor_id", "code", "name"),
+            show="headings",
+            selectmode="browse",
+            height=14,
+        )
+        self.competitor_tree.grid(row=0, column=0, sticky="nsew")
+        self.competitor_tree.heading("competitor_id", text="Mitbewerber ID")
+        self.competitor_tree.heading("code", text="Kuerzel")
+        self.competitor_tree.heading("name", text="Name")
+        self.competitor_tree.column("competitor_id", width=140, anchor="center")
+        self.competitor_tree.column("code", width=140, anchor="center")
+        self.competitor_tree.column("name", width=720, anchor="w")
+        self.competitor_tree.bind("<Double-1>", self._on_competitor_tree_double_click)
+
+        competitor_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.competitor_tree.yview)
+        competitor_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.competitor_tree.configure(yscrollcommand=competitor_scrollbar.set)
+
     def _build_media_tabs(self) -> None:
         self.image_tab.columnconfigure(0, weight=1)
         self.image_tab.rowconfigure(0, weight=1)
@@ -4901,6 +7258,60 @@ if ($copied) {{
             self.genart_source_path_var.set(selected)
             self._load_genart_catalog()
 
+    def choose_attribute_source_file(self) -> None:
+        initial_dir = (
+            str(Path(self.attribute_source_path_var.get()).parent)
+            if self.attribute_source_path_var.get().strip()
+            else str(DEFAULT_ATTRIBUTE_SOURCE.parent)
+        )
+        selected = filedialog.askopenfilename(
+            title="Attribut XLSX waehlen",
+            initialdir=initial_dir,
+            filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
+        )
+        if selected:
+            self.attribute_source_path_var.set(selected)
+            self._load_attribute_catalog()
+
+    def _reload_attribute_catalog(self) -> None:
+        self._load_attribute_catalog()
+
+    def choose_attribute_key_value_source_file(self) -> None:
+        initial_dir = (
+            str(Path(self.attribute_key_value_source_path_var.get()).parent)
+            if self.attribute_key_value_source_path_var.get().strip()
+            else str(DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE.parent)
+        )
+        selected = filedialog.askopenfilename(
+            title="Schluesselwert XLSX waehlen",
+            initialdir=initial_dir,
+            filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
+        )
+        if selected:
+            self.attribute_key_value_source_path_var.set(selected)
+            self._load_attribute_key_value_catalog()
+
+    def _reload_attribute_key_value_catalog(self) -> None:
+        self._load_attribute_key_value_catalog()
+
+    def choose_competitor_source_file(self) -> None:
+        initial_dir = (
+            str(Path(self.competitor_source_path_var.get()).parent)
+            if self.competitor_source_path_var.get().strip()
+            else str(DEFAULT_COMPETITOR_SOURCE.parent)
+        )
+        selected = filedialog.askopenfilename(
+            title="Mitbewerber CSV waehlen",
+            initialdir=initial_dir,
+            filetypes=[("CSV Dateien", "*.csv"), ("Alle Dateien", "*.*")],
+        )
+        if selected:
+            self.competitor_source_path_var.set(selected)
+            self._load_competitor_catalog()
+
+    def _reload_competitor_catalog(self) -> None:
+        self._load_competitor_catalog()
+
     def _load_genart_catalog(self, initial: bool = False) -> None:
         source_path = Path(self.genart_source_path_var.get().strip()) if self.genart_source_path_var.get().strip() else None
         if source_path is None or not source_path.exists():
@@ -4953,6 +7364,154 @@ if ($copied) {{
             self._normalize_genart_selection()
         if not initial:
             self.status_var.set(f"GenArt-Katalog geladen: {count} Eintraege")
+
+    def _load_competitor_catalog(self, initial: bool = False) -> None:
+        source_path = Path(self.competitor_source_path_var.get().strip()) if self.competitor_source_path_var.get().strip() else None
+        if source_path is None or not source_path.exists():
+            self.competitor_options = []
+            self.competitor_options_by_id = {}
+            self.competitor_count_var.set("0 Mitbewerber geladen")
+            if hasattr(self, "comparison_frame"):
+                self.comparison_frame.set_competitor_catalog([])
+            if hasattr(self, "competitor_tree"):
+                self._refresh_competitor_tree()
+            if not initial and source_path is not None:
+                self.status_var.set(f"Mitbewerber-CSV nicht gefunden: {source_path}")
+            return
+
+        try:
+            options = load_competitor_options(source_path)
+        except ValueError as exc:
+            self.competitor_options = []
+            self.competitor_options_by_id = {}
+            self.competitor_count_var.set("0 Mitbewerber geladen")
+            if hasattr(self, "comparison_frame"):
+                self.comparison_frame.set_competitor_catalog([])
+            if hasattr(self, "competitor_tree"):
+                self._refresh_competitor_tree()
+            if not initial:
+                self.status_var.set(str(exc))
+                messagebox.showwarning(APP_TITLE, str(exc))
+            return
+
+        self.competitor_options = options
+        self.competitor_options_by_id = {option.competitor_id: option for option in options}
+        self.competitor_count_var.set(f"{len(options)} Mitbewerber geladen")
+        if hasattr(self, "comparison_frame"):
+            self.comparison_frame.set_competitor_catalog(options)
+        if hasattr(self, "competitor_tree"):
+            self._refresh_competitor_tree()
+        self.article_browser_cache_signature = None
+        if not initial:
+            self.status_var.set(f"Mitbewerber-CSV geladen: {len(options)} Eintraege")
+            self.refresh_preview()
+
+    def _load_attribute_catalog(self, initial: bool = False) -> None:
+        source_path = Path(self.attribute_source_path_var.get().strip()) if self.attribute_source_path_var.get().strip() else None
+        if source_path is None or not source_path.exists():
+            self.attribute_options = []
+            self.attribute_options_by_id = {}
+            self.attribute_count_var.set("0 Attribute geladen")
+            if hasattr(self, "attribute_frame"):
+                self.attribute_frame.set_attribute_catalog([])
+            if not initial and source_path is not None:
+                self.status_var.set(f"Attributdatei nicht gefunden: {source_path}")
+            return
+
+        try:
+            options = load_attribute_options(source_path)
+        except ValueError as exc:
+            self.attribute_options = []
+            self.attribute_options_by_id = {}
+            self.attribute_count_var.set("0 Attribute geladen")
+            if hasattr(self, "attribute_frame"):
+                self.attribute_frame.set_attribute_catalog([])
+            if not initial:
+                self.status_var.set(str(exc))
+                messagebox.showwarning(APP_TITLE, str(exc))
+            return
+
+        self.attribute_options = options
+        self.attribute_options_by_id = {option.criteria_id: option for option in options}
+        self.attribute_count_var.set(f"{len(options)} Attribute geladen")
+        if hasattr(self, "attribute_frame"):
+            self.attribute_frame.set_attribute_catalog(options)
+        self.article_browser_cache_signature = None
+        if not initial:
+            self.status_var.set(f"Attributkatalog geladen: {len(options)} Eintraege")
+            self.refresh_preview()
+
+    def _load_attribute_key_value_catalog(self, initial: bool = False) -> None:
+        source_path = (
+            Path(self.attribute_key_value_source_path_var.get().strip())
+            if self.attribute_key_value_source_path_var.get().strip()
+            else None
+        )
+        if source_path is None or not source_path.exists():
+            self.attribute_key_value_options = []
+            self.attribute_key_values_by_group = {}
+            self.attribute_key_value_count_var.set("0 Schluesselwerte geladen")
+            if hasattr(self, "attribute_frame"):
+                self.attribute_frame.set_attribute_key_value_catalog({})
+            if not initial and source_path is not None:
+                self.status_var.set(f"Schluesselwertdatei nicht gefunden: {source_path}")
+            return
+
+        try:
+            options = load_attribute_key_value_options(source_path)
+        except ValueError as exc:
+            self.attribute_key_value_options = []
+            self.attribute_key_values_by_group = {}
+            self.attribute_key_value_count_var.set("0 Schluesselwerte geladen")
+            if hasattr(self, "attribute_frame"):
+                self.attribute_frame.set_attribute_key_value_catalog({})
+            if not initial:
+                self.status_var.set(str(exc))
+                messagebox.showwarning(APP_TITLE, str(exc))
+            return
+
+        self.attribute_key_value_options = options
+        self.attribute_key_values_by_group = build_attribute_key_value_group_index(options)
+        self.attribute_key_value_count_var.set(
+            f"{len(options)} Schluesselwerte in {len(self.attribute_key_values_by_group)} Gruppen geladen"
+        )
+        if hasattr(self, "attribute_frame"):
+            self.attribute_frame.set_attribute_key_value_catalog(self.attribute_key_values_by_group)
+        self.article_browser_cache_signature = None
+        if not initial:
+            self.status_var.set(f"Schluesselwertkatalog geladen: {len(options)} Eintraege")
+            self.refresh_preview()
+
+    def _refresh_competitor_tree(self) -> None:
+        if not hasattr(self, "competitor_tree"):
+            return
+        query = self.competitor_search_var.get().strip().casefold() if hasattr(self, "competitor_search_var") else ""
+        for item_id in self.competitor_tree.get_children():
+            self.competitor_tree.delete(item_id)
+        for option in self.competitor_options:
+            if query and query not in option.search_blob:
+                continue
+            self.competitor_tree.insert("", "end", iid=option.competitor_id, values=(option.competitor_id, option.code, option.name))
+
+    def _get_selected_competitor_option(self) -> CompetitorOption | None:
+        if not hasattr(self, "competitor_tree"):
+            return None
+        selection = self.competitor_tree.selection()
+        if not selection:
+            return None
+        return self.competitor_options_by_id.get(str(selection[0]).strip())
+
+    def _use_selected_competitor_for_comparison(self) -> None:
+        option = self._get_selected_competitor_option()
+        if option is None:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Mitbewerber aus der Liste auswaehlen.")
+            return
+        self.comparison_frame.prefill_competitor(option)
+        self.main_notebook.select(self.comparison_tab)
+        self.status_var.set(f"Mitbewerber uebernommen: {option.display_label()}")
+
+    def _on_competitor_tree_double_click(self, _event: tk.Event[tk.Misc]) -> None:
+        self._use_selected_competitor_for_comparison()
 
     def _refresh_genart_combobox_values(self) -> None:
         if not hasattr(self, "genart_combo"):
@@ -5537,6 +8096,9 @@ if ($copied) {{
             document_rows=bundle.document_rows,
             video_rows=bundle.video_rows,
             web_rows=bundle.web_rows,
+            oe_number_rows=bundle.oe_number_rows,
+            comparison_number_rows=bundle.comparison_number_rows,
+            attribute_rows=bundle.attribute_rows,
         )
 
     def _copy_snapshot(self, snapshot: StoredArticleSnapshot) -> StoredArticleSnapshot:
@@ -5557,6 +8119,27 @@ if ($copied) {{
             document_rows=[MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in snapshot.document_rows],
             video_rows=[MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in snapshot.video_rows],
             web_rows=[MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in snapshot.web_rows],
+            oe_number_rows=[OeNumberRow(value=row.value) for row in snapshot.oe_number_rows],
+            comparison_number_rows=[
+                ComparisonNumberRow(
+                    competitor_id=row.competitor_id,
+                    competitor_code=row.competitor_code,
+                    competitor_name=row.competitor_name,
+                    reference_number=row.reference_number,
+                )
+                for row in snapshot.comparison_number_rows
+            ],
+            attribute_rows=[
+                AttributeRow(
+                    criteria_id=row.criteria_id,
+                    label=row.label,
+                    value_format=row.value_format,
+                    max_length=row.max_length,
+                    type_name=row.type_name,
+                    value=row.value,
+                )
+                for row in snapshot.attribute_rows
+            ],
         )
 
     def _render_article_browser(self, current_article: str | None = None) -> None:
@@ -5578,6 +8161,9 @@ if ($copied) {{
                     snapshot.short_module_id,
                     snapshot.long_module_id,
                     summarize_genart_selections(snapshot.genart_selections, empty_label="-", limit=2),
+                    len(snapshot.attribute_rows),
+                    len(snapshot.oe_number_rows),
+                    len(snapshot.comparison_number_rows),
                     len(snapshot.image_rows),
                     len(snapshot.document_rows),
                     len(snapshot.video_rows),
@@ -5599,6 +8185,9 @@ if ($copied) {{
             SHORT_MAPPING_FILE[0],
             LONG_TEXT_FILE[0],
             GENART_FILE[0],
+            OE_FILE[0],
+            COMPARISON_FILE[0],
+            ATTRIBUTE_FILE[0],
             IMAGE_FILE[0],
             DOCUMENT_FILE[0],
             VIDEO_FILE[0],
@@ -5659,6 +8248,30 @@ if ($copied) {{
             snapshot.video_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.video_rows]
         if section in {"web_links", "all"}:
             snapshot.web_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.web_rows]
+        if section in {"oe_numbers", "all"}:
+            snapshot.oe_number_rows = [OeNumberRow(value=row.value) for row in bundle.oe_number_rows]
+        if section in {"comparison_numbers", "all"}:
+            snapshot.comparison_number_rows = [
+                ComparisonNumberRow(
+                    competitor_id=row.competitor_id,
+                    competitor_code=row.competitor_code,
+                    competitor_name=row.competitor_name,
+                    reference_number=row.reference_number,
+                )
+                for row in bundle.comparison_number_rows
+            ]
+        if section in {"attributes", "all"}:
+            snapshot.attribute_rows = [
+                AttributeRow(
+                    criteria_id=row.criteria_id,
+                    label=row.label,
+                    value_format=row.value_format,
+                    max_length=row.max_length,
+                    type_name=row.type_name,
+                    value=row.value,
+                )
+                for row in bundle.attribute_rows
+            ]
 
         self.article_browser_records[bundle.article_number] = snapshot
         self.genart_image_index_dirty = True
@@ -5704,6 +8317,33 @@ if ($copied) {{
             replace_article_keys={bundle.article_number},
         )
 
+    def _write_oe_live(self, bundle: ExportBundle, output_root: Path) -> None:
+        replace_article_rows_preserving_timestamps(
+            output_root / OE_FILE[0],
+            OE_FILE[1],
+            OE_HEADERS,
+            bundle.article_number,
+            build_oe_export_rows(bundle),
+        )
+
+    def _write_comparison_live(self, bundle: ExportBundle, output_root: Path) -> None:
+        replace_article_rows_preserving_timestamps(
+            output_root / COMPARISON_FILE[0],
+            COMPARISON_FILE[1],
+            COMPARISON_HEADERS,
+            bundle.article_number,
+            build_comparison_export_rows(bundle),
+        )
+
+    def _write_attribute_live(self, bundle: ExportBundle, output_root: Path) -> None:
+        replace_article_rows_preserving_timestamps(
+            output_root / ATTRIBUTE_FILE[0],
+            ATTRIBUTE_FILE[1],
+            ATTRIBUTE_HEADERS,
+            bundle.article_number,
+            build_attribute_export_rows(bundle),
+        )
+
     def _write_media_section_live(
         self,
         bundle: ExportBundle,
@@ -5738,6 +8378,12 @@ if ($copied) {{
                 self._write_long_text_live(bundle, output_root)
             elif section == "genart":
                 self._write_genart_live(bundle, output_root)
+            elif section == "oe_numbers":
+                self._write_oe_live(bundle, output_root)
+            elif section == "comparison_numbers":
+                self._write_comparison_live(bundle, output_root)
+            elif section == "attributes":
+                self._write_attribute_live(bundle, output_root)
             elif section == "images":
                 self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
             elif section == "documents":
@@ -5951,6 +8597,9 @@ if ($copied) {{
             self.document_frame.set_rows(document_rows)
             self.video_frame.set_rows(video_rows)
             self.web_frame.set_rows(web_rows)
+            self.attribute_frame.set_rows([])
+            self.oe_frame.set_rows([])
+            self.comparison_frame.set_rows([])
             suggestions = self._collect_genart_suggestions(
                 result.short_text_de,
                 result.long_text_de,
@@ -6096,6 +8745,9 @@ if ($copied) {{
                 self.long_text_frame.set_value(last_bundle.long_texts, auto_uni=True)
             else:
                 self.long_text_frame.set_value(TranslationSet(), auto_uni=True)
+            self.attribute_frame.set_rows(last_bundle.attribute_rows)
+            self.oe_frame.set_rows(last_bundle.oe_number_rows)
+            self.comparison_frame.set_rows(last_bundle.comparison_number_rows)
             if not last_bundle.include_images:
                 self.image_frame.set_rows([])
             if not last_bundle.include_documents:
@@ -6287,6 +8939,20 @@ if ($copied) {{
             )
             self.video_frame.set_rows([MediaRow("https://youtube.com/shorts/demo-video-1000")])
             self.web_frame.set_rows([MediaRow("https://www.kunzer.de/shop/p/WK%20DEMO-1000")])
+            self.attribute_frame.set_rows(
+                [
+                    AttributeRow(criteria_id="121", label="ABE-Nr", value_format="Alphanumerisch", max_length=20, value="ABE-2026-1000"),
+                    AttributeRow(criteria_id="9204", label="3PMSF", value_format="Flag (Ja / Nein)", value="Ja"),
+                    AttributeRow(criteria_id="1546", label="Abbildung ähnlich", value_format="Kein Wert", value=""),
+                ]
+            )
+            self.oe_frame.set_rows([OeNumberRow("0001234567"), OeNumberRow("8K0 698 151")])
+            self.comparison_frame.set_rows(
+                [
+                    ComparisonNumberRow(competitor_id="530", competitor_code="BOSCH", competitor_name="BOSCH", reference_number="1 987 302 777"),
+                    ComparisonNumberRow(competitor_id="521", competitor_code="VALEO", competitor_name="VALEO", reference_number="574385"),
+                ]
+            )
         self.status_var.set("Beispieldaten geladen.")
         self.refresh_preview()
         self._write_live_database(status_message="Live gespeichert: WK DEMO-1000")
@@ -6304,7 +8970,13 @@ if ($copied) {{
             ):
                 self._render_article_browser()
                 return
-            records = load_article_snapshots_from_folder(output_folder, "Output")
+            records = load_article_snapshots_from_folder(
+                output_folder,
+                "Output",
+                competitor_lookup=self.competitor_options_by_id,
+                attribute_lookup=self.attribute_options_by_id,
+                attribute_key_values_by_group=self.attribute_key_values_by_group,
+            )
 
         self.article_browser_records = records
         self.article_browser_cache_dir = str(output_folder)
@@ -6357,6 +9029,9 @@ if ($copied) {{
             self.genart_suggestion_var.set("Keine GenArt fuer diesen Artikel gespeichert.")
         self.short_text_frame.set_value(snapshot.short_texts, auto_uni=snapshot.short_auto_uni)
         self.long_text_frame.set_value(snapshot.long_texts, auto_uni=snapshot.long_auto_uni)
+        self.attribute_frame.set_rows(snapshot.attribute_rows)
+        self.oe_frame.set_rows(snapshot.oe_number_rows)
+        self.comparison_frame.set_rows(snapshot.comparison_number_rows)
         self.image_frame.set_rows(snapshot.image_rows)
         self.document_frame.set_rows(snapshot.document_rows)
         self.video_frame.set_rows(snapshot.video_rows)
@@ -6454,6 +9129,9 @@ if ($copied) {{
                 (SHORT_MAPPING_FILE, SHORT_MAPPING_HEADERS),
                 (LONG_TEXT_FILE, SHORT_TEXT_HEADERS),
                 (GENART_FILE, GENART_HEADERS),
+                (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
+                (OE_FILE, OE_HEADERS),
+                (COMPARISON_FILE, COMPARISON_HEADERS),
                 (IMAGE_FILE, IMAGE_HEADERS),
                 (DOCUMENT_FILE, DOCUMENT_HEADERS),
                 (VIDEO_FILE, VIDEO_HEADERS),
@@ -6487,6 +9165,10 @@ if ($copied) {{
             long_texts=self.long_text_frame.get_value(),
             long_auto_uni=self.long_text_frame.auto_uni_var.get(),
             genart_selections=self._get_selected_genart_selections(),
+            attribute_rows=self.attribute_frame.get_rows(),
+            attribute_key_values_by_group=self.attribute_key_values_by_group,
+            oe_number_rows=self.oe_frame.get_rows(),
+            comparison_number_rows=self.comparison_frame.get_rows(),
             image_rows=self.image_frame.get_rows(),
             document_rows=self.document_frame.get_rows(),
             video_rows=self.video_frame.get_rows(),

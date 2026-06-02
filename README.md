@@ -25,6 +25,10 @@ Alternativ unter Windows:
 - Kurztexte pro Sprache pflegen
   - Umlaute in Kurzbezeichnungen werden automatisch ersetzt, z. B. `ä -> ae`, `ö -> oe`, `ü -> ue`, `ß -> ss`
 - Langtexte pro Sprache pflegen
+- Attribute pro Artikel mit `TecDoc Kriterien ID`, Format-Hinweis und Wert pflegen
+- OE-Nummern als freie Referenzen pro Artikel pflegen
+- Vergleichsnummern mit Mitbewerber-ID pro Artikel pflegen
+- Mitbewerber aus `KHer.csv` nachschlagen und direkt in Vergleichsnummern uebernehmen
 - Bilder, Dokumente, Videos und Web Links erfassen
   - mit Bild-Thumbnail und PDF-Vorschau in den Bilder- und Dokumente-Tabs
   - vorhandene Zeilen koennen direkt im Formular nachbearbeitet und aktualisiert werden
@@ -151,6 +155,9 @@ Die GUI erzeugt aktuell diese Dateien:
 - `Kurzbezeichnung-NEU.xlsx`
 - `Kurzbezeichnung_zu_ID.xlsx`
 - `Text-NEU.xlsx`
+- `Attribute.xlsx`
+- `OE-Nummern.xlsx`
+- `Vergleichsnummern.xlsx`
 - `Bilder.xlsx`
 - `Dokumente.xlsx`
 - `Videos.xlsx`
@@ -165,7 +172,7 @@ Die GUI kann auf zwei Arten exportieren:
 - mit Zeitstempel-Unterordner, damit alte Exporte erhalten bleiben
 - direkt in einen festen Ausgabeordner, damit immer derselbe Importpfad genutzt werden kann
 
-Im festen Ausgabeordner bleiben die sieben Exportdateien bestehen. Neue Artikel werden angehaengt, und bei erneutem Export derselben Artikelnummer werden nur die alten Zeilen dieses Artikels ersetzt.
+Im festen Ausgabeordner bleiben die zehn Exportdateien bestehen. Neue Artikel werden angehaengt, und bei erneutem Export derselben Artikelnummer werden nur die alten Zeilen dieses Artikels ersetzt.
 Bei einer neuen Artikelnummer werden die `Text Modul ID`s automatisch im bestehenden 6-stelligen Format erzeugt und gegen vorhandene IDs geprueft. Bestehende Artikel behalten ihre bereits gespeicherten IDs.
 
 Die Output-Dateien dienen dabei als Live-Datenbank: Aenderungen an Texten, Bildern, Dokumenten, Videos und Links werden aus der GUI direkt in diese Excel-Dateien zurueckgeschrieben.
