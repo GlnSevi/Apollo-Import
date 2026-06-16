@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "v0.1.3"
+    [string]$Version = "v0.1.5"
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,12 +16,14 @@ $onefileSpec = Join-Path $root "Apollo-Import-GUI-v0.1-onefile.spec"
 $distRoot = Join-Path $root "dist"
 $stageDir = Join-Path $root "build\\installer-stage"
 $sedPath = Join-Path $root "build\\Apollo-Import-GUI-setup.sed"
-$onefileExeName = "Apollo-Import-GUI-v0.1.3-onefile.exe"
+$onefileExeName = "Apollo-Import-GUI-$Version-onefile.exe"
 $onefileExePath = Join-Path $distRoot $onefileExeName
 $installerExePath = Join-Path $distRoot "Apollo-Import-GUI-$Version-setup.exe"
 
 python -m py_compile apollo_import_gui.py
+$env:APOLLO_RELEASE_VERSION = $Version
 pyinstaller --noconfirm $onefileSpec
+Remove-Item Env:APOLLO_RELEASE_VERSION -ErrorAction SilentlyContinue
 
 if (-not (Test-Path -LiteralPath $onefileExePath)) {
     throw "Onefile-EXE wurde nicht erzeugt: $onefileExePath"

@@ -1,5 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_data_files
+
+release_version = os.environ.get('APOLLO_RELEASE_VERSION', 'v0.1.5')
+exe_name = f'Apollo-Import-GUI-{release_version}-onefile'
 
 datas = []
 datas += collect_data_files('playwright')
@@ -31,7 +35,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Apollo-Import-GUI-v0.1.3-onefile',
+    name=exe_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

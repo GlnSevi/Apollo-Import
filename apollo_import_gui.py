@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
@@ -98,6 +98,14 @@ GITHUB_REPO_FULL_NAME = "GlnSevi/Apollo-Import"
 GITHUB_RELEASES_LATEST_API_URL = f"https://api.github.com/repos/{GITHUB_REPO_FULL_NAME}/releases/latest"
 GITHUB_RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPO_FULL_NAME}/releases"
 
+
+def path_exists_safe(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 SHORT_TEXT_HEADERS = [
     "Artikelnummer",
     "Text Modul ID",
@@ -138,7 +146,8 @@ VIDEO_HEADERS = ["Produktnummer", "Link", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WR
 WEB_HEADERS = ["Artikelnummer ", "Link", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
 SHORT_MAPPING_HEADERS = ["Artikelnummer", "Text Modul ID", LAST_WRITTEN_HEADER]
 GENART_HEADERS = ["Artikelnummer", "GenArt ID", "GenArt Bezeichnung", LAST_WRITTEN_HEADER]
-OE_HEADERS = ["Artikelnummer", "TecDoc ID", "OE-Nummer", LAST_WRITTEN_HEADER]
+LEGACY_OE_HEADERS = ["Artikelnummer", "TecDoc ID", "OE-Nummer", LAST_WRITTEN_HEADER]
+OE_HEADERS = ["Artikelnummer", "TecDoc ID", "KHerNr", "OE-Nummer", LAST_WRITTEN_HEADER]
 COMPARISON_HEADERS = ["Artikelnummer", "TecDoc ID", "Mitbewerber ID", "Vergleichsnummer", LAST_WRITTEN_HEADER]
 ATTRIBUTE_HEADERS = ["Artikelnummer", "TecDoc Kriterien ID", "Attribut Bezeichnung", "Format", "Wert", LAST_WRITTEN_HEADER]
 CSV_ARTICLE_HEADER_ALIASES = {
@@ -308,6 +317,13 @@ class MediaRow:
 @dataclass(frozen=True)
 class OeNumberRow:
     value: str = ""
+    manufacturer_id: str = ""
+    manufacturer_code: str = ""
+    manufacturer_name: str = ""
+
+    def display_manufacturer_label(self) -> str:
+        parts = [self.manufacturer_id.strip(), self.manufacturer_code.strip(), self.manufacturer_name.strip()]
+        return " | ".join(part for part in parts if part) or "-"
 
 
 @dataclass(frozen=True)
@@ -677,16 +693,26 @@ def format_genart_selections(label: str, selections: list[GenArtSelection]) -> s
 
 def normalize_oe_number_rows(rows: list[OeNumberRow]) -> list[OeNumberRow]:
     normalized: list[OeNumberRow] = []
-    seen_values: set[str] = set()
+    seen_values: set[tuple[str, str]] = set()
     for row in rows:
         value = row.value.strip()
+        manufacturer_id = row.manufacturer_id.strip()
+        manufacturer_code = row.manufacturer_code.strip()
+        manufacturer_name = row.manufacturer_name.strip()
         if not value:
             continue
-        dedupe_key = value.casefold()
+        dedupe_key = (manufacturer_id.casefold(), value.casefold())
         if dedupe_key in seen_values:
             continue
         seen_values.add(dedupe_key)
-        normalized.append(OeNumberRow(value=value))
+        normalized.append(
+            OeNumberRow(
+                value=value,
+                manufacturer_id=manufacturer_id,
+                manufacturer_code=manufacturer_code,
+                manufacturer_name=manufacturer_name,
+            )
+        )
     return normalized
 
 
@@ -750,6 +776,7 @@ def format_oe_number_rows(label: str, rows: list[OeNumberRow]) -> str:
         return "\n".join(lines)
     for index, row in enumerate(normalized, start=1):
         lines.append(f"{index}. {row.value}")
+        lines.append(f"   Hersteller: {row.display_manufacturer_label()}")
     return "\n".join(lines)
 
 
@@ -987,8 +1014,8 @@ def parse_bool_flag(value: object) -> bool:
     return str(value or "").strip().casefold() in {"1", "true", "wahr", "yes", "ja", "x"}
 
 
-def load_competitor_options(csv_path: Path) -> list[CompetitorOption]:
-    if not csv_path.exists():
+def load_competitor_options(csv_path: Path, *, comparison_only: bool = True) -> list[CompetitorOption]:
+    if not path_exists_safe(csv_path):
         return []
 
     last_error: Exception | None = None
@@ -997,16 +1024,16 @@ def load_competitor_options(csv_path: Path) -> list[CompetitorOption]:
             with csv_path.open("r", encoding=encoding, newline="") as handle:
                 reader = csv.DictReader(handle, delimiter=";")
                 if not reader.fieldnames:
-                    raise ValueError("Die Mitbewerber-CSV hat keine Kopfzeile.")
+                    raise ValueError("Die KHer-CSV hat keine Kopfzeile.")
                 header_map = {normalize_header_key(field_name): field_name for field_name in reader.fieldnames if field_name}
                 id_key = header_map.get("khernr")
                 code_key = header_map.get("khkz")
                 name_key = header_map.get("bez")
                 compare_key = header_map.get("vgl")
                 if id_key is None:
-                    raise ValueError("In der Mitbewerber-CSV fehlt die Spalte 'KHerNr'.")
+                    raise ValueError("In der KHer-CSV fehlt die Spalte 'KHerNr'.")
                 if name_key is None:
-                    raise ValueError("In der Mitbewerber-CSV fehlt die Spalte 'Bez'.")
+                    raise ValueError("In der KHer-CSV fehlt die Spalte 'Bez'.")
 
                 options: list[CompetitorOption] = []
                 seen_ids: set[str] = set()
@@ -1014,7 +1041,7 @@ def load_competitor_options(csv_path: Path) -> list[CompetitorOption]:
                     competitor_id = str(row.get(id_key, "")).strip()
                     if not competitor_id or competitor_id in seen_ids:
                         continue
-                    if compare_key is not None and not parse_csv_flag(row.get(compare_key)):
+                    if comparison_only and compare_key is not None and not parse_csv_flag(row.get(compare_key)):
                         continue
                     seen_ids.add(competitor_id)
                     options.append(
@@ -1035,12 +1062,12 @@ def load_competitor_options(csv_path: Path) -> list[CompetitorOption]:
             break
 
     if last_error is not None:
-        raise ValueError(f"Mitbewerber-CSV konnte nicht geladen werden: {last_error}") from last_error
+        raise ValueError(f"KHer-CSV konnte nicht geladen werden: {last_error}") from last_error
     return []
 
 
 def load_attribute_options(workbook_path: Path) -> list[AttributeOption]:
-    if not workbook_path.exists():
+    if not path_exists_safe(workbook_path):
         return []
 
     try:
@@ -1108,7 +1135,7 @@ def load_attribute_options(workbook_path: Path) -> list[AttributeOption]:
 
 
 def load_attribute_key_value_options(workbook_path: Path) -> list[AttributeKeyValueOption]:
-    if not workbook_path.exists():
+    if not path_exists_safe(workbook_path):
         return []
 
     try:
@@ -2509,6 +2536,28 @@ def write_workbook(path: Path, sheet_name: str, headers: list[str], rows: list[l
     workbook.save(path)
 
 
+def read_workbook_headers(path: Path, sheet_name: str) -> list[str]:
+    if not path.exists():
+        return []
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.active
+        first_row = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        return ["" if value is None else str(value) for value in first_row]
+    finally:
+        workbook.close()
+
+
+def is_legacy_oe_workbook(path: Path, sheet_name: str) -> bool:
+    header_keys = [normalize_header_key(value) for value in read_workbook_headers(path, sheet_name)]
+    if not header_keys:
+        return False
+    has_oe_number = "oenummer" in header_keys
+    has_manufacturer = any(key in header_keys for key in ("khernr", "herstellerid", "herstellernr"))
+    return has_oe_number and not has_manufacturer
+
+
 def read_workbook_rows(path: Path, sheet_name: str, expected_width: int) -> list[list[str]]:
     if not path.exists():
         return []
@@ -2531,7 +2580,14 @@ def read_workbook_rows(path: Path, sheet_name: str, expected_width: int) -> list
 
 
 def prepare_existing_rows_for_write(path: Path, sheet_name: str, headers: list[str]) -> list[list[str]]:
-    existing_rows = read_workbook_rows(path, sheet_name, len(headers))
+    if headers == OE_HEADERS and is_legacy_oe_workbook(path, sheet_name):
+        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_OE_HEADERS))
+        existing_rows = []
+        for row in legacy_rows:
+            padded = list(row) + [""] * max(0, len(LEGACY_OE_HEADERS) - len(row))
+            existing_rows.append([padded[0], padded[1], "", padded[2], padded[3]])
+    else:
+        existing_rows = read_workbook_rows(path, sheet_name, len(headers))
     if headers and headers[-1] == LAST_WRITTEN_HEADER and path.exists():
         fallback_written_at = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         for row in existing_rows:
@@ -2727,7 +2783,12 @@ def build_web_export_rows(bundle: ExportBundle) -> list[list[str]]:
 
 
 def build_oe_export_rows(bundle: ExportBundle) -> list[list[str]]:
-    return [[bundle.article_number, "4", row.value] for row in normalize_oe_number_rows(bundle.oe_number_rows)]
+    export_rows: list[list[str]] = []
+    for row in normalize_oe_number_rows(bundle.oe_number_rows):
+        if not row.manufacturer_id:
+            raise ValueError(f"Bitte Hersteller fuer OE-Nummer '{row.value}' auswaehlen.")
+        export_rows.append([bundle.article_number, "4", row.manufacturer_id, row.value])
+    return export_rows
 
 
 def build_comparison_export_rows(bundle: ExportBundle) -> list[list[str]]:
@@ -2995,6 +3056,7 @@ def load_article_snapshots_from_folder(
     folder: Path,
     source_label: str,
     competitor_lookup: dict[str, CompetitorOption] | None = None,
+    manufacturer_lookup: dict[str, CompetitorOption] | None = None,
     attribute_lookup: dict[str, AttributeOption] | None = None,
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] | None = None,
 ) -> dict[str, StoredArticleSnapshot]:
@@ -3039,12 +3101,21 @@ def load_article_snapshots_from_folder(
         snapshot = ensure_snapshot(article_number)
         snapshot.genart_selections.append(GenArtSelection(id=row[1].strip(), bezeichnung=row[2].strip()))
 
-    oe_rows = read_workbook_rows(folder / OE_FILE[0], OE_FILE[1], len(OE_HEADERS))
+    oe_rows = prepare_existing_rows_for_write(folder / OE_FILE[0], OE_FILE[1], OE_HEADERS)
     for row in oe_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
-        ensure_snapshot(article_number).oe_number_rows.append(OeNumberRow(value=row[2].strip()))
+        manufacturer_id = row[2].strip()
+        manufacturer = manufacturer_lookup.get(manufacturer_id) if manufacturer_lookup is not None else None
+        ensure_snapshot(article_number).oe_number_rows.append(
+            OeNumberRow(
+                value=row[3].strip(),
+                manufacturer_id=manufacturer_id,
+                manufacturer_code=manufacturer.code if manufacturer is not None else "",
+                manufacturer_name=manufacturer.name if manufacturer is not None else "",
+            )
+        )
 
     comparison_rows = read_workbook_rows(folder / COMPARISON_FILE[0], COMPARISON_FILE[1], len(COMPARISON_HEADERS))
     for row in comparison_rows:
@@ -4429,6 +4500,253 @@ class SimpleValueTableFrame(ttk.LabelFrame):
         self.inline_editor_item = ""
 
 
+class OeNumberTableFrame(ttk.LabelFrame):
+    def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
+        super().__init__(master, text="OE-Nummern", padding=14)
+        self.on_change = on_change
+        self.catalog_options: list[CompetitorOption] = []
+        self.catalog_by_id: dict[str, CompetitorOption] = {}
+        self.catalog_by_code: dict[str, CompetitorOption] = {}
+        self.catalog_by_label: dict[str, CompetitorOption] = {}
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
+        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+
+        self.manufacturer_display_var = tk.StringVar()
+        self.manufacturer_id_var = tk.StringVar()
+        self.manufacturer_code_var = tk.StringVar()
+        self.manufacturer_name_var = tk.StringVar()
+        self.value_var = tk.StringVar()
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(1, weight=1)
+        header.columnconfigure(5, weight=1)
+
+        ttk.Label(
+            header,
+            text="Waehle den Hersteller aus und erfasse die zugehoerige OE-Nummer.",
+            foreground="#5E6472",
+            wraplength=980,
+        ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 10))
+
+        ttk.Label(header, text="Hersteller").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.manufacturer_combo = ttk.Combobox(header, textvariable=self.manufacturer_display_var)
+        self.manufacturer_combo.grid(row=1, column=1, columnspan=6, sticky="ew", pady=4)
+        self.manufacturer_combo.bind("<<ComboboxSelected>>", self._apply_current_manufacturer_selection)
+        self.manufacturer_combo.bind("<KeyRelease>", self._on_manufacturer_key_release)
+        self.manufacturer_combo.bind("<Return>", self._apply_current_manufacturer_selection)
+        self.manufacturer_combo.bind("<FocusOut>", self._apply_current_manufacturer_selection)
+
+        ttk.Label(header, text="KHerNr").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(header, textvariable=self.manufacturer_id_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(header, text="Kuerzel").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(header, textvariable=self.manufacturer_code_var, width=18).grid(row=2, column=3, sticky="w", pady=4)
+        ttk.Label(header, text="Name").grid(row=2, column=4, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(header, textvariable=self.manufacturer_name_var).grid(row=2, column=5, columnspan=2, sticky="ew", pady=4)
+
+        ttk.Label(header, text="OE-Nummer").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(header, textvariable=self.value_var).grid(row=3, column=1, columnspan=3, sticky="ew", pady=4)
+
+        actions = ttk.Frame(header)
+        actions.grid(row=3, column=4, columnspan=3, sticky="e", pady=4)
+        ttk.Button(actions, text="Hinzufuegen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text="Leeren", command=self.clear_form).grid(row=0, column=3)
+
+        columns = ("manufacturer_id", "manufacturer_code", "manufacturer_name", "value")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=11, selectmode="extended")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.tree.heading("manufacturer_id", text="KHerNr")
+        self.tree.heading("manufacturer_code", text="Kuerzel")
+        self.tree.heading("manufacturer_name", text="Hersteller")
+        self.tree.heading("value", text="OE-Nummer")
+        self.tree.column("manufacturer_id", width=120, anchor="center")
+        self.tree.column("manufacturer_code", width=120, anchor="center")
+        self.tree.column("manufacturer_name", width=380, anchor="w")
+        self.tree.column("value", width=300, anchor="w")
+        self.tree.bind("<<TreeviewSelect>>", self._handle_selection)
+        self.tree.bind("<Button-3>", self._open_context_menu)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+    def set_manufacturer_catalog(self, options: list[CompetitorOption]) -> None:
+        self.catalog_options = list(options)
+        self.catalog_by_id = {option.competitor_id: option for option in self.catalog_options}
+        self.catalog_by_code = {option.code.casefold(): option for option in self.catalog_options if option.code}
+        self.catalog_by_label = {option.display_label(): option for option in self.catalog_options}
+        self._update_manufacturer_combo_values(self.manufacturer_display_var.get())
+
+    def prefill_manufacturer(self, option: CompetitorOption) -> None:
+        self.manufacturer_display_var.set(option.display_label())
+        self.manufacturer_id_var.set(option.competitor_id)
+        self.manufacturer_code_var.set(option.code)
+        self.manufacturer_name_var.set(option.name)
+        self._update_manufacturer_combo_values(option.display_label())
+
+    def _update_manufacturer_combo_values(self, query: str = "") -> None:
+        query_text = query.strip().casefold()
+        filtered = [
+            option.display_label()
+            for option in self.catalog_options
+            if not query_text or query_text in option.search_blob
+        ]
+        self.manufacturer_combo.configure(values=filtered[:200])
+
+    def _resolve_manufacturer(self, raw_value: str) -> CompetitorOption | None:
+        value = raw_value.strip()
+        if not value:
+            return None
+        if value in self.catalog_by_label:
+            return self.catalog_by_label[value]
+        if value in self.catalog_by_id:
+            return self.catalog_by_id[value]
+        by_code = self.catalog_by_code.get(value.casefold())
+        if by_code is not None:
+            return by_code
+
+        exact_matches = [option for option in self.catalog_options if value.casefold() == option.name.casefold()]
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+
+        partial_matches = [option for option in self.catalog_options if value.casefold() in option.search_blob]
+        if len(partial_matches) == 1:
+            return partial_matches[0]
+        return None
+
+    def _apply_current_manufacturer_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        option = self._resolve_manufacturer(self.manufacturer_display_var.get())
+        if option is None:
+            return
+        self.prefill_manufacturer(option)
+
+    def _on_manufacturer_key_release(self, _event: tk.Event[tk.Misc]) -> None:
+        self._update_manufacturer_combo_values(self.manufacturer_display_var.get())
+
+    def _emit_change(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def _build_current_row(self) -> OeNumberRow:
+        return OeNumberRow(
+            value=self.value_var.get().strip(),
+            manufacturer_id=self.manufacturer_id_var.get().strip(),
+            manufacturer_code=self.manufacturer_code_var.get().strip(),
+            manufacturer_name=self.manufacturer_name_var.get().strip(),
+        )
+
+    def add_row(self) -> None:
+        self._apply_current_manufacturer_selection()
+        row = self._build_current_row()
+        if not row.manufacturer_id or not row.value:
+            messagebox.showwarning(APP_TITLE, "Bitte Hersteller und OE-Nummer eingeben.")
+            return
+        self.tree.insert("", "end", values=(row.manufacturer_id, row.manufacturer_code, row.manufacturer_name, row.value))
+        self._select_first_row(select_last=True)
+        self._emit_change()
+
+    def update_selected_row(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            return
+        self._apply_current_manufacturer_selection()
+        row = self._build_current_row()
+        if not row.manufacturer_id or not row.value:
+            messagebox.showwarning(APP_TITLE, "Bitte Hersteller und OE-Nummer eingeben.")
+            return
+        self.tree.item(selected[0], values=(row.manufacturer_id, row.manufacturer_code, row.manufacturer_name, row.value))
+        self.tree.focus(selected[0])
+        self._handle_selection()
+        self._emit_change()
+
+    def remove_selected(self) -> None:
+        for item_id in self.tree.selection():
+            self.tree.delete(item_id)
+        self.clear_form()
+        self._select_first_row()
+        self._emit_change()
+
+    def copy_selected_rows(self) -> None:
+        selected_items = list(self.tree.selection())
+        if not selected_items:
+            return
+        rows = []
+        for item_id in selected_items:
+            values = [str(value).strip() for value in self.tree.item(item_id, "values")]
+            rows.append("\t".join(values))
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(rows))
+
+    def clear_form(self) -> None:
+        self.manufacturer_display_var.set("")
+        self.manufacturer_id_var.set("")
+        self.manufacturer_code_var.set("")
+        self.manufacturer_name_var.set("")
+        self.value_var.set("")
+
+    def get_rows(self) -> list[OeNumberRow]:
+        rows = []
+        for item_id in self.tree.get_children():
+            manufacturer_id, manufacturer_code, manufacturer_name, value = self.tree.item(item_id, "values")
+            rows.append(
+                OeNumberRow(
+                    value=str(value).strip(),
+                    manufacturer_id=str(manufacturer_id).strip(),
+                    manufacturer_code=str(manufacturer_code).strip(),
+                    manufacturer_name=str(manufacturer_name).strip(),
+                )
+            )
+        return normalize_oe_number_rows(rows)
+
+    def set_rows(self, rows: list[OeNumberRow]) -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        for row in normalize_oe_number_rows(rows):
+            self.tree.insert("", "end", values=(row.manufacturer_id, row.manufacturer_code, row.manufacturer_name, row.value))
+        self._select_first_row()
+
+    def _select_first_row(self, select_last: bool = False) -> None:
+        children = list(self.tree.get_children())
+        if not children:
+            return
+        target = children[-1] if select_last else children[0]
+        self.tree.selection_set(target)
+        self.tree.focus(target)
+        self._handle_selection()
+
+    def _handle_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        manufacturer_id, manufacturer_code, manufacturer_name, value = self.tree.item(selected[0], "values")
+        self.manufacturer_id_var.set(str(manufacturer_id).strip())
+        self.manufacturer_code_var.set(str(manufacturer_code).strip())
+        self.manufacturer_name_var.set(str(manufacturer_name).strip())
+        self.value_var.set(str(value).strip())
+        display_parts = [self.manufacturer_id_var.get(), self.manufacturer_code_var.get(), self.manufacturer_name_var.get()]
+        self.manufacturer_display_var.set(" | ".join(part for part in display_parts if part))
+
+    def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            if item_id not in self.tree.selection():
+                self.tree.selection_set(item_id)
+            self.tree.focus(item_id)
+            self._handle_selection()
+        has_selection = bool(self.tree.selection())
+        self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.grab_release()
+
+
 class ComparisonTableFrame(ttk.LabelFrame):
     def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
         super().__init__(master, text="Vergleichsnummern", padding=14)
@@ -5654,11 +5972,11 @@ class ApolloImportApp:
 
         self.import_dir_var = tk.StringVar(value=str(DEFAULT_IMPORT_DIR))
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
-        self.genart_source_path_var = tk.StringVar(value=str(DEFAULT_GENART_SOURCE) if DEFAULT_GENART_SOURCE.exists() else "")
-        self.competitor_source_path_var = tk.StringVar(value=str(DEFAULT_COMPETITOR_SOURCE) if DEFAULT_COMPETITOR_SOURCE.exists() else "")
-        self.attribute_source_path_var = tk.StringVar(value=str(DEFAULT_ATTRIBUTE_SOURCE) if DEFAULT_ATTRIBUTE_SOURCE.exists() else "")
+        self.genart_source_path_var = tk.StringVar(value=str(DEFAULT_GENART_SOURCE) if path_exists_safe(DEFAULT_GENART_SOURCE) else "")
+        self.competitor_source_path_var = tk.StringVar(value=str(DEFAULT_COMPETITOR_SOURCE) if path_exists_safe(DEFAULT_COMPETITOR_SOURCE) else "")
+        self.attribute_source_path_var = tk.StringVar(value=str(DEFAULT_ATTRIBUTE_SOURCE) if path_exists_safe(DEFAULT_ATTRIBUTE_SOURCE) else "")
         self.attribute_key_value_source_path_var = tk.StringVar(
-            value=str(DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE) if DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE.exists() else ""
+            value=str(DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE) if path_exists_safe(DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE) else ""
         )
         self.product_list_path_var = tk.StringVar()
         self.deepl_api_key_var = tk.StringVar(value=os.getenv("DEEPL_API_KEY", ""))
@@ -5683,7 +6001,7 @@ class ApolloImportApp:
         self.update_status_var = tk.StringVar(value=f"Aktuelle Version: {APP_VERSION_TAG}")
         self.known_id_count_var = tk.StringVar(value="0 IDs geladen")
         self.genart_count_var = tk.StringVar(value="0 GenArts geladen")
-        self.competitor_count_var = tk.StringVar(value="0 Mitbewerber geladen")
+        self.competitor_count_var = tk.StringVar(value="0 Hersteller / 0 Mitbewerber geladen")
         self.attribute_count_var = tk.StringVar(value="0 Attribute geladen")
         self.attribute_key_value_count_var = tk.StringVar(value="0 Schluesselwerte geladen")
         self.article_section_collapsed = False
@@ -5695,6 +6013,8 @@ class ApolloImportApp:
         self.current_id_article_number = ""
         self.article_browser_records: dict[str, StoredArticleSnapshot] = {}
         self.selected_genart_selections: list[GenArtSelection] = []
+        self.manufacturer_options: list[CompetitorOption] = []
+        self.manufacturer_options_by_id: dict[str, CompetitorOption] = {}
         self.competitor_options: list[CompetitorOption] = []
         self.competitor_options_by_id: dict[str, CompetitorOption] = {}
         self.attribute_options: list[AttributeOption] = []
@@ -5788,7 +6108,6 @@ class ApolloImportApp:
         self.attribute_tab = ttk.Frame(self.main_notebook, padding=18)
         self.oe_tab = ttk.Frame(self.main_notebook, padding=18)
         self.comparison_tab = ttk.Frame(self.main_notebook, padding=18)
-        self.competitor_tab = ttk.Frame(self.main_notebook, padding=18)
         self.image_tab = ttk.Frame(self.main_notebook, padding=18)
         self.document_tab = ttk.Frame(self.main_notebook, padding=18)
         self.links_tab = ttk.Frame(self.main_notebook, padding=18)
@@ -5800,7 +6119,6 @@ class ApolloImportApp:
         self.main_notebook.add(self.attribute_tab, text="Attribute")
         self.main_notebook.add(self.oe_tab, text="OE-Nummern")
         self.main_notebook.add(self.comparison_tab, text="Vergleichsnummern")
-        self.main_notebook.add(self.competitor_tab, text="Mitbewerber")
         self.main_notebook.add(self.image_tab, text="Bilder")
         self.main_notebook.add(self.document_tab, text="Dokumente")
         self.main_notebook.add(self.links_tab, text="Links")
@@ -5811,7 +6129,6 @@ class ApolloImportApp:
         self._build_genart_tab()
         self._build_attribute_tab()
         self._build_reference_tabs()
-        self._build_competitor_tab()
         self._build_media_tabs()
 
         status_bar = ttk.Label(shell, textvariable=self.status_var, anchor="w", foreground="#5E6472")
@@ -5905,7 +6222,15 @@ class ApolloImportApp:
         return rows
 
     def _oe_number_rows_to_state(self, rows: list[OeNumberRow]) -> list[dict[str, str]]:
-        return [{"value": row.value} for row in normalize_oe_number_rows(rows)]
+        return [
+            {
+                "value": row.value,
+                "manufacturer_id": row.manufacturer_id,
+                "manufacturer_code": row.manufacturer_code,
+                "manufacturer_name": row.manufacturer_name,
+            }
+            for row in normalize_oe_number_rows(rows)
+        ]
 
     def _oe_number_rows_from_state(self, payload: object) -> list[OeNumberRow]:
         if not isinstance(payload, list):
@@ -5914,7 +6239,14 @@ class ApolloImportApp:
         for item in payload:
             if not isinstance(item, dict):
                 continue
-            rows.append(OeNumberRow(value=str(item.get("value", ""))))
+            rows.append(
+                OeNumberRow(
+                    value=str(item.get("value", "")),
+                    manufacturer_id=str(item.get("manufacturer_id", "")),
+                    manufacturer_code=str(item.get("manufacturer_code", "")),
+                    manufacturer_name=str(item.get("manufacturer_name", "")),
+                )
+            )
         return normalize_oe_number_rows(rows)
 
     def _comparison_rows_to_state(self, rows: list[ComparisonNumberRow]) -> list[dict[str, str]]:
@@ -6081,6 +6413,10 @@ class ApolloImportApp:
                 "oe_numbers": {
                     "rows": self._oe_number_rows_to_state(self.oe_frame.get_rows()),
                     "form": {
+                        "manufacturer_display": self.oe_frame.manufacturer_display_var.get(),
+                        "manufacturer_id": self.oe_frame.manufacturer_id_var.get(),
+                        "manufacturer_code": self.oe_frame.manufacturer_code_var.get(),
+                        "manufacturer_name": self.oe_frame.manufacturer_name_var.get(),
                         "value": self.oe_frame.value_var.get(),
                     },
                 },
@@ -6094,7 +6430,6 @@ class ApolloImportApp:
                         "reference_number": self.comparison_frame.reference_number_var.get(),
                     },
                 },
-                "competitor_search": getattr(self, "competitor_search_var", tk.StringVar()).get() if hasattr(self, "competitor_search_var") else "",
             },
             "media": {
                 "images": {
@@ -6243,6 +6578,10 @@ class ApolloImportApp:
                     self.oe_frame.set_rows(self._oe_number_rows_from_state(oe_payload.get("rows")))
                     form = oe_payload.get("form")
                     if isinstance(form, dict):
+                        self.oe_frame.manufacturer_display_var.set(str(form.get("manufacturer_display", "")))
+                        self.oe_frame.manufacturer_id_var.set(str(form.get("manufacturer_id", "")))
+                        self.oe_frame.manufacturer_code_var.set(str(form.get("manufacturer_code", "")))
+                        self.oe_frame.manufacturer_name_var.set(str(form.get("manufacturer_name", "")))
                         self.oe_frame.value_var.set(str(form.get("value", "")))
 
                 comparison_payload = references.get("comparison_numbers")
@@ -6255,9 +6594,6 @@ class ApolloImportApp:
                         self.comparison_frame.competitor_code_var.set(str(form.get("competitor_code", "")))
                         self.comparison_frame.competitor_name_var.set(str(form.get("competitor_name", "")))
                         self.comparison_frame.reference_number_var.set(str(form.get("reference_number", "")))
-
-                if hasattr(self, "competitor_search_var"):
-                    self.competitor_search_var.set(str(references.get("competitor_search", "")))
 
             media = payload.get("media")
             if isinstance(media, dict):
@@ -6564,6 +6900,50 @@ if ($copied) {{
             self.browser_content_frame.grid()
             self._schedule_article_browser_layout()
 
+    def _handle_project_scroll_content_configure(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        if not hasattr(self, "project_canvas"):
+            return
+        self.project_canvas.configure(scrollregion=self.project_canvas.bbox("all"))
+
+    def _handle_project_canvas_configure(self, event: tk.Event[tk.Misc]) -> None:
+        if hasattr(self, "project_canvas_window"):
+            self.project_canvas.itemconfigure(self.project_canvas_window, width=event.width)
+        self._schedule_project_tab_layout()
+
+    def _is_project_widget(self, widget: tk.Misc) -> bool:
+        current: tk.Misc | None = widget
+        while current is not None:
+            if current is self.project_tab:
+                return True
+            current = getattr(current, "master", None)
+        return False
+
+    def _bind_project_mousewheel(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        if not hasattr(self, "project_canvas") or getattr(self, "_project_mousewheel_bound", False):
+            return
+        self.root.bind_all("<MouseWheel>", self._handle_project_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._handle_project_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._handle_project_mousewheel, add="+")
+        self._project_mousewheel_bound = True
+
+    def _unbind_project_mousewheel(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        return
+
+    def _handle_project_mousewheel(self, event: tk.Event[tk.Misc]) -> str | None:
+        if not hasattr(self, "project_canvas") or not self._is_project_widget(event.widget):
+            return None
+        widget_class = event.widget.winfo_class()
+        if widget_class in {"Treeview", "Text"}:
+            return None
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        else:
+            delta = -1 if event.delta > 0 else 1
+        self.project_canvas.yview_scroll(delta, "units")
+        return "break"
+
     def _schedule_project_tab_layout(self) -> None:
         if self._project_layout_after_id is not None:
             try:
@@ -6577,15 +6957,19 @@ if ($copied) {{
 
     def _apply_project_tab_layout(self) -> None:
         self._project_layout_after_id = None
-        width = max(self.project_tab.winfo_width(), self.project_tab.winfo_reqwidth())
+        project_parent = getattr(self, "project_content_frame", self.project_tab)
+        if hasattr(self, "project_canvas"):
+            width = max(self.project_canvas.winfo_width(), 1)
+        else:
+            width = max(self.project_tab.winfo_width(), self.project_tab.winfo_reqwidth())
         compact = width < 1380
         layout_changed = self.project_tab_compact_mode is None or self.project_tab_compact_mode != compact
         self.project_tab_compact_mode = compact
 
-        self.project_tab.columnconfigure(0, weight=1)
-        self.project_tab.columnconfigure(1, weight=1 if not compact else 0)
+        project_parent.columnconfigure(0, weight=1)
+        project_parent.columnconfigure(1, weight=1 if not compact else 0)
         for row_index in range(0, 6):
-            self.project_tab.rowconfigure(row_index, weight=0)
+            project_parent.rowconfigure(row_index, weight=0)
 
         if layout_changed:
             self.file_frame.grid_configure(row=0, column=0, columnspan=2, sticky="ew")
@@ -6594,14 +6978,15 @@ if ($copied) {{
                 self.export_frame.grid_configure(row=2, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
                 self.deepl_frame.grid_configure(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(14, 0))
                 self.browser_frame.grid_configure(row=4, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
-                self.project_tab.rowconfigure(4, weight=1)
+                project_parent.rowconfigure(4, weight=1)
             else:
                 self.article_frame.grid_configure(row=1, column=0, columnspan=1, rowspan=1, sticky="new", padx=(0, 9), pady=(14, 0))
                 self.export_frame.grid_configure(row=1, column=1, columnspan=1, rowspan=2, sticky="nsew", padx=(9, 0), pady=(14, 0))
                 self.deepl_frame.grid_configure(row=2, column=0, columnspan=1, sticky="ew", padx=(0, 9), pady=(14, 0))
                 self.browser_frame.grid_configure(row=3, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
-                self.project_tab.rowconfigure(3, weight=1)
+                project_parent.rowconfigure(3, weight=1)
 
+        self._handle_project_scroll_content_configure()
         self._schedule_article_browser_layout()
 
     def _schedule_article_browser_layout(self) -> None:
@@ -6640,10 +7025,26 @@ if ($copied) {{
 
     def _build_project_tab(self) -> None:
         self.project_tab.columnconfigure(0, weight=1)
-        self.project_tab.columnconfigure(1, weight=1)
-        self.project_tab.rowconfigure(3, weight=1)
+        self.project_tab.rowconfigure(0, weight=1)
 
-        self.file_frame = ttk.LabelFrame(self.project_tab, text="Ordner", padding=14)
+        self.project_canvas = tk.Canvas(self.project_tab, background="#F6F2EA", borderwidth=0, highlightthickness=0)
+        self.project_canvas.grid(row=0, column=0, sticky="nsew")
+        project_scrollbar = ttk.Scrollbar(self.project_tab, orient="vertical", command=self.project_canvas.yview)
+        project_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.project_canvas.configure(yscrollcommand=project_scrollbar.set)
+
+        self.project_content_frame = ttk.Frame(self.project_canvas)
+        self.project_canvas_window = self.project_canvas.create_window((0, 0), window=self.project_content_frame, anchor="nw")
+        self.project_content_frame.bind("<Configure>", self._handle_project_scroll_content_configure)
+        self.project_canvas.bind("<Configure>", self._handle_project_canvas_configure)
+        self._bind_project_mousewheel()
+
+        project_parent = self.project_content_frame
+        project_parent.columnconfigure(0, weight=1)
+        project_parent.columnconfigure(1, weight=1)
+        project_parent.rowconfigure(3, weight=1)
+
+        self.file_frame = ttk.LabelFrame(project_parent, text="Ordner", padding=14)
         file_frame = self.file_frame
         file_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
         file_frame.columnconfigure(1, weight=1)
@@ -6663,14 +7064,9 @@ if ($copied) {{
         ttk.Button(file_frame, text="Datei waehlen", command=self.choose_product_list_file).grid(row=2, column=2, padx=(8, 0), pady=6)
         ttk.Button(file_frame, text="Liste importieren", command=self.import_products_from_file).grid(row=2, column=3, padx=(8, 0), pady=6)
 
-        ttk.Label(file_frame, text="GenArt XLSX").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(file_frame, textvariable=self.genart_source_path_var).grid(row=3, column=1, sticky="ew", pady=6)
-        ttk.Button(file_frame, text="Datei waehlen", command=self.choose_genart_source_file).grid(row=3, column=2, padx=(8, 0), pady=6)
-        ttk.Label(file_frame, textvariable=self.genart_count_var, foreground="#5E6472").grid(row=3, column=3, sticky="w", padx=(8, 0), pady=6)
-
-        ttk.Label(file_frame, text="App-Update").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(file_frame, text="App-Update").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
         update_row = ttk.Frame(file_frame)
-        update_row.grid(row=4, column=1, columnspan=3, sticky="ew", pady=6)
+        update_row.grid(row=3, column=1, columnspan=3, sticky="ew", pady=6)
         update_row.columnconfigure(0, weight=1)
         ttk.Label(update_row, textvariable=self.update_status_var, foreground="#5E6472").grid(row=0, column=0, sticky="w")
         ttk.Button(update_row, text="Nach Updates suchen", command=self._check_for_github_updates).grid(
@@ -6678,7 +7074,7 @@ if ($copied) {{
         )
         ttk.Button(update_row, text="Releases", command=self._open_github_releases_page).grid(row=0, column=2, padx=(8, 0))
 
-        self.article_frame = ttk.LabelFrame(self.project_tab, text="Artikel", padding=14)
+        self.article_frame = ttk.LabelFrame(project_parent, text="Artikel", padding=14)
         article_frame = self.article_frame
         article_frame.grid(row=1, column=0, sticky="new", pady=(14, 0), padx=(0, 9))
         article_frame.columnconfigure(0, weight=1)
@@ -6732,7 +7128,7 @@ if ($copied) {{
         ttk.Button(button_row, text="Beispiel laden", command=self.load_demo_data).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_row, text="Artikelliste aktualisieren", command=self.refresh_preview).grid(row=0, column=1)
 
-        self.export_frame = ttk.LabelFrame(self.project_tab, text="Export", padding=14)
+        self.export_frame = ttk.LabelFrame(project_parent, text="Export", padding=14)
         export_frame = self.export_frame
         export_frame.grid(row=1, column=1, rowspan=2, sticky="nsew", pady=(14, 0), padx=(9, 0))
         export_frame.columnconfigure(0, weight=1)
@@ -6784,7 +7180,7 @@ if ($copied) {{
             foreground="#5E6472",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        self.deepl_frame = ttk.LabelFrame(self.project_tab, text="APIs", padding=14)
+        self.deepl_frame = ttk.LabelFrame(project_parent, text="API & Einstellungen", padding=14)
         deepl_frame = self.deepl_frame
         deepl_frame.grid(row=2, column=0, sticky="ew", pady=(14, 0), padx=(0, 9))
         deepl_frame.columnconfigure(0, weight=1)
@@ -6792,7 +7188,9 @@ if ($copied) {{
         deepl_header = ttk.Frame(deepl_frame)
         deepl_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         deepl_header.columnconfigure(0, weight=1)
-        ttk.Label(deepl_header, text="DeepL und Google Lens Einstellungen", foreground="#5E6472").grid(row=0, column=0, sticky="w")
+        ttk.Label(deepl_header, text="DeepL, Google Lens und Datenstamm-Einstellungen", foreground="#5E6472").grid(
+            row=0, column=0, sticky="w"
+        )
         ttk.Button(deepl_header, textvariable=self.api_section_toggle_var, command=self._toggle_api_section).grid(row=0, column=1, padx=(8, 0))
 
         self.deepl_content_frame = ttk.Frame(deepl_frame)
@@ -6845,7 +7243,66 @@ if ($copied) {{
             wraplength=1000,
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        self.browser_frame = ttk.LabelFrame(self.project_tab, text="Artikelverzeichnis", padding=14)
+        ttk.Separator(self.deepl_content_frame, orient="horizontal").grid(row=8, column=0, columnspan=3, sticky="ew", pady=(14, 12))
+
+        ttk.Label(self.deepl_content_frame, text="Datenstaemme", font=("Segoe UI Semibold", 10)).grid(
+            row=9, column=0, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(self.deepl_content_frame, text="GenArt XLSX").grid(row=10, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(self.deepl_content_frame, textvariable=self.genart_source_path_var).grid(row=10, column=1, sticky="ew", pady=6)
+        genart_actions = ttk.Frame(self.deepl_content_frame)
+        genart_actions.grid(row=10, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(genart_actions, text="Datei waehlen", command=self.choose_genart_source_file).grid(row=0, column=0)
+        ttk.Button(genart_actions, text="Neu laden", command=self._reload_genart_catalog).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(self.deepl_content_frame, textvariable=self.genart_count_var, foreground="#5E6472").grid(
+            row=11, column=1, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(self.deepl_content_frame, text="KHer CSV").grid(row=12, column=0, sticky="w", padx=(0, 10), pady=6)
+        kher_actions = ttk.Frame(self.deepl_content_frame)
+        kher_actions.grid(row=12, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(kher_actions, text="Datei waehlen", command=self.choose_competitor_source_file).grid(row=0, column=0)
+        ttk.Button(kher_actions, text="Neu laden", command=self._reload_competitor_catalog).grid(row=0, column=1, padx=(8, 0))
+        ttk.Entry(self.deepl_content_frame, textvariable=self.competitor_source_path_var).grid(row=12, column=1, sticky="ew", pady=6)
+        ttk.Label(
+            self.deepl_content_frame,
+            text="Diese Datei wird fuer OE-Nummern und Vergleichsnummern verwendet. OE nutzt alle Hersteller, Vergleichsnummern nur Eintraege mit VGL-Flag.",
+            foreground="#5E6472",
+            wraplength=1000,
+        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(self.deepl_content_frame, textvariable=self.competitor_count_var, foreground="#5E6472").grid(
+            row=14, column=1, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(self.deepl_content_frame, text="Attribute XLSX").grid(row=15, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_source_path_var).grid(row=15, column=1, sticky="ew", pady=6)
+        attribute_actions = ttk.Frame(self.deepl_content_frame)
+        attribute_actions.grid(row=15, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(attribute_actions, text="Datei waehlen", command=self.choose_attribute_source_file).grid(row=0, column=0)
+        ttk.Button(attribute_actions, text="Neu laden", command=self._reload_attribute_catalog).grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Label(self.deepl_content_frame, text="Schluesselwerte XLSX").grid(row=16, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_key_value_source_path_var).grid(
+            row=16, column=1, sticky="ew", pady=6
+        )
+        key_value_actions = ttk.Frame(self.deepl_content_frame)
+        key_value_actions.grid(row=16, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(key_value_actions, text="Datei waehlen", command=self.choose_attribute_key_value_source_file).grid(row=0, column=0)
+        ttk.Button(key_value_actions, text="Neu laden", command=self._reload_attribute_key_value_catalog).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            self.deepl_content_frame,
+            text="Die Attributliste liefert TecDoc Kriterien, Formate und Bezeichnungen; Schluesselwerte liefern die moeglichen Auswahlwerte.",
+            foreground="#5E6472",
+            wraplength=1000,
+        ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(self.deepl_content_frame, textvariable=self.attribute_count_var, foreground="#5E6472").grid(
+            row=18, column=1, columnspan=2, sticky="w"
+        )
+        ttk.Label(self.deepl_content_frame, textvariable=self.attribute_key_value_count_var, foreground="#5E6472").grid(
+            row=19, column=1, columnspan=2, sticky="w"
+        )
+
+        self.browser_frame = ttk.LabelFrame(project_parent, text="Artikelverzeichnis", padding=14)
         browser_frame = self.browser_frame
         browser_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(14, 0))
         browser_frame.columnconfigure(0, weight=1)
@@ -7041,42 +7498,13 @@ if ($copied) {{
 
     def _build_attribute_tab(self) -> None:
         self.attribute_tab.columnconfigure(0, weight=1)
-        self.attribute_tab.rowconfigure(1, weight=1)
-
-        source_frame = ttk.LabelFrame(self.attribute_tab, text="Attributkatalog", padding=14)
-        source_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        source_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(source_frame, text="Attributdatei").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Entry(source_frame, textvariable=self.attribute_source_path_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Button(source_frame, text="Datei waehlen", command=self.choose_attribute_source_file).grid(row=0, column=2, padx=(8, 0), pady=4)
-        ttk.Button(source_frame, text="Neu laden", command=self._reload_attribute_catalog).grid(row=0, column=3, padx=(8, 0), pady=4)
-        ttk.Label(source_frame, text="Schluesselwerte").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Entry(source_frame, textvariable=self.attribute_key_value_source_path_var).grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Button(source_frame, text="Datei waehlen", command=self.choose_attribute_key_value_source_file).grid(
-            row=1, column=2, padx=(8, 0), pady=4
-        )
-        ttk.Button(source_frame, text="Neu laden", command=self._reload_attribute_key_value_catalog).grid(
-            row=1, column=3, padx=(8, 0), pady=4
-        )
-        ttk.Label(
-            source_frame,
-            text="Quelle fuer TecDoc Kriterien ID, Bezeichnung, Format, Typ und die moeglichen Schluesselwerte.",
-            foreground="#5E6472",
-            wraplength=980,
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 4))
-        ttk.Label(source_frame, textvariable=self.attribute_count_var, foreground="#5E6472").grid(
-            row=3, column=0, columnspan=4, sticky="w"
-        )
-        ttk.Label(source_frame, textvariable=self.attribute_key_value_count_var, foreground="#5E6472").grid(
-            row=4, column=0, columnspan=4, sticky="w"
-        )
+        self.attribute_tab.rowconfigure(0, weight=1)
 
         self.attribute_frame = AttributeTableFrame(
             self.attribute_tab,
             on_change=lambda: self._write_live_section("attributes"),
         )
-        self.attribute_frame.grid(row=1, column=0, sticky="nsew")
+        self.attribute_frame.grid(row=0, column=0, sticky="nsew")
 
     def _build_reference_tabs(self) -> None:
         self.oe_tab.columnconfigure(0, weight=1)
@@ -7084,10 +7512,8 @@ if ($copied) {{
         self.comparison_tab.columnconfigure(0, weight=1)
         self.comparison_tab.rowconfigure(0, weight=1)
 
-        self.oe_frame = SimpleValueTableFrame(
+        self.oe_frame = OeNumberTableFrame(
             self.oe_tab,
-            title="OE-Nummern",
-            entry_label="OE-Nummer",
             on_change=lambda: self._write_live_section("oe_numbers"),
         )
         self.oe_frame.grid(row=0, column=0, sticky="nsew")
@@ -7097,70 +7523,6 @@ if ($copied) {{
             on_change=lambda: self._write_live_section("comparison_numbers"),
         )
         self.comparison_frame.grid(row=0, column=0, sticky="nsew")
-
-    def _build_competitor_tab(self) -> None:
-        self.competitor_tab.columnconfigure(0, weight=1)
-        self.competitor_tab.rowconfigure(1, weight=1)
-
-        header = ttk.LabelFrame(self.competitor_tab, text="Mitbewerber aus KHer.csv", padding=14)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        header.columnconfigure(1, weight=1)
-
-        ttk.Label(header, text="CSV-Datei").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Entry(header, textvariable=self.competitor_source_path_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Button(header, text="Datei waehlen", command=self.choose_competitor_source_file).grid(row=0, column=2, padx=(8, 0), pady=4)
-        ttk.Button(header, text="Neu laden", command=self._reload_competitor_catalog).grid(row=0, column=3, padx=(8, 0), pady=4)
-        ttk.Label(
-            header,
-            text="Es werden nur Zeilen mit gesetztem VGL-Flag geladen, also die fuer Vergleichsnummern relevanten Mitbewerber.",
-            foreground="#5E6472",
-            wraplength=980,
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 4))
-        ttk.Label(header, textvariable=self.competitor_count_var, foreground="#5E6472").grid(row=2, column=0, columnspan=4, sticky="w")
-
-        content = ttk.LabelFrame(self.competitor_tab, text="Mitbewerberliste", padding=14)
-        content.grid(row=1, column=0, sticky="nsew")
-        content.columnconfigure(0, weight=1)
-        content.rowconfigure(1, weight=1)
-
-        search_row = ttk.Frame(content)
-        search_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        search_row.columnconfigure(1, weight=1)
-        self.competitor_search_var = tk.StringVar()
-        ttk.Label(search_row, text="Suche").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        competitor_search_entry = ttk.Entry(search_row, textvariable=self.competitor_search_var)
-        competitor_search_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Button(search_row, text="In Vergleichsnummern uebernehmen", command=self._use_selected_competitor_for_comparison).grid(
-            row=0,
-            column=2,
-            padx=(8, 0),
-        )
-        self.competitor_search_var.trace_add("write", lambda *_args: self._refresh_competitor_tree())
-
-        table_frame = ttk.Frame(content)
-        table_frame.grid(row=1, column=0, sticky="nsew")
-        table_frame.columnconfigure(0, weight=1)
-        table_frame.rowconfigure(0, weight=1)
-
-        self.competitor_tree = ttk.Treeview(
-            table_frame,
-            columns=("competitor_id", "code", "name"),
-            show="headings",
-            selectmode="browse",
-            height=14,
-        )
-        self.competitor_tree.grid(row=0, column=0, sticky="nsew")
-        self.competitor_tree.heading("competitor_id", text="Mitbewerber ID")
-        self.competitor_tree.heading("code", text="Kuerzel")
-        self.competitor_tree.heading("name", text="Name")
-        self.competitor_tree.column("competitor_id", width=140, anchor="center")
-        self.competitor_tree.column("code", width=140, anchor="center")
-        self.competitor_tree.column("name", width=720, anchor="w")
-        self.competitor_tree.bind("<Double-1>", self._on_competitor_tree_double_click)
-
-        competitor_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.competitor_tree.yview)
-        competitor_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.competitor_tree.configure(yscrollcommand=competitor_scrollbar.set)
 
     def _build_media_tabs(self) -> None:
         self.image_tab.columnconfigure(0, weight=1)
@@ -7258,6 +7620,9 @@ if ($copied) {{
             self.genart_source_path_var.set(selected)
             self._load_genart_catalog()
 
+    def _reload_genart_catalog(self) -> None:
+        self._load_genart_catalog()
+
     def choose_attribute_source_file(self) -> None:
         initial_dir = (
             str(Path(self.attribute_source_path_var.get()).parent)
@@ -7301,7 +7666,7 @@ if ($copied) {{
             else str(DEFAULT_COMPETITOR_SOURCE.parent)
         )
         selected = filedialog.askopenfilename(
-            title="Mitbewerber CSV waehlen",
+            title="KHer CSV waehlen",
             initialdir=initial_dir,
             filetypes=[("CSV Dateien", "*.csv"), ("Alle Dateien", "*.*")],
         )
@@ -7314,7 +7679,7 @@ if ($copied) {{
 
     def _load_genart_catalog(self, initial: bool = False) -> None:
         source_path = Path(self.genart_source_path_var.get().strip()) if self.genart_source_path_var.get().strip() else None
-        if source_path is None or not source_path.exists():
+        if source_path is None or not path_exists_safe(source_path):
             self.genart_registry = GenArtRegistry()
             self.genart_image_index_dirty = True
             self.genart_count_var.set("0 GenArts geladen")
@@ -7367,48 +7732,57 @@ if ($copied) {{
 
     def _load_competitor_catalog(self, initial: bool = False) -> None:
         source_path = Path(self.competitor_source_path_var.get().strip()) if self.competitor_source_path_var.get().strip() else None
-        if source_path is None or not source_path.exists():
+        if source_path is None or not path_exists_safe(source_path):
+            self.manufacturer_options = []
+            self.manufacturer_options_by_id = {}
             self.competitor_options = []
             self.competitor_options_by_id = {}
-            self.competitor_count_var.set("0 Mitbewerber geladen")
+            self.competitor_count_var.set("0 Hersteller / 0 Mitbewerber geladen")
+            if hasattr(self, "oe_frame"):
+                self.oe_frame.set_manufacturer_catalog([])
             if hasattr(self, "comparison_frame"):
                 self.comparison_frame.set_competitor_catalog([])
-            if hasattr(self, "competitor_tree"):
-                self._refresh_competitor_tree()
             if not initial and source_path is not None:
-                self.status_var.set(f"Mitbewerber-CSV nicht gefunden: {source_path}")
+                self.status_var.set(f"KHer-CSV nicht gefunden: {source_path}")
             return
 
         try:
-            options = load_competitor_options(source_path)
+            manufacturer_options = load_competitor_options(source_path, comparison_only=False)
+            competitor_options = load_competitor_options(source_path, comparison_only=True)
         except ValueError as exc:
+            self.manufacturer_options = []
+            self.manufacturer_options_by_id = {}
             self.competitor_options = []
             self.competitor_options_by_id = {}
-            self.competitor_count_var.set("0 Mitbewerber geladen")
+            self.competitor_count_var.set("0 Hersteller / 0 Mitbewerber geladen")
+            if hasattr(self, "oe_frame"):
+                self.oe_frame.set_manufacturer_catalog([])
             if hasattr(self, "comparison_frame"):
                 self.comparison_frame.set_competitor_catalog([])
-            if hasattr(self, "competitor_tree"):
-                self._refresh_competitor_tree()
             if not initial:
                 self.status_var.set(str(exc))
                 messagebox.showwarning(APP_TITLE, str(exc))
             return
 
-        self.competitor_options = options
-        self.competitor_options_by_id = {option.competitor_id: option for option in options}
-        self.competitor_count_var.set(f"{len(options)} Mitbewerber geladen")
+        self.manufacturer_options = manufacturer_options
+        self.manufacturer_options_by_id = {option.competitor_id: option for option in manufacturer_options}
+        self.competitor_options = competitor_options
+        self.competitor_options_by_id = {option.competitor_id: option for option in competitor_options}
+        self.competitor_count_var.set(f"{len(manufacturer_options)} Hersteller / {len(competitor_options)} Mitbewerber geladen")
+        if hasattr(self, "oe_frame"):
+            self.oe_frame.set_manufacturer_catalog(manufacturer_options)
         if hasattr(self, "comparison_frame"):
-            self.comparison_frame.set_competitor_catalog(options)
-        if hasattr(self, "competitor_tree"):
-            self._refresh_competitor_tree()
+            self.comparison_frame.set_competitor_catalog(competitor_options)
         self.article_browser_cache_signature = None
         if not initial:
-            self.status_var.set(f"Mitbewerber-CSV geladen: {len(options)} Eintraege")
+            self.status_var.set(
+                f"KHer-CSV geladen: {len(manufacturer_options)} Hersteller, {len(competitor_options)} Mitbewerber fuer Vergleichsnummern"
+            )
             self.refresh_preview()
 
     def _load_attribute_catalog(self, initial: bool = False) -> None:
         source_path = Path(self.attribute_source_path_var.get().strip()) if self.attribute_source_path_var.get().strip() else None
-        if source_path is None or not source_path.exists():
+        if source_path is None or not path_exists_safe(source_path):
             self.attribute_options = []
             self.attribute_options_by_id = {}
             self.attribute_count_var.set("0 Attribute geladen")
@@ -7447,7 +7821,7 @@ if ($copied) {{
             if self.attribute_key_value_source_path_var.get().strip()
             else None
         )
-        if source_path is None or not source_path.exists():
+        if source_path is None or not path_exists_safe(source_path):
             self.attribute_key_value_options = []
             self.attribute_key_values_by_group = {}
             self.attribute_key_value_count_var.set("0 Schluesselwerte geladen")
@@ -7481,37 +7855,6 @@ if ($copied) {{
         if not initial:
             self.status_var.set(f"Schluesselwertkatalog geladen: {len(options)} Eintraege")
             self.refresh_preview()
-
-    def _refresh_competitor_tree(self) -> None:
-        if not hasattr(self, "competitor_tree"):
-            return
-        query = self.competitor_search_var.get().strip().casefold() if hasattr(self, "competitor_search_var") else ""
-        for item_id in self.competitor_tree.get_children():
-            self.competitor_tree.delete(item_id)
-        for option in self.competitor_options:
-            if query and query not in option.search_blob:
-                continue
-            self.competitor_tree.insert("", "end", iid=option.competitor_id, values=(option.competitor_id, option.code, option.name))
-
-    def _get_selected_competitor_option(self) -> CompetitorOption | None:
-        if not hasattr(self, "competitor_tree"):
-            return None
-        selection = self.competitor_tree.selection()
-        if not selection:
-            return None
-        return self.competitor_options_by_id.get(str(selection[0]).strip())
-
-    def _use_selected_competitor_for_comparison(self) -> None:
-        option = self._get_selected_competitor_option()
-        if option is None:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Mitbewerber aus der Liste auswaehlen.")
-            return
-        self.comparison_frame.prefill_competitor(option)
-        self.main_notebook.select(self.comparison_tab)
-        self.status_var.set(f"Mitbewerber uebernommen: {option.display_label()}")
-
-    def _on_competitor_tree_double_click(self, _event: tk.Event[tk.Misc]) -> None:
-        self._use_selected_competitor_for_comparison()
 
     def _refresh_genart_combobox_values(self) -> None:
         if not hasattr(self, "genart_combo"):
@@ -8119,7 +8462,15 @@ if ($copied) {{
             document_rows=[MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in snapshot.document_rows],
             video_rows=[MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in snapshot.video_rows],
             web_rows=[MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in snapshot.web_rows],
-            oe_number_rows=[OeNumberRow(value=row.value) for row in snapshot.oe_number_rows],
+            oe_number_rows=[
+                OeNumberRow(
+                    value=row.value,
+                    manufacturer_id=row.manufacturer_id,
+                    manufacturer_code=row.manufacturer_code,
+                    manufacturer_name=row.manufacturer_name,
+                )
+                for row in snapshot.oe_number_rows
+            ],
             comparison_number_rows=[
                 ComparisonNumberRow(
                     competitor_id=row.competitor_id,
@@ -8249,7 +8600,15 @@ if ($copied) {{
         if section in {"web_links", "all"}:
             snapshot.web_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.web_rows]
         if section in {"oe_numbers", "all"}:
-            snapshot.oe_number_rows = [OeNumberRow(value=row.value) for row in bundle.oe_number_rows]
+            snapshot.oe_number_rows = [
+                OeNumberRow(
+                    value=row.value,
+                    manufacturer_id=row.manufacturer_id,
+                    manufacturer_code=row.manufacturer_code,
+                    manufacturer_name=row.manufacturer_name,
+                )
+                for row in bundle.oe_number_rows
+            ]
         if section in {"comparison_numbers", "all"}:
             snapshot.comparison_number_rows = [
                 ComparisonNumberRow(
@@ -8946,7 +9305,12 @@ if ($copied) {{
                     AttributeRow(criteria_id="1546", label="Abbildung ähnlich", value_format="Kein Wert", value=""),
                 ]
             )
-            self.oe_frame.set_rows([OeNumberRow("0001234567"), OeNumberRow("8K0 698 151")])
+            self.oe_frame.set_rows(
+                [
+                    OeNumberRow(value="0001234567", manufacturer_id="5", manufacturer_code="AUDI", manufacturer_name="AUDI"),
+                    OeNumberRow(value="8K0 698 151", manufacturer_id="5", manufacturer_code="AUDI", manufacturer_name="AUDI"),
+                ]
+            )
             self.comparison_frame.set_rows(
                 [
                     ComparisonNumberRow(competitor_id="530", competitor_code="BOSCH", competitor_name="BOSCH", reference_number="1 987 302 777"),
@@ -8974,6 +9338,7 @@ if ($copied) {{
                 output_folder,
                 "Output",
                 competitor_lookup=self.competitor_options_by_id,
+                manufacturer_lookup=self.manufacturer_options_by_id,
                 attribute_lookup=self.attribute_options_by_id,
                 attribute_key_values_by_group=self.attribute_key_values_by_group,
             )
