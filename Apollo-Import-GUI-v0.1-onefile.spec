@@ -2,7 +2,7 @@
 import os
 from PyInstaller.utils.hooks import collect_data_files
 
-release_version = os.environ.get('APOLLO_RELEASE_VERSION', 'v0.1.5')
+release_version = os.environ.get('APOLLO_RELEASE_VERSION', 'v0.1.6')
 exe_name = f'Apollo-Import-GUI-{release_version}-onefile'
 
 datas = []
