@@ -149,7 +149,26 @@ GENART_HEADERS = ["Artikelnummer", "GenArt ID", "GenArt Bezeichnung", LAST_WRITT
 LEGACY_OE_HEADERS = ["Artikelnummer", "TecDoc ID", "OE-Nummer", LAST_WRITTEN_HEADER]
 OE_HEADERS = ["Artikelnummer", "TecDoc ID", "KHerNr", "OE-Nummer", LAST_WRITTEN_HEADER]
 COMPARISON_HEADERS = ["Artikelnummer", "TecDoc ID", "Mitbewerber ID", "Vergleichsnummer", LAST_WRITTEN_HEADER]
-ATTRIBUTE_HEADERS = ["Artikelnummer", "TecDoc Kriterien ID", "Attribut Bezeichnung", "Format", "Wert", LAST_WRITTEN_HEADER]
+LEGACY_ATTRIBUTE_HEADERS = ["Artikelnummer", "TecDoc Kriterien ID", "Attribut Bezeichnung", "Format", "Wert", LAST_WRITTEN_HEADER]
+ATTRIBUTE_HEADERS_WITH_VALUE_FROM = [
+    "Artikelnummer",
+    "TecDoc Kriterien ID",
+    "Attribut Bezeichnung",
+    "Format",
+    "Wert",
+    "Wert von",
+    "Wert bis",
+    LAST_WRITTEN_HEADER,
+]
+ATTRIBUTE_HEADERS = [
+    "Artikelnummer",
+    "TecDoc Kriterien ID",
+    "Attribut Bezeichnung",
+    "Format",
+    "Wert",
+    "Wert bis",
+    LAST_WRITTEN_HEADER,
+]
 CSV_ARTICLE_HEADER_ALIASES = {
     "artikelnummer",
     "artikelnr",
@@ -426,14 +445,21 @@ class AttributeRow:
     max_length: int | None = None
     type_name: str = ""
     value: str = ""
+    value_to: str = ""
 
     def display_label(self) -> str:
         parts = [self.criteria_id.strip(), self.label.strip()]
         return " | ".join(part for part in parts if part) or "-"
 
     def display_value(self) -> str:
-        if self.value.strip():
-            return self.value.strip()
+        value = self.value.strip()
+        value_to = self.value_to.strip()
+        if value and value_to:
+            return f"{value} bis {value_to}"
+        if value:
+            return value
+        if value_to:
+            return f"bis {value_to}"
         if self.value_format.strip().casefold() == "kein wert":
             return "(kein Wert)"
         return "-"
@@ -743,15 +769,19 @@ def normalize_comparison_number_rows(rows: list[ComparisonNumberRow]) -> list[Co
 
 def normalize_attribute_rows(rows: list[AttributeRow]) -> list[AttributeRow]:
     normalized: list[AttributeRow] = []
-    seen_values: set[tuple[str, str]] = set()
+    seen_values: set[tuple[str, str, str]] = set()
     for row in rows:
         criteria_id = row.criteria_id.strip()
         label = row.label.strip()
         value_format = row.value_format.strip()
         value = row.value.strip()
+        value_to = row.value_to.strip()
         if not criteria_id:
             continue
-        dedupe_key = (criteria_id.casefold(), value.casefold())
+        if value_format.casefold() == "kein wert":
+            value = ""
+            value_to = ""
+        dedupe_key = (criteria_id.casefold(), value.casefold(), value_to.casefold())
         if dedupe_key in seen_values:
             continue
         seen_values.add(dedupe_key)
@@ -763,6 +793,7 @@ def normalize_attribute_rows(rows: list[AttributeRow]) -> list[AttributeRow]:
                 max_length=row.max_length,
                 type_name=row.type_name.strip(),
                 value=value,
+                value_to=value_to,
             )
         )
     return normalized
@@ -2558,6 +2589,20 @@ def is_legacy_oe_workbook(path: Path, sheet_name: str) -> bool:
     return has_oe_number and not has_manufacturer
 
 
+def is_legacy_attribute_workbook(path: Path, sheet_name: str) -> bool:
+    header_keys = [normalize_header_key(value) for value in read_workbook_headers(path, sheet_name)]
+    if not header_keys:
+        return False
+    has_value = "wert" in header_keys
+    has_range = any(key in header_keys for key in ("wertvon", "wertbis", "von", "bis"))
+    return has_value and not has_range
+
+
+def is_attribute_workbook_with_value_from(path: Path, sheet_name: str) -> bool:
+    header_keys = [normalize_header_key(value) for value in read_workbook_headers(path, sheet_name)]
+    return "wertvon" in header_keys and "wertbis" in header_keys
+
+
 def read_workbook_rows(path: Path, sheet_name: str, expected_width: int) -> list[list[str]]:
     if not path.exists():
         return []
@@ -2586,6 +2631,19 @@ def prepare_existing_rows_for_write(path: Path, sheet_name: str, headers: list[s
         for row in legacy_rows:
             padded = list(row) + [""] * max(0, len(LEGACY_OE_HEADERS) - len(row))
             existing_rows.append([padded[0], padded[1], "", padded[2], padded[3]])
+    elif headers == ATTRIBUTE_HEADERS and is_attribute_workbook_with_value_from(path, sheet_name):
+        legacy_rows = read_workbook_rows(path, sheet_name, len(ATTRIBUTE_HEADERS_WITH_VALUE_FROM))
+        existing_rows = []
+        for row in legacy_rows:
+            padded = list(row) + [""] * max(0, len(ATTRIBUTE_HEADERS_WITH_VALUE_FROM) - len(row))
+            value = padded[4].strip() or padded[5].strip()
+            existing_rows.append([padded[0], padded[1], padded[2], padded[3], value, padded[6], padded[7]])
+    elif headers == ATTRIBUTE_HEADERS and is_legacy_attribute_workbook(path, sheet_name):
+        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_ATTRIBUTE_HEADERS))
+        existing_rows = []
+        for row in legacy_rows:
+            padded = list(row) + [""] * max(0, len(LEGACY_ATTRIBUTE_HEADERS) - len(row))
+            existing_rows.append([padded[0], padded[1], padded[2], padded[3], padded[4], "", padded[5]])
     else:
         existing_rows = read_workbook_rows(path, sheet_name, len(headers))
     if headers and headers[-1] == LAST_WRITTEN_HEADER and path.exists():
@@ -2804,7 +2862,16 @@ def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
         export_value = row.value
         if is_attribute_key_value_format(row.value_format):
             export_value = resolve_attribute_export_value(row, bundle.attribute_key_values_by_group)
-        export_rows.append([bundle.article_number, row.criteria_id, row.label, row.value_format, export_value])
+        export_rows.append(
+            [
+                bundle.article_number,
+                row.criteria_id,
+                row.label,
+                row.value_format,
+                export_value,
+                row.value_to,
+            ]
+        )
     return export_rows
 
 
@@ -3133,7 +3200,7 @@ def load_article_snapshots_from_folder(
             )
         )
 
-    attribute_rows = read_workbook_rows(folder / ATTRIBUTE_FILE[0], ATTRIBUTE_FILE[1], len(ATTRIBUTE_HEADERS))
+    attribute_rows = prepare_existing_rows_for_write(folder / ATTRIBUTE_FILE[0], ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS)
     for row in attribute_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
@@ -3151,6 +3218,7 @@ def load_article_snapshots_from_folder(
             max_length=max_length,
             type_name=type_name,
             value=row[4].strip(),
+            value_to=row[5].strip(),
         )
         if is_attribute_key_value_format(value_format) and attribute_key_values_by_group:
             attribute_row = AttributeRow(
@@ -3160,6 +3228,7 @@ def load_article_snapshots_from_folder(
                 max_length=attribute_row.max_length,
                 type_name=attribute_row.type_name,
                 value=resolve_attribute_key_value_display_value(attribute_row, attribute_key_values_by_group),
+                value_to=attribute_row.value_to,
             )
         ensure_snapshot(article_number).attribute_rows.append(
             attribute_row
@@ -4525,6 +4594,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         header.columnconfigure(1, weight=1)
         header.columnconfigure(5, weight=1)
+        header.columnconfigure(7, weight=1)
 
         ttk.Label(
             header,
@@ -5014,6 +5084,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.max_length_var = tk.StringVar()
         self.type_name_var = tk.StringVar()
         self.value_var = tk.StringVar()
+        self.value_to_var = tk.StringVar()
         self.hint_var = tk.StringVar(value="Waehle ein Attribut aus oder gib die Kriterien-ID manuell ein.")
         self.attribute_suggestion_popup: tk.Toplevel | None = None
         self.attribute_suggestion_listbox: tk.Listbox | None = None
@@ -5035,11 +5106,11 @@ class AttributeTableFrame(ttk.LabelFrame):
             text="Attribute werden ueber die TecDoc Kriterien ID ausgewaehlt. Format und maximale Laenge dienen als Pflegehilfe.",
             foreground="#5E6472",
             wraplength=980,
-        ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 10))
+        ).grid(row=0, column=0, columnspan=9, sticky="w", pady=(0, 10))
 
         ttk.Label(header, text="Attribut").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         self.attribute_entry = ttk.Entry(header, textvariable=self.attribute_display_var)
-        self.attribute_entry.grid(row=1, column=1, columnspan=6, sticky="ew", pady=4)
+        self.attribute_entry.grid(row=1, column=1, columnspan=8, sticky="ew", pady=4)
         self.attribute_entry.bind("<KeyRelease>", self._on_attribute_key_release)
         self.attribute_entry.bind("<Down>", self._open_attribute_dropdown_event)
         self.attribute_entry.bind("<F4>", self._open_attribute_dropdown_event)
@@ -5050,7 +5121,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         ttk.Label(header, text="Kriterien ID").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(header, textvariable=self.criteria_id_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
         ttk.Label(header, text="Bezeichnung").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
-        ttk.Entry(header, textvariable=self.label_var).grid(row=2, column=3, columnspan=4, sticky="ew", pady=4)
+        ttk.Entry(header, textvariable=self.label_var).grid(row=2, column=3, columnspan=6, sticky="ew", pady=4)
 
         ttk.Label(header, text="Format").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(header, textvariable=self.format_var, width=24).grid(row=3, column=1, sticky="w", pady=4)
@@ -5066,37 +5137,42 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.value_entry.bind("<Return>", self._handle_value_return)
         self.value_entry.bind("<FocusOut>", self._handle_value_focus_out)
 
+        ttk.Label(header, text="Wert bis").grid(row=3, column=6, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(header, textvariable=self.value_to_var).grid(row=3, column=7, sticky="ew", pady=4)
+
         quick_row = ttk.Frame(header)
-        quick_row.grid(row=3, column=6, sticky="e", pady=4)
+        quick_row.grid(row=3, column=8, sticky="e", padx=(12, 0), pady=4)
         ttk.Button(quick_row, text="Ja", command=lambda: self.value_var.set("Ja")).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(quick_row, text="Nein", command=lambda: self.value_var.set("Nein")).grid(row=0, column=1)
 
         ttk.Label(header, textvariable=self.hint_var, foreground="#5E6472", wraplength=980).grid(
             row=4,
             column=0,
-            columnspan=7,
+            columnspan=9,
             sticky="w",
             pady=(6, 8),
         )
 
         actions = ttk.Frame(header)
-        actions.grid(row=5, column=0, columnspan=7, sticky="w")
+        actions.grid(row=5, column=0, columnspan=9, sticky="w")
         ttk.Button(actions, text="Hinzufuegen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(actions, text="Leeren", command=self.clear_form).grid(row=0, column=3)
 
-        columns = ("criteria_id", "label", "value_format", "value")
+        columns = ("criteria_id", "label", "value_format", "value", "value_to")
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=11, selectmode="extended")
         self.tree.grid(row=1, column=0, sticky="nsew")
         self.tree.heading("criteria_id", text="Kriterien ID")
         self.tree.heading("label", text="Attribut")
         self.tree.heading("value_format", text="Format")
         self.tree.heading("value", text="Wert")
+        self.tree.heading("value_to", text="Wert bis")
         self.tree.column("criteria_id", width=120, anchor="center")
-        self.tree.column("label", width=430, anchor="w")
-        self.tree.column("value_format", width=180, anchor="center")
-        self.tree.column("value", width=260, anchor="w")
+        self.tree.column("label", width=390, anchor="w")
+        self.tree.column("value_format", width=160, anchor="center")
+        self.tree.column("value", width=240, anchor="w")
+        self.tree.column("value_to", width=160, anchor="w")
         self.tree.bind("<<TreeviewSelect>>", self._handle_selection)
         self.tree.bind("<Button-3>", self._open_context_menu)
 
@@ -5365,6 +5441,7 @@ class AttributeTableFrame(ttk.LabelFrame):
             max_length=self._current_max_length(),
             type_name=self.type_name_var.get().strip(),
             value=self.value_var.get().strip(),
+            value_to=self.value_to_var.get().strip(),
         )
 
     def _current_key_value_options(self) -> list[AttributeKeyValueOption]:
@@ -5650,15 +5727,20 @@ class AttributeTableFrame(ttk.LabelFrame):
             max_length=self._current_max_length(),
             type_name=self.type_name_var.get().strip(),
             value=self._normalize_current_value(value_format, self.value_var.get()),
+            value_to=self._normalize_current_value(value_format, self.value_to_var.get()),
         )
 
     def _validate_row(self, row: AttributeRow) -> None:
         if not row.criteria_id:
             raise ValueError("Bitte mindestens eine TecDoc Kriterien ID angeben.")
-        if row.max_length is not None and row.value and len(row.value) > row.max_length:
-            raise ValueError(f"Der Wert fuer {row.display_label()} ist laenger als erlaubt ({row.max_length}).")
-        if row.value_format.strip().casefold() != "kein wert" and not row.value.strip():
-            raise ValueError("Bitte fuer dieses Attribut einen Wert eingeben.")
+        if row.max_length is not None:
+            for value_label, value in [("Wert", row.value), ("Wert bis", row.value_to)]:
+                if value and len(value) > row.max_length:
+                    raise ValueError(f"{value_label} fuer {row.display_label()} ist laenger als erlaubt ({row.max_length}).")
+        if row.value_format.strip().casefold() != "kein wert" and not any(
+            value.strip() for value in [row.value, row.value_to]
+        ):
+            raise ValueError("Bitte fuer dieses Attribut einen Wert oder Wert bis eingeben.")
 
     def add_row(self) -> None:
         self._apply_current_attribute_selection()
@@ -5668,7 +5750,11 @@ class AttributeTableFrame(ttk.LabelFrame):
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
             return
-        item_id = self.tree.insert("", "end", values=(row.criteria_id, row.label, row.value_format, row.value))
+        item_id = self.tree.insert(
+            "",
+            "end",
+            values=(row.criteria_id, row.label, row.value_format, row.value, row.value_to),
+        )
         self.row_type_names[item_id] = row.type_name
         self._select_first_row(select_last=True)
         self._emit_change()
@@ -5685,7 +5771,10 @@ class AttributeTableFrame(ttk.LabelFrame):
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
             return
-        self.tree.item(selected[0], values=(row.criteria_id, row.label, row.value_format, row.value))
+        self.tree.item(
+            selected[0],
+            values=(row.criteria_id, row.label, row.value_format, row.value, row.value_to),
+        )
         self.row_type_names[selected[0]] = row.type_name
         self.tree.focus(selected[0])
         self._handle_selection()
@@ -5718,6 +5807,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.max_length_var.set("")
         self.type_name_var.set("")
         self.value_var.set("")
+        self.value_to_var.set("")
         self._hide_attribute_suggestions()
         self._hide_value_suggestions()
         self._update_hint()
@@ -5740,15 +5830,18 @@ class AttributeTableFrame(ttk.LabelFrame):
             group_label = self.type_name_var.get().strip() or self.label_var.get().strip() or "-"
             self.hint_var.set(
                 f"Format: {format_label}. Schluesselwertgruppe: {group_label}. "
-                f"{len(options)} moegliche Werte, Suche mit Live-Vorschlaegen. Max. Laenge: {max_length}."
+                f"{len(options)} moegliche Werte, Suche mit Live-Vorschlaegen im Feld Wert. "
+                f"Bereiche koennen ueber Wert und Wert bis gepflegt werden. Max. Laenge: {max_length}."
             )
             return
-        self.hint_var.set(f"Format: {format_label}. Max. Laenge laut Katalog: {max_length}.")
+        self.hint_var.set(f"Format: {format_label}. Wert oder Bereich ueber Wert und Wert bis pflegen. Max. Laenge laut Katalog: {max_length}.")
 
     def get_rows(self) -> list[AttributeRow]:
         rows = []
         for item_id in self.tree.get_children():
-            criteria_id, label, value_format, value = self.tree.item(item_id, "values")
+            values = [str(value).strip() for value in self.tree.item(item_id, "values")]
+            values.extend([""] * max(0, 5 - len(values)))
+            criteria_id, label, value_format, value, value_to = values[:5]
             catalog_entry = self.catalog_by_id.get(str(criteria_id).strip())
             rows.append(
                 AttributeRow(
@@ -5762,6 +5855,7 @@ class AttributeTableFrame(ttk.LabelFrame):
                         else self.row_type_names.get(item_id, "").strip()
                     ),
                     value=str(value).strip(),
+                    value_to=str(value_to).strip(),
                 )
             )
         return normalize_attribute_rows(rows)
@@ -5771,7 +5865,11 @@ class AttributeTableFrame(ttk.LabelFrame):
             self.tree.delete(item_id)
         self.row_type_names = {}
         for row in normalize_attribute_rows(rows):
-            item_id = self.tree.insert("", "end", values=(row.criteria_id, row.label, row.value_format, row.value))
+            item_id = self.tree.insert(
+                "",
+                "end",
+                values=(row.criteria_id, row.label, row.value_format, row.value, row.value_to),
+            )
             self.row_type_names[item_id] = row.type_name
         self._select_first_row()
 
@@ -5788,11 +5886,14 @@ class AttributeTableFrame(ttk.LabelFrame):
         selected = self.tree.selection()
         if not selected:
             return
-        criteria_id, label, value_format, value = self.tree.item(selected[0], "values")
+        values = [str(value).strip() for value in self.tree.item(selected[0], "values")]
+        values.extend([""] * max(0, 5 - len(values)))
+        criteria_id, label, value_format, value, value_to = values[:5]
         self.criteria_id_var.set(str(criteria_id).strip())
         self.label_var.set(str(label).strip())
         self.format_var.set(str(value_format).strip())
         self.value_var.set(str(value).strip())
+        self.value_to_var.set(str(value_to).strip())
         catalog_entry = self.catalog_by_id.get(self.criteria_id_var.get())
         self.max_length_var.set("" if catalog_entry is None or catalog_entry.max_length is None else str(catalog_entry.max_length))
         self.type_name_var.set(
@@ -6286,6 +6387,7 @@ class ApolloImportApp:
                 "max_length": row.max_length,
                 "type_name": row.type_name,
                 "value": row.value,
+                "value_to": row.value_to,
             }
             for row in normalize_attribute_rows(rows)
         ]
@@ -6306,6 +6408,9 @@ class ApolloImportApp:
                     max_length = int(str(max_length_raw).strip()) if str(max_length_raw).strip() else None
                 except Exception:
                     max_length = None
+            raw_value = str(item.get("value", ""))
+            if not raw_value.strip():
+                raw_value = str(item.get("value_from", ""))
             rows.append(
                 AttributeRow(
                     criteria_id=str(item.get("criteria_id", "")),
@@ -6313,7 +6418,8 @@ class ApolloImportApp:
                     value_format=str(item.get("value_format", "")),
                     max_length=max_length,
                     type_name=str(item.get("type_name", "")),
-                    value=str(item.get("value", "")),
+                    value=raw_value,
+                    value_to=str(item.get("value_to", "")),
                 )
             )
         return normalize_attribute_rows(rows)
@@ -6408,6 +6514,7 @@ class ApolloImportApp:
                         "max_length": self.attribute_frame.max_length_var.get(),
                         "type_name": self.attribute_frame.type_name_var.get(),
                         "value": self.attribute_frame.value_var.get(),
+                        "value_to": self.attribute_frame.value_to_var.get(),
                     },
                 },
                 "oe_numbers": {
@@ -6570,7 +6677,11 @@ class ApolloImportApp:
                         self.attribute_frame.format_var.set(str(form.get("value_format", "")))
                         self.attribute_frame.max_length_var.set(str(form.get("max_length", "")))
                         self.attribute_frame.type_name_var.set(str(form.get("type_name", "")))
-                        self.attribute_frame.value_var.set(str(form.get("value", "")))
+                        form_value = str(form.get("value", ""))
+                        if not form_value.strip():
+                            form_value = str(form.get("value_from", ""))
+                        self.attribute_frame.value_var.set(form_value)
+                        self.attribute_frame.value_to_var.set(str(form.get("value_to", "")))
                         self.attribute_frame._update_hint()
 
                 oe_payload = references.get("oe_numbers")
@@ -8488,6 +8599,7 @@ if ($copied) {{
                     max_length=row.max_length,
                     type_name=row.type_name,
                     value=row.value,
+                    value_to=row.value_to,
                 )
                 for row in snapshot.attribute_rows
             ],
@@ -8628,6 +8740,7 @@ if ($copied) {{
                     max_length=row.max_length,
                     type_name=row.type_name,
                     value=row.value,
+                    value_to=row.value_to,
                 )
                 for row in bundle.attribute_rows
             ]
