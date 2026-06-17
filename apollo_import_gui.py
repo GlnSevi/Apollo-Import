@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
@@ -4569,6 +4569,219 @@ class SimpleValueTableFrame(ttk.LabelFrame):
         self.inline_editor_item = ""
 
 
+class SearchSuggestionPopup:
+    IGNORED_KEYSYMS = {
+        "Up",
+        "Down",
+        "Left",
+        "Right",
+        "Return",
+        "Escape",
+        "Tab",
+        "Shift_L",
+        "Shift_R",
+        "Control_L",
+        "Control_R",
+        "Alt_L",
+        "Alt_R",
+    }
+
+    def __init__(
+        self,
+        owner: tk.Misc,
+        entry: ttk.Entry,
+        values_provider: Callable[[str], list[str]],
+        accept_callback: Callable[[str], None],
+        *,
+        on_focus_out: Callable[[], None] | None = None,
+        on_missing_selection: Callable[[], None] | None = None,
+        min_width: int = 360,
+        max_visible_rows: int = 8,
+    ) -> None:
+        self.owner = owner
+        self.entry = entry
+        self.values_provider = values_provider
+        self.accept_callback = accept_callback
+        self.on_focus_out = on_focus_out
+        self.on_missing_selection = on_missing_selection
+        self.min_width = min_width
+        self.max_visible_rows = max_visible_rows
+        self.popup: tk.Toplevel | None = None
+        self.listbox: tk.Listbox | None = None
+        self.values: list[str] = []
+        self.suppress_next_focus_show = False
+
+        self.entry.bind("<KeyRelease>", self._handle_key_release)
+        self.entry.bind("<Down>", self._open_event)
+        self.entry.bind("<F4>", self._open_event)
+        self.entry.bind("<Escape>", self._close_event)
+        self.entry.bind("<Return>", self._handle_return)
+        self.entry.bind("<FocusIn>", self._handle_focus_in)
+        self.entry.bind("<FocusOut>", self._handle_focus_out)
+
+    def refresh(self, show: bool = False) -> list[str]:
+        values = self.values_provider(self.entry.get())
+        self.values = values
+        if show or (self.popup is not None and self.popup.winfo_exists() and self.popup.state() != "withdrawn"):
+            self.show(values)
+        return list(values)
+
+    def show(self, values: list[str] | None = None) -> None:
+        if values is None:
+            values = self.values_provider(self.entry.get())
+        self.values = list(values)
+        if not self.values:
+            self.hide()
+            return
+
+        self._ensure_popup()
+        if self.popup is None or self.listbox is None:
+            return
+
+        self.listbox.delete(0, "end")
+        for value in self.values:
+            self.listbox.insert("end", value)
+
+        visible_rows = min(max(len(self.values), 1), self.max_visible_rows)
+        self.listbox.configure(height=visible_rows)
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(0)
+        self.listbox.activate(0)
+        self.listbox.see(0)
+
+        self.popup.update_idletasks()
+        x_pos = self.entry.winfo_rootx()
+        y_pos = self.entry.winfo_rooty() + self.entry.winfo_height()
+        width = max(self.entry.winfo_width(), self.min_width)
+        height = self.popup.winfo_reqheight()
+        self.popup.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
+        self.popup.deiconify()
+        self.popup.lift()
+
+    def hide(self) -> None:
+        if self.popup is None or not self.popup.winfo_exists():
+            self.popup = None
+            self.listbox = None
+            return
+        self.popup.withdraw()
+
+    def _ensure_popup(self) -> None:
+        if self.popup is not None and self.popup.winfo_exists():
+            return
+
+        popup = tk.Toplevel(self.owner)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.transient(self.owner.winfo_toplevel())
+        popup.configure(background="#C7BFAF", padx=1, pady=1)
+
+        listbox = tk.Listbox(
+            popup,
+            activestyle="none",
+            exportselection=False,
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+        )
+        listbox.pack(fill="both", expand=True)
+        listbox.bind("<ButtonRelease-1>", self._accept_listbox_click)
+        listbox.bind("<Double-Button-1>", self._accept_listbox_click)
+        listbox.bind("<Return>", self._accept_listbox_keyboard)
+        listbox.bind("<Escape>", self._close_event)
+        listbox.bind("<FocusOut>", self._handle_focus_out)
+
+        self.popup = popup
+        self.listbox = listbox
+
+    def _selected_value(self) -> str | None:
+        if self.listbox is not None and self.listbox.winfo_exists():
+            selection = self.listbox.curselection()
+            if selection:
+                return str(self.listbox.get(selection[0]))
+        if not self.values:
+            self.values = self.values_provider(self.entry.get())
+        return self.values[0] if self.values else None
+
+    def _accept_value(self, value: str | None) -> None:
+        if not value:
+            if self.on_missing_selection is not None:
+                self.on_missing_selection()
+            self.hide()
+            return
+        self.accept_callback(value)
+        self.hide()
+        self.suppress_next_focus_show = True
+        self.entry.focus_set()
+        self.entry.icursor("end")
+
+    def _accept_listbox_click(self, _event: tk.Event[tk.Misc]) -> str:
+        self._accept_value(self._selected_value())
+        return "break"
+
+    def _accept_listbox_keyboard(self, _event: tk.Event[tk.Misc]) -> str:
+        self._accept_value(self._selected_value())
+        return "break"
+
+    def _open_event(self, _event: tk.Event[tk.Misc]) -> str:
+        values = self.values_provider(self.entry.get())
+        self.show(values)
+        if self.listbox is not None and self.values:
+            self.listbox.focus_set()
+        return "break"
+
+    def _close_event(self, _event: tk.Event[tk.Misc]) -> str:
+        self.hide()
+        self.suppress_next_focus_show = True
+        self.entry.focus_set()
+        return "break"
+
+    def _handle_return(self, _event: tk.Event[tk.Misc]) -> str:
+        self._accept_value(self._selected_value())
+        return "break"
+
+    def _handle_focus_in(self, _event: tk.Event[tk.Misc]) -> None:
+        if self.suppress_next_focus_show:
+            self.suppress_next_focus_show = False
+            return
+        if self.entry.get().strip():
+            self.show()
+
+    def _handle_key_release(self, event: tk.Event[tk.Misc]) -> None:
+        if event.keysym in self.IGNORED_KEYSYMS:
+            return
+        if self.entry.get().strip():
+            self.show()
+        else:
+            self.hide()
+
+    def _handle_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
+        self.owner.after(120, self._finalize_focus_out)
+
+    def _finalize_focus_out(self) -> None:
+        focus_widget = self.owner.focus_get()
+        if self._is_popup_widget(focus_widget):
+            return
+        self.hide()
+        if self.on_focus_out is not None:
+            self.on_focus_out()
+
+    def _is_popup_widget(self, widget: tk.Misc | None) -> bool:
+        if widget is None:
+            return False
+        if widget is self.entry:
+            return True
+        if self.listbox is not None and widget is self.listbox:
+            return True
+        if self.popup is not None and widget is self.popup:
+            return True
+        master = getattr(widget, "master", None)
+        while master is not None:
+            if self.popup is not None and master is self.popup:
+                return True
+            master = getattr(master, "master", None)
+        return False
+
+
 class OeNumberTableFrame(ttk.LabelFrame):
     def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
         super().__init__(master, text="OE-Nummern", padding=14)
@@ -4586,6 +4799,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
         self.manufacturer_code_var = tk.StringVar()
         self.manufacturer_name_var = tk.StringVar()
         self.value_var = tk.StringVar()
+        self.manufacturer_suggestions: SearchSuggestionPopup | None = None
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -4604,12 +4818,16 @@ class OeNumberTableFrame(ttk.LabelFrame):
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 10))
 
         ttk.Label(header, text="Hersteller").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.manufacturer_combo = ttk.Combobox(header, textvariable=self.manufacturer_display_var)
-        self.manufacturer_combo.grid(row=1, column=1, columnspan=6, sticky="ew", pady=4)
-        self.manufacturer_combo.bind("<<ComboboxSelected>>", self._apply_current_manufacturer_selection)
-        self.manufacturer_combo.bind("<KeyRelease>", self._on_manufacturer_key_release)
-        self.manufacturer_combo.bind("<Return>", self._apply_current_manufacturer_selection)
-        self.manufacturer_combo.bind("<FocusOut>", self._apply_current_manufacturer_selection)
+        self.manufacturer_entry = ttk.Entry(header, textvariable=self.manufacturer_display_var)
+        self.manufacturer_entry.grid(row=1, column=1, columnspan=6, sticky="ew", pady=4)
+        self.manufacturer_suggestions = SearchSuggestionPopup(
+            self,
+            self.manufacturer_entry,
+            self._update_manufacturer_combo_values,
+            self._accept_manufacturer_suggestion,
+            on_focus_out=self._apply_current_manufacturer_selection,
+            min_width=520,
+        )
 
         ttk.Label(header, text="KHerNr").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(header, textvariable=self.manufacturer_id_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
@@ -4651,23 +4869,25 @@ class OeNumberTableFrame(ttk.LabelFrame):
         self.catalog_by_id = {option.competitor_id: option for option in self.catalog_options}
         self.catalog_by_code = {option.code.casefold(): option for option in self.catalog_options if option.code}
         self.catalog_by_label = {option.display_label(): option for option in self.catalog_options}
-        self._update_manufacturer_combo_values(self.manufacturer_display_var.get())
+        if self.manufacturer_suggestions is not None:
+            self.manufacturer_suggestions.refresh()
 
     def prefill_manufacturer(self, option: CompetitorOption) -> None:
         self.manufacturer_display_var.set(option.display_label())
         self.manufacturer_id_var.set(option.competitor_id)
         self.manufacturer_code_var.set(option.code)
         self.manufacturer_name_var.set(option.name)
-        self._update_manufacturer_combo_values(option.display_label())
+        if self.manufacturer_suggestions is not None:
+            self.manufacturer_suggestions.refresh()
 
-    def _update_manufacturer_combo_values(self, query: str = "") -> None:
+    def _update_manufacturer_combo_values(self, query: str = "") -> list[str]:
         query_text = query.strip().casefold()
         filtered = [
             option.display_label()
             for option in self.catalog_options
             if not query_text or query_text in option.search_blob
         ]
-        self.manufacturer_combo.configure(values=filtered[:200])
+        return filtered[:200]
 
     def _resolve_manufacturer(self, raw_value: str) -> CompetitorOption | None:
         value = raw_value.strip()
@@ -4696,8 +4916,13 @@ class OeNumberTableFrame(ttk.LabelFrame):
             return
         self.prefill_manufacturer(option)
 
+    def _accept_manufacturer_suggestion(self, value: str) -> None:
+        self.manufacturer_display_var.set(value)
+        self._apply_current_manufacturer_selection()
+
     def _on_manufacturer_key_release(self, _event: tk.Event[tk.Misc]) -> None:
-        self._update_manufacturer_combo_values(self.manufacturer_display_var.get())
+        if self.manufacturer_suggestions is not None:
+            self.manufacturer_suggestions.refresh(show=True)
 
     def _emit_change(self) -> None:
         if self.on_change is not None:
@@ -4834,6 +5059,7 @@ class ComparisonTableFrame(ttk.LabelFrame):
         self.competitor_code_var = tk.StringVar()
         self.competitor_name_var = tk.StringVar()
         self.reference_number_var = tk.StringVar()
+        self.competitor_suggestions: SearchSuggestionPopup | None = None
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -4851,12 +5077,16 @@ class ComparisonTableFrame(ttk.LabelFrame):
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 10))
 
         ttk.Label(header, text="Mitbewerber").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.competitor_combo = ttk.Combobox(header, textvariable=self.competitor_display_var)
-        self.competitor_combo.grid(row=1, column=1, columnspan=6, sticky="ew", pady=4)
-        self.competitor_combo.bind("<<ComboboxSelected>>", self._apply_current_competitor_selection)
-        self.competitor_combo.bind("<KeyRelease>", self._on_competitor_key_release)
-        self.competitor_combo.bind("<Return>", self._apply_current_competitor_selection)
-        self.competitor_combo.bind("<FocusOut>", self._apply_current_competitor_selection)
+        self.competitor_entry = ttk.Entry(header, textvariable=self.competitor_display_var)
+        self.competitor_entry.grid(row=1, column=1, columnspan=6, sticky="ew", pady=4)
+        self.competitor_suggestions = SearchSuggestionPopup(
+            self,
+            self.competitor_entry,
+            self._update_competitor_combo_values,
+            self._accept_competitor_suggestion,
+            on_focus_out=self._apply_current_competitor_selection,
+            min_width=520,
+        )
 
         ttk.Label(header, text="Mitbewerber ID").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(header, textvariable=self.competitor_id_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
@@ -4898,23 +5128,25 @@ class ComparisonTableFrame(ttk.LabelFrame):
         self.catalog_by_id = {option.competitor_id: option for option in self.catalog_options}
         self.catalog_by_code = {option.code.casefold(): option for option in self.catalog_options if option.code}
         self.catalog_by_label = {option.display_label(): option for option in self.catalog_options}
-        self._update_competitor_combo_values(self.competitor_display_var.get())
+        if self.competitor_suggestions is not None:
+            self.competitor_suggestions.refresh()
 
     def prefill_competitor(self, option: CompetitorOption) -> None:
         self.competitor_display_var.set(option.display_label())
         self.competitor_id_var.set(option.competitor_id)
         self.competitor_code_var.set(option.code)
         self.competitor_name_var.set(option.name)
-        self._update_competitor_combo_values(option.display_label())
+        if self.competitor_suggestions is not None:
+            self.competitor_suggestions.refresh()
 
-    def _update_competitor_combo_values(self, query: str = "") -> None:
+    def _update_competitor_combo_values(self, query: str = "") -> list[str]:
         query_text = query.strip().casefold()
         filtered = [
             option.display_label()
             for option in self.catalog_options
             if not query_text or query_text in option.search_blob
         ]
-        self.competitor_combo.configure(values=filtered[:200])
+        return filtered[:200]
 
     def _resolve_competitor(self, raw_value: str) -> CompetitorOption | None:
         value = raw_value.strip()
@@ -4943,8 +5175,13 @@ class ComparisonTableFrame(ttk.LabelFrame):
             return
         self.prefill_competitor(option)
 
+    def _accept_competitor_suggestion(self, value: str) -> None:
+        self.competitor_display_var.set(value)
+        self._apply_current_competitor_selection()
+
     def _on_competitor_key_release(self, _event: tk.Event[tk.Misc]) -> None:
-        self._update_competitor_combo_values(self.competitor_display_var.get())
+        if self.competitor_suggestions is not None:
+            self.competitor_suggestions.refresh(show=True)
 
     def _emit_change(self) -> None:
         if self.on_change is not None:
@@ -6114,6 +6351,7 @@ class ApolloImportApp:
         self.current_id_article_number = ""
         self.article_browser_records: dict[str, StoredArticleSnapshot] = {}
         self.selected_genart_selections: list[GenArtSelection] = []
+        self.genart_suggestions: SearchSuggestionPopup | None = None
         self.manufacturer_options: list[CompetitorOption] = []
         self.manufacturer_options_by_id: dict[str, CompetitorOption] = {}
         self.competitor_options: list[CompetitorOption] = []
@@ -7561,15 +7799,18 @@ if ($copied) {{
         input_row.grid(row=1, column=0, sticky="ew")
         input_row.columnconfigure(1, weight=1)
         ttk.Label(input_row, text="GenArt").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
-        self.genart_combo = ttk.Combobox(input_row, textvariable=self.genart_display_var)
-        self.genart_combo.grid(row=0, column=1, sticky="ew", pady=6)
-        self.genart_combo.bind("<<ComboboxSelected>>", lambda _event: self.add_current_genart_selection())
-        self.genart_combo.bind("<KeyRelease>", self._on_genart_key_release)
-        self.genart_combo.bind("<Return>", self._on_genart_return)
-        self.genart_combo.bind("<FocusIn>", self._on_genart_focus_in)
-        self.genart_combo.bind("<FocusOut>", self._on_genart_focus_out)
-        self.genart_combo.bind("<Control-f>", self._open_genart_search_dialog_event)
-        self.genart_combo.bind("<F4>", self._open_genart_search_dialog_event)
+        self.genart_entry = ttk.Entry(input_row, textvariable=self.genart_display_var)
+        self.genart_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        self.genart_entry.bind("<Control-f>", self._open_genart_search_dialog_event)
+        self.genart_suggestions = SearchSuggestionPopup(
+            self.root,
+            self.genart_entry,
+            self._genart_suggestion_values,
+            self._accept_genart_suggestion,
+            on_focus_out=self._normalize_genart_selection,
+            on_missing_selection=self._handle_missing_genart_selection,
+            min_width=520,
+        )
         ttk.Button(input_row, text="Hinzufuegen", command=self.add_current_genart_selection).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=6)
         ttk.Button(input_row, text="Suchen...", command=self._open_genart_search_dialog).grid(row=0, column=3, sticky="w", padx=(8, 0), pady=6)
 
@@ -7800,8 +8041,9 @@ if ($copied) {{
                 )
             else:
                 self.genart_suggestion_var.set("Keine GenArt-Datei geladen.")
-            if hasattr(self, "genart_combo"):
-                self.genart_combo.configure(values=[])
+            if self.genart_suggestions is not None:
+                self.genart_suggestions.values = []
+                self.genart_suggestions.hide()
             if not initial and source_path is not None:
                 self.status_var.set(f"GenArt-Datei nicht gefunden: {source_path}")
             return
@@ -7817,15 +8059,16 @@ if ($copied) {{
                 )
             else:
                 self.genart_suggestion_var.set("GenArt-Datei konnte nicht geladen werden.")
-            if hasattr(self, "genart_combo"):
-                self.genart_combo.configure(values=[])
+            if self.genart_suggestions is not None:
+                self.genart_suggestions.values = []
+                self.genart_suggestions.hide()
             if not initial:
                 messagebox.showwarning(APP_TITLE, f"GenArt-Datei konnte nicht geladen werden:\n{exc}")
             return
 
         self.genart_count_var.set(f"{count} GenArts geladen")
         self.genart_image_index_dirty = True
-        if hasattr(self, "genart_combo"):
+        if self.genart_suggestions is not None:
             self._refresh_genart_combobox_values()
         if self.selected_genart_selections:
             self._set_selected_genart_selections(self.selected_genart_selections)
@@ -7968,10 +8211,12 @@ if ($copied) {{
             self.refresh_preview()
 
     def _refresh_genart_combobox_values(self) -> None:
-        if not hasattr(self, "genart_combo"):
+        if self.genart_suggestions is None:
             return
-        values = self.genart_registry.search_display_values(self.genart_display_var.get(), limit=250)
-        self.genart_combo.configure(values=values)
+        self.genart_suggestions.refresh()
+
+    def _genart_suggestion_values(self, query: str = "") -> list[str]:
+        return self.genart_registry.search_display_values(query, limit=250)
 
     def _canonicalize_genart_selection(self, selection: GenArtSelection) -> GenArtSelection:
         option = self.genart_registry.resolve(selection.id) or self.genart_registry.resolve(selection.bezeichnung)
@@ -8024,9 +8269,8 @@ if ($copied) {{
             if parsed_selection is not None and (not self.genart_registry.options or "|" in current_value):
                 return self._canonicalize_genart_selection(parsed_selection)
 
-        if prefer_first_suggestion and hasattr(self, "genart_combo"):
-            values_raw = self.genart_combo.cget("values")
-            values = list(self.root.tk.splitlist(values_raw)) if isinstance(values_raw, str) else list(values_raw)
+        if prefer_first_suggestion and self.genart_suggestions is not None:
+            values = self.genart_suggestions.values or self._genart_suggestion_values(current_value)
             for value in values:
                 option = self.genart_registry.resolve(str(value))
                 if option is not None:
@@ -8075,6 +8319,13 @@ if ($copied) {{
             self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
             return
         self._add_genart_selection(selection)
+
+    def _accept_genart_suggestion(self, value: str) -> None:
+        self.genart_display_var.set(value)
+        self.add_current_genart_selection()
+
+    def _handle_missing_genart_selection(self) -> None:
+        self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
 
     def _remove_selected_genarts_event(self, _event: tk.Event[tk.Misc]) -> str:
         self.remove_selected_genarts()
