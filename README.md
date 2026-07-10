@@ -26,15 +26,24 @@ Alternativ unter Windows:
   - Umlaute in Kurzbezeichnungen werden automatisch ersetzt, z. B. `ä -> ae`, `ö -> oe`, `ü -> ue`, `ß -> ss`
 - Langtexte pro Sprache pflegen
 - Attribute pro Artikel mit `TecDoc Kriterien ID`, Format-Hinweis und Wert pflegen
+- Attribute aus gescrapten Produkttexten vorschlagen lassen
+  - erkennt `Label: Wert`-Zeilen und technische Daten (inkl. Bereichen und `LxBxH`-Abmessungen)
+  - Uebernahme immer ueber einen Bestaetigungsdialog, nie automatisch
+- Suchwoerter pro Artikel pflegen
+  - werden beim Export als Attribut `Zusatzbezeichnung` (TecDoc Kriterien ID `9595`) in die `Attribute.xlsx` geschrieben, eine Zeile pro Suchwort
 - OE-Nummern als freie Referenzen pro Artikel pflegen
 - Vergleichsnummern mit Mitbewerber-ID pro Artikel pflegen
 - Mitbewerber aus `KHer.csv` nachschlagen und direkt in Vergleichsnummern uebernehmen
+- Fahrzeugverknuepfungen pro Artikel ueber Motorcodes pflegen
+  - ueber einen oder mehrere Motorcodes werden die passenden KTyp-Nummern (TopMotive und TecDoc) automatisch aus den KTyp-Stammdaten (`KTyp.xlsx`) ergaenzt
+  - waehrend der Eingabe werden Motorcode-Vorschlaege inklusive `meintest du`-Naehe angezeigt
+  - der Fahrzeugtyp ist per Dropdown waehlbar (Standard `PKW = 2`)
 - Bilder, Dokumente, Videos und Web Links erfassen
   - mit Bild-Thumbnail und PDF-Vorschau in den Bilder- und Dokumente-Tabs
   - vorhandene Zeilen koennen direkt im Formular nachbearbeitet und aktualisiert werden
   - Aenderungen werden direkt in die Output-Excel-Dateien geschrieben
 - Kurzbezeichnungen und Texte per DeepL aus dem deutschen Feld in `EN`, `CZ`, `FR`, `IT` und `NL` uebersetzen
-- GenArt lokal und optional ueber inoffizielle Google-Lens-Treffer zum Produktbild verfeinern
+- GenArt manuell ueber die Suche auswaehlen
   - mit direkter Suche ueber das GenArt-Feld oder den Button `Suchen...`
 - Produktdaten direkt von `kunzer.de` laden
   - per Artikelnummer oder Produkt-URL
@@ -77,7 +86,7 @@ Video-Links werden automatisch auf ein einbettbares YouTube-Format im Stil `http
 
 Wenn `DEEPL_API_KEY` gesetzt ist oder der Key in der GUI eingetragen wurde, koennen die geladenen deutschen Texte direkt weiter uebersetzt werden.
 
-Wenn `Google Lens ohne API-Key fuer GenArt verwenden (inoffiziell)` aktiv ist, kann die GUI GenArt-Vorschlaege ueber sichtbare Treffer aus Google Lens verfeinern. Dabei werden Treffertexte und erkannte Seiten aus dem Lens-Ergebnis als zusaetzliches Signal fuer die GenArt-Suche genutzt.
+Die GenArt wird nach dem Laden bewusst nicht automatisch gesetzt, sondern manuell ueber das GenArt-Suchfeld oder den Button `Suchen...` ausgewaehlt.
 
 ## Artikelverzeichnis
 
@@ -110,6 +119,53 @@ Unterstuetzte Spalten sind flexibel. Mindestens eine der beiden Gruppen muss vor
 
 CSV-Dateien duerfen mit `;`, `,`, Tab oder `|` getrennt sein. XLSX-Dateien werden aus dem ersten Tabellenblatt gelesen. Neue Artikel werden im festen Importpfad angehaengt; existiert die Artikelnummer bereits, werden nur deren alte Zeilen ersetzt.
 
+## Fahrzeugverknuepfungen
+
+Im Tab `Fahrzeuge` koennen einem Artikel Fahrzeuge (KTyp-Nummern) zugeordnet werden. Grundlage ist die KTyp-Stammdatendatei (`KTyp.xlsx`), die im Projekt-Tab unter `Datenstaemme` gewaehlt und jederzeit ueber `Neu laden` aktualisiert werden kann. Standardpfad ist `G:\Apollo\KTyp.xlsx`.
+
+Ablauf:
+
+- einen oder mehrere Motorcodes eingeben (mehrere mit `;` trennen)
+- waehrend der Eingabe erscheinen Vorschlaege fuer den gemeinten Motorcode inklusive `meintest du`-Naehe (Tippfehler-tolerant)
+- mit `Fahrzeuge hinzufuegen` bzw. `Enter` werden **alle** passenden Fahrzeuge aus den Stammdaten uebernommen (Hersteller, Modell, Bezeichnung, Bauzeit, Leistung, KTyp TopMotive und KTyp TecDoc)
+- der Fahrzeugtyp ist per Dropdown waehlbar; Standard ist `PKW (2)`, weitere sind `NKW (16)`, `Motor (14)` und `Achse (19)`
+
+Die Suche ueber Motorcodes ist robust gegen Gross-/Kleinschreibung, Leerzeichen und Klammerzusaetze (z. B. `108C (XV8)` findet auch `108C`).
+
+Der Export erzeugt `Fahrzeugverknuepfungen.xlsx` mit den Spalten:
+
+- `Artikelnummer`
+- `Fahrzeugtyp` (fuer den Apollo-Import auf `TecDoc Verknuepfungstyp ID` mappen, `PKW = 2`)
+- `KTypNr` (fuer den Apollo-Import auf `TecDoc Verknuepfungs ID` mappen)
+- `KTyp-System` (Info, ob die `KTypNr` aus dem `Topmotive`- oder `TecDoc`-Nummernkreis stammt)
+
+Pro Fahrzeug werden zwei Zeilen geschrieben: eine mit der TopMotive-Nummer und eine mit der TecDoc-Nummer. So kann im Apollo-Import genau die eine passende Spalte auf `TecDoc Verknuepfungs ID` gemappt werden. Ueber die Spalte `KTyp-System` lassen sich die Zeilen bei Bedarf vorher filtern.
+
+## Attribute aus Text vorschlagen
+
+Die GUI kann technische Angaben aus den deutschen Produkttexten lesen und passende Attribute vorschlagen. Erkannt werden `Label: Wert`- und Tab-getrennte Zeilen aus Technische-Daten-Bloecken, z. B.:
+
+- `Gewicht: 612 g` -> `Gewicht [kg]` = `0,612` (Einheiten werden automatisch umgerechnet)
+- `Hubhoehe: 150 - 530 mm` -> Bereich als `Wert` + `Wert bis`
+- `Abmessungen (LxBxH): 155 x 17 x 13,5 mm` -> aufgeteilt in `Laenge`, `Breite`, `Hoehe`
+- Schluesselwert-Attribute werden nur vorgeschlagen, wenn der Wert exakt in der Werteliste steht
+
+Grundlage ist die pflegbare Zuordnungsdatei `Attribut_Zuordnung.xlsx` (Standard `G:\Apollo\Attribut_Zuordnung.xlsx`, Spalten `Text-Label` und `TecDoc Kriterien ID`), die im Projekt-Tab unter `Datenstaemme` konfiguriert wird.
+
+Vorschlaege erscheinen in einem Bestaetigungsdialog (per Button `Attribute aus Text vorschlagen` im Attribute-Tab oder automatisch nach dem Kunzer-Laden). Nichts wird ohne Bestaetigung uebernommen. Nicht erkannte Angaben koennen im Dialog manuell einem Attribut zugewiesen werden; mit `Zuordnung merken` wird das Text-Label dauerhaft in die Zuordnungsdatei uebernommen, so dass es beim naechsten Mal automatisch erkannt wird.
+
+## Suchwoerter
+
+Apollo kennt keine nativen Keywords oder Suchbegriffe. Im Tab `Suchwoerter` koennen deshalb pro Artikel freie Suchbegriffe gepflegt werden, die beim Export als Attribut mitgeschrieben werden:
+
+- jedes Suchwort wird eine eigene Zeile in `Attribute.xlsx`
+- `TecDoc Kriterien ID` = `9595`, `Attribut Bezeichnung` = `Zusatzbezeichnung`, `Format` = `Alphanumerisch`
+- maximal 20 Zeichen pro Suchwort (Vorgabe aus den Attribut-Stammdaten); laengere Eingaben werden abgewiesen
+- mehrere Suchwoerter koennen mit `;` getrennt auf einmal eingegeben werden
+- Duplikate werden automatisch ignoriert, auch gegenueber manuell gepflegten `9595`-Zeilen im Attribute-Tab
+
+Beim erneuten Laden eines Artikels aus den Output-Dateien werden `9595`-Zeilen automatisch wieder dem Tab `Suchwoerter` zugeordnet (nicht dem Attribute-Tab).
+
 ## TecDoc Anhangsformattyp ID
 
 Die Exportdateien fuer Bilder, Dokumente, Videos und Web Links enthalten zusaetzlich die Spalte `TecDoc Anhangsformattyp ID`.
@@ -137,17 +193,6 @@ python apollo_import_gui.py
 
 Standardmaessig nutzt die GUI `https://api.deepl.com`. Fuer DeepL Free kannst du in der GUI oder per `DEEPL_API_BASE_URL` auf `https://api-free.deepl.com` wechseln.
 
-## Google Lens
-
-Die GenArt-Vorschlaege koennen optional ueber einen inoffiziellen Google-Lens-Abruf ohne API Key verfeinert werden.
-
-- es ist kein zusaetzlicher API Key noetig
-- die GUI nutzt dafuer einen Headless-Browser ueber `Playwright`
-- ausgewertet werden sichtbare Treffertexte und erkannte Zielseiten aus dem Lens-Ergebnis
-- der Weg ist bewusst experimentell und kann sich durch Aenderungen bei Google jederzeit veraendern
-
-Die lokale Such- und Bildaehnlichkeitslogik bleibt als Fallback erhalten, falls Lens keine brauchbaren Treffer liefert.
-
 ## Exportierte Dateien
 
 Die GUI erzeugt aktuell diese Dateien:
@@ -158,6 +203,7 @@ Die GUI erzeugt aktuell diese Dateien:
 - `Attribute.xlsx`
 - `OE-Nummern.xlsx`
 - `Vergleichsnummern.xlsx`
+- `Fahrzeugverknuepfungen.xlsx`
 - `Bilder.xlsx`
 - `Dokumente.xlsx`
 - `Videos.xlsx`

@@ -4,7 +4,7 @@ import csv
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, get_close_matches
 from html import unescape
 import io
 import json
@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
@@ -56,13 +56,72 @@ DEFAULT_GENART_SOURCE = Path(r"C:\Users\heimbuchner\Downloads\Genarten.xlsx")
 DEFAULT_COMPETITOR_SOURCE = Path(r"C:\Users\heimbuchner\Downloads\KHer.csv")
 DEFAULT_ATTRIBUTE_SOURCE = Path(r"G:\Apollo\Export aus SQL\Attribute alle.xlsx")
 DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE = Path("G:/Apollo/Export aus SQL/Schl\u00fcsselwerte.xlsx")
+DEFAULT_VEHICLE_SOURCE = Path(r"G:\Apollo\KTyp.xlsx")
+DEFAULT_ATTRIBUTE_MAPPING_SOURCE = Path(r"G:\Apollo\Attribut_Zuordnung.xlsx")
 DEEPL_DEFAULT_BASE_URL = "https://api.deepl.com"
 ID_ALPHABET = string.ascii_uppercase + string.digits
 ID_LENGTH = 6
 SHORT_TEXT_MAX_LENGTH = 60
-GENART_AUTO_APPLY_MIN_SCORE = 360
 ATTACHMENT_FORMAT_TYPE_HEADER = "TecDoc Anhangsformattyp ID"
 LAST_WRITTEN_HEADER = "Zuletzt geschrieben am"
+# TecDoc Verknuepfungstyp IDs (Fahrzeugtyp) aus dem Apollo-Import. PKW = 2.
+VEHICLE_TYPE_CHOICES = [
+    ("2", "PKW"),
+    ("16", "NKW"),
+    ("14", "Motor"),
+    ("19", "Achse"),
+]
+DEFAULT_VEHICLE_TYPE_ID = "2"
+
+
+def vehicle_type_label_for_id(vehicle_type_id: str) -> str:
+    key = str(vehicle_type_id or "").strip()
+    for type_id, label in VEHICLE_TYPE_CHOICES:
+        if type_id == key:
+            return label
+    return ""
+
+
+def vehicle_type_id_for_label(label: str) -> str:
+    key = str(label or "").strip().casefold()
+    for type_id, type_label in VEHICLE_TYPE_CHOICES:
+        if type_label.casefold() == key:
+            return type_id
+    return ""
+
+
+def format_vehicle_type_choice(type_id: str, label: str) -> str:
+    label = label.strip() or vehicle_type_label_for_id(type_id)
+    return f"{label} ({type_id})" if type_id else label
+
+
+def normalize_motorcode(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().upper())
+
+
+def motorcode_keys(value: object) -> list[str]:
+    """Robuste Suchschluessel fuer einen Motorcode.
+
+    Beruecksichtigt Gross-/Kleinschreibung, Leerzeichen und Klammerzusaetze,
+    z. B. ``108C (XV8)`` -> ``108C``.
+    """
+    collapsed = normalize_motorcode(value)
+    if not collapsed:
+        return []
+    keys = {collapsed, collapsed.replace(" ", "")}
+    base = collapsed.split("(", 1)[0].strip()
+    if base:
+        keys.add(base)
+        keys.add(base.replace(" ", ""))
+    return [key for key in keys if key]
+
+
+def format_year_range(year_from: str, year_to: str) -> str:
+    year_from = str(year_from or "").strip()
+    year_to = str(year_to or "").strip()
+    if year_from and year_to:
+        return f"{year_from} - {year_to}"
+    return year_from or year_to
 SHORT_TEXT_UMLAUT_REPLACEMENTS = str.maketrans(
     {
         "ä": "ae",
@@ -139,6 +198,7 @@ GENART_FILE = ("GenArt_Artikel.xlsx", "GenArt")
 OE_FILE = ("OE-Nummern.xlsx", "Sheet1")
 COMPARISON_FILE = ("Vergleichsnummern.xlsx", "Sheet1")
 ATTRIBUTE_FILE = ("Attribute.xlsx", "Sheet1")
+VEHICLE_LINK_FILE = ("Fahrzeugverknuepfungen.xlsx", "Sheet1")
 
 IMAGE_HEADERS = ["Artikelnummer", "BILDPFAD", "Art", "Sprache", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
 DOCUMENT_HEADERS = ["Artikelnummer", "Pfad zum Dokument", "Sprache", "Art", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
@@ -169,6 +229,20 @@ ATTRIBUTE_HEADERS = [
     "Wert bis",
     LAST_WRITTEN_HEADER,
 ]
+# Fahrzeugverknuepfungen fuer den Apollo-Import.
+# Fahrzeugtyp  -> TecDoc Verknuepfungstyp ID (PKW = 2)
+# KTypNr       -> TecDoc Verknuepfungs ID (pro Zeile eine KTyp-Nummer)
+# KTyp-System  -> Info, aus welchem Nummernkreis die KTypNr stammt (Topmotive/TecDoc)
+VEHICLE_LINK_HEADERS = ["Artikelnummer", "Fahrzeugtyp", "KTypNr", "KTyp-System", LAST_WRITTEN_HEADER]
+# Zuordnung von Text-Labels (aus gescrapten Produkttexten) zu TecDoc Kriterien IDs.
+ATTRIBUTE_MAPPING_SHEET = "Zuordnung"
+ATTRIBUTE_MAPPING_HEADERS = ["Text-Label", "TecDoc Kriterien ID", "Hinweis"]
+# Suchwoerter werden als Attribut 'Zusatzbezeichnung' (TOPMOTIVE, alphanumerisch)
+# exportiert, weil Apollo keine nativen Keywords kennt. Pro Suchwort eine Attributzeile.
+SEARCH_TERM_CRITERIA_ID = "9595"
+SEARCH_TERM_ATTRIBUTE_LABEL = "Zusatzbezeichnung"
+SEARCH_TERM_ATTRIBUTE_FORMAT = "Alphanumerisch"
+SEARCH_TERM_MAX_LENGTH = 20
 CSV_ARTICLE_HEADER_ALIASES = {
     "artikelnummer",
     "artikelnr",
@@ -283,12 +357,6 @@ GENART_COMPOUND_SUFFIXES = frozenset(
     }
 )
 
-GENART_OPPOSING_FAMILY_PENALTIES = {
-    ("light", "pin"): 180,
-    ("pin", "light"): 180,
-}
-
-
 @dataclass
 class TranslationSet:
     de: str = ""
@@ -370,6 +438,52 @@ class CompetitorOption:
     def display_label(self) -> str:
         parts = [self.competitor_id.strip(), self.code.strip(), self.name.strip()]
         return " | ".join(part for part in parts if part)
+
+
+@dataclass(frozen=True)
+class VehicleLinkRow:
+    """Eine Fahrzeugverknuepfung eines Artikels (ein Fahrzeug / KTyp).
+
+    Ein Fahrzeug traegt beide KTyp-Nummern (Topmotive + TecDoc); beim Export
+    wird daraus je Nummer eine Zeile erzeugt.
+    """
+
+    vehicle_type_id: str = DEFAULT_VEHICLE_TYPE_ID
+    vehicle_type_label: str = "PKW"
+    motorcode: str = ""
+    ktyp_topmotive: str = ""
+    ktyp_tecdoc: str = ""
+    manufacturer: str = ""
+    model: str = ""
+    description: str = ""
+    year_from: str = ""
+    year_to: str = ""
+    power: str = ""
+
+    def has_ktyp(self) -> bool:
+        return bool(self.ktyp_topmotive.strip() or self.ktyp_tecdoc.strip())
+
+    def display_vehicle_label(self) -> str:
+        parts = [self.manufacturer.strip(), self.model.strip(), self.description.strip()]
+        return " ".join(part for part in parts if part) or self.motorcode.strip() or "-"
+
+
+@dataclass(frozen=True)
+class VehicleMatch:
+    """Ein Treffer aus den KTyp-Stammdaten fuer einen Motorcode."""
+
+    motorcode: str = ""
+    ktyp_topmotive: str = ""
+    ktyp_tecdoc: str = ""
+    manufacturer: str = ""
+    model: str = ""
+    description: str = ""
+    year_from: str = ""
+    year_to: str = ""
+    power: str = ""
+
+    def identity(self) -> tuple[str, str]:
+        return (self.ktyp_topmotive, self.ktyp_tecdoc)
 
 
 @dataclass(frozen=True)
@@ -475,9 +589,24 @@ class AttributeRow:
 
 
 @dataclass(frozen=True)
-class ImageSignature:
-    average_hash: int
-    difference_hash: int
+class ExtractedSpecLine:
+    """Eine erkannte 'Label: Wert'-Zeile aus einem Produkttext."""
+
+    label: str = ""
+    raw_value: str = ""
+    source_line: str = ""
+
+
+@dataclass
+class AttributeSuggestion:
+    """Ein Attribut-Vorschlag aus einem Produkttext fuer den Bestaetigungsdialog."""
+
+    option: AttributeOption
+    value: str = ""
+    value_to: str = ""
+    source_line: str = ""
+    confident: bool = True
+    note: str = ""
 
 
 @dataclass
@@ -509,36 +638,6 @@ class GenArtSelection:
         if option_id and bezeichnung and option_id != bezeichnung:
             return f"{option_id} | {bezeichnung}"
         return option_id or bezeichnung
-
-
-@dataclass
-class GenArtSuggestion:
-    option: GenArtOption
-    total_score: float
-    text_score: float = 0.0
-    image_score: float = 0.0
-    web_score: float = 0.0
-    web_reason: str = ""
-
-
-@dataclass
-class GoogleLensWebResult:
-    headline_lines: list[str] = field(default_factory=list)
-    result_titles: list[str] = field(default_factory=list)
-    result_snippets: list[str] = field(default_factory=list)
-    page_urls: list[str] = field(default_factory=list)
-
-    def as_context_text(self) -> str:
-        return " ".join(
-            part
-            for part in [
-                " ".join(self.headline_lines),
-                " ".join(self.result_titles),
-                " ".join(self.result_snippets),
-                " ".join(self.page_urls),
-            ]
-            if part.strip()
-        ).strip()
 
 
 @dataclass
@@ -581,7 +680,9 @@ class ExportBundle:
     web_rows: list[MediaRow] = field(default_factory=list)
     oe_number_rows: list[OeNumberRow] = field(default_factory=list)
     comparison_number_rows: list[ComparisonNumberRow] = field(default_factory=list)
+    vehicle_link_rows: list[VehicleLinkRow] = field(default_factory=list)
     attribute_rows: list[AttributeRow] = field(default_factory=list)
+    search_terms: list[str] = field(default_factory=list)
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] = field(default_factory=dict)
     include_short_text: bool = True
     include_long_text: bool = True
@@ -594,7 +695,9 @@ class ExportBundle:
         self.sync_genart_fields()
         self.oe_number_rows = normalize_oe_number_rows(self.oe_number_rows)
         self.comparison_number_rows = normalize_comparison_number_rows(self.comparison_number_rows)
+        self.vehicle_link_rows = normalize_vehicle_link_rows(self.vehicle_link_rows)
         self.attribute_rows = normalize_attribute_rows(self.attribute_rows)
+        self.search_terms = normalize_search_terms(self.search_terms)
 
     def sync_genart_fields(self) -> None:
         self.genart_selections = normalize_genart_selections(
@@ -630,13 +733,17 @@ class StoredArticleSnapshot:
     web_rows: list[MediaRow] = field(default_factory=list)
     oe_number_rows: list[OeNumberRow] = field(default_factory=list)
     comparison_number_rows: list[ComparisonNumberRow] = field(default_factory=list)
+    vehicle_link_rows: list[VehicleLinkRow] = field(default_factory=list)
     attribute_rows: list[AttributeRow] = field(default_factory=list)
+    search_terms: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.sync_genart_fields()
         self.oe_number_rows = normalize_oe_number_rows(self.oe_number_rows)
         self.comparison_number_rows = normalize_comparison_number_rows(self.comparison_number_rows)
+        self.vehicle_link_rows = normalize_vehicle_link_rows(self.vehicle_link_rows)
         self.attribute_rows = normalize_attribute_rows(self.attribute_rows)
+        self.search_terms = normalize_search_terms(self.search_terms)
 
     def sync_genart_fields(self) -> None:
         self.genart_selections = normalize_genart_selections(
@@ -765,6 +872,375 @@ def normalize_comparison_number_rows(rows: list[ComparisonNumberRow]) -> list[Co
             )
         )
     return normalized
+
+
+def normalize_vehicle_link_rows(rows: list[VehicleLinkRow]) -> list[VehicleLinkRow]:
+    normalized: list[VehicleLinkRow] = []
+    seen_values: set[tuple[str, str, str]] = set()
+    for row in rows:
+        vehicle_type_id = row.vehicle_type_id.strip() or DEFAULT_VEHICLE_TYPE_ID
+        vehicle_type_label = row.vehicle_type_label.strip() or vehicle_type_label_for_id(vehicle_type_id)
+        ktyp_topmotive = row.ktyp_topmotive.strip()
+        ktyp_tecdoc = row.ktyp_tecdoc.strip()
+        if not ktyp_topmotive and not ktyp_tecdoc:
+            continue
+        dedupe_key = (vehicle_type_id, ktyp_topmotive, ktyp_tecdoc)
+        if dedupe_key in seen_values:
+            continue
+        seen_values.add(dedupe_key)
+        normalized.append(
+            VehicleLinkRow(
+                vehicle_type_id=vehicle_type_id,
+                vehicle_type_label=vehicle_type_label,
+                motorcode=row.motorcode.strip(),
+                ktyp_topmotive=ktyp_topmotive,
+                ktyp_tecdoc=ktyp_tecdoc,
+                manufacturer=row.manufacturer.strip(),
+                model=row.model.strip(),
+                description=row.description.strip(),
+                year_from=row.year_from.strip(),
+                year_to=row.year_to.strip(),
+                power=row.power.strip(),
+            )
+        )
+    return normalized
+
+
+def normalize_search_terms(terms: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        cleaned = " ".join(str(term or "").split())
+        if not cleaned:
+            continue
+        dedupe_key = cleaned.casefold()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        normalized.append(cleaned)
+    return normalized
+
+
+def normalize_mapping_label(value: str) -> str:
+    """Normalisiert ein Text-Label fuer die Attribut-Zuordnung (Umlaute, Klammern, Spaces)."""
+    text = str(value or "").strip()
+    text = re.sub(r"\([^)]*\)", " ", text)  # Klammerzusaetze wie (LxBxH) entfernen
+    text = text.translate(SHORT_TEXT_UMLAUT_REPLACEMENTS)
+    text = re.sub(r"[^a-z0-9]+", " ", text.casefold())
+    return " ".join(text.split())
+
+
+# Einheiten-Normalisierung: Schreibweisen im Text -> kanonische Einheit
+_UNIT_ALIASES = {
+    "mm": "mm", "cm": "cm", "m": "m", "meter": "m",
+    "g": "g", "kg": "kg", "t": "t", "gramm": "g", "kilogramm": "kg",
+    "n": "n", "kn": "kn", "nm": "nm",
+    "v": "v", "volt": "v", "a": "a", "ampere": "a",
+    "ah": "ah", "mah": "mah",
+    "w": "w", "kw": "kw",
+    "lm": "lm", "lumen": "lm",
+    "std": "std", "std.": "std", "h": "std", "stunden": "std", "stunde": "std",
+    "min": "min", "minuten": "min", "s": "s", "sek": "s",
+    "bar": "bar", "l": "l", "liter": "l", "ml": "ml",
+    "zoll": "zoll", '"': "zoll",
+    "u/min": "1/min", "1/min": "1/min", "upm": "1/min",
+    "st": "st", "st.": "st", "stk": "st", "stk.": "st", "tlg": "tlg", "tlg.": "tlg", "teile": "st",
+    "%": "%", "grad": "grad",
+}
+
+# Umrechnung (von, nach) -> Faktor
+_UNIT_CONVERSIONS = {
+    ("mm", "cm"): 0.1, ("cm", "mm"): 10.0,
+    ("mm", "m"): 0.001, ("m", "mm"): 1000.0,
+    ("cm", "m"): 0.01, ("m", "cm"): 100.0,
+    ("zoll", "mm"): 25.4, ("mm", "zoll"): 1 / 25.4,
+    ("g", "kg"): 0.001, ("kg", "g"): 1000.0,
+    ("t", "kg"): 1000.0, ("kg", "t"): 0.001,
+    ("mah", "ah"): 0.001, ("ah", "mah"): 1000.0,
+    ("min", "std"): 1 / 60.0, ("std", "min"): 60.0,
+    ("ml", "l"): 0.001, ("l", "ml"): 1000.0,
+    ("kw", "w"): 1000.0, ("w", "kw"): 0.001,
+    ("kn", "n"): 1000.0, ("n", "kn"): 0.001,
+}
+
+
+def normalize_unit_text(value: str) -> str:
+    return _UNIT_ALIASES.get(str(value or "").strip().casefold(), str(value or "").strip().casefold())
+
+
+def extract_attribute_unit(attribute_label: str) -> str:
+    """Liest die Zieleinheit aus einer Attribut-Bezeichnung wie 'Gewicht [kg]'."""
+    match = re.search(r"\[([^\]]+)\]", attribute_label or "")
+    return normalize_unit_text(match.group(1)) if match else ""
+
+
+def parse_german_number(text: str) -> float | None:
+    value = str(text or "").strip().replace(" ", "").replace(" ", "")
+    if not value:
+        return None
+    value = re.sub(r"\.(?=\d{3}(\D|$))", "", value)  # Tausenderpunkte
+    value = value.replace(",", ".")
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def format_german_number(value: float) -> str:
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{round(value, 3):g}".replace(".", ",")
+
+
+def convert_unit_value(value: float, from_unit: str, to_unit: str) -> float | None:
+    from_unit = normalize_unit_text(from_unit)
+    to_unit = normalize_unit_text(to_unit)
+    if not to_unit or from_unit == to_unit:
+        return value
+    factor = _UNIT_CONVERSIONS.get((from_unit, to_unit))
+    if factor is None:
+        return None
+    return value * factor
+
+
+_NUMBER_PATTERN = r"\d+(?:[.,]\d+)*"
+_UNIT_PATTERN = r"[A-Za-z/%\".]{0,6}"
+
+
+def extract_spec_lines_from_text(text: str) -> list[ExtractedSpecLine]:
+    """Findet 'Label<Tab>Wert'- und 'Label: Wert'-Zeilen in einem Produkttext."""
+    specs: list[ExtractedSpecLine] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip().lstrip("•·*–-• ").strip()
+        if not line or len(line) > 160:
+            continue
+        if "\t" in line:
+            label, _, value = line.partition("\t")
+        elif ":" in line:
+            label, _, value = line.partition(":")
+        else:
+            continue
+        label = " ".join(label.split())
+        value = value.strip()
+        if not label or not value or len(label) > 45:
+            continue
+        if "." in label and len(label.split()) > 4:
+            continue  # Fliesstext, kein Label
+        specs.append(ExtractedSpecLine(label=label, raw_value=value, source_line=line))
+    return specs
+
+
+def _strip_trailing_parenthetical(value: str) -> tuple[str, str]:
+    match = re.match(r"^(.*?)\s*\(([^)]*)\)\s*$", value.strip())
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return value.strip(), ""
+
+
+def parse_dimension_value(raw_value: str) -> tuple[list[float], str] | None:
+    """Erkennt Abmessungen wie '155 x 17 x 13,5 mm' -> ([155, 17, 13.5], 'mm')."""
+    value, _note = _strip_trailing_parenthetical(raw_value)
+    match = re.match(
+        rf"^({_NUMBER_PATTERN})\s*[x×]\s*({_NUMBER_PATTERN})(?:\s*[x×]\s*({_NUMBER_PATTERN}))?\s*({_UNIT_PATTERN})?\s*$",
+        value,
+    )
+    if not match:
+        return None
+    numbers = [parse_german_number(part) for part in match.groups()[:3] if part]
+    if any(number is None for number in numbers) or len(numbers) < 2:
+        return None
+    unit = normalize_unit_text(match.group(4) or "mm")
+    return [float(n) for n in numbers if n is not None], unit
+
+
+def parse_numeric_value(raw_value: str) -> tuple[float, float | None, str] | None:
+    """Erkennt Einzelwerte und Bereiche: '612 g' / '150 - 530 mm' -> (Wert, Wert-bis, Einheit)."""
+    value, _note = _strip_trailing_parenthetical(raw_value)
+    range_match = re.match(
+        rf"^({_NUMBER_PATTERN})\s*(?:-|–|bis)\s*({_NUMBER_PATTERN})\s*({_UNIT_PATTERN})?\s*$",
+        value,
+    )
+    if range_match:
+        first = parse_german_number(range_match.group(1))
+        second = parse_german_number(range_match.group(2))
+        if first is not None and second is not None:
+            return first, second, normalize_unit_text(range_match.group(3) or "")
+    single_match = re.match(rf"^(?:ca\.?\s*|~\s*)?({_NUMBER_PATTERN})\s*({_UNIT_PATTERN})?\s*$", value)
+    if single_match:
+        number = parse_german_number(single_match.group(1))
+        if number is not None:
+            return number, None, normalize_unit_text(single_match.group(2) or "")
+    return None
+
+
+_DIMENSION_ORDER_LABELS = {"l": "laenge", "b": "breite", "h": "hoehe", "t": "tiefe"}
+
+
+def parse_dimension_order_hint(label: str) -> list[str]:
+    """Liest die Reihenfolge aus Labels wie 'Abmessungen (LxBxH)' oder '... (HxBxT)'."""
+    match = re.search(r"\(([lbht])\s*x\s*([lbht])\s*(?:x\s*([lbht]))?\)", label, re.IGNORECASE)
+    if match:
+        parts = [part for part in match.groups() if part]
+        return [_DIMENSION_ORDER_LABELS[part.casefold()] for part in parts]
+    return ["laenge", "breite", "hoehe"]
+
+
+def is_dimension_spec_label(label: str) -> bool:
+    return normalize_mapping_label(label) in {"abmessung", "abmessungen", "masse", "abmessungen ca"}
+
+
+def build_attribute_suggestions_from_text(
+    text: str,
+    mapping: dict[str, str],
+    attribute_options_by_id: dict[str, AttributeOption],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+) -> tuple[list[AttributeSuggestion], list[ExtractedSpecLine]]:
+    """Erzeugt Attribut-Vorschlaege aus einem Produkttext.
+
+    Rueckgabe: (Vorschlaege, nicht zugeordnete Spezifikationszeilen).
+    """
+    suggestions: list[AttributeSuggestion] = []
+    unmatched: list[ExtractedSpecLine] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_suggestion(suggestion: AttributeSuggestion) -> None:
+        key = (suggestion.option.criteria_id, suggestion.value.casefold(), suggestion.value_to.casefold())
+        if key in seen:
+            return
+        seen.add(key)
+        suggestions.append(suggestion)
+
+    def suggest_for_option(
+        option: AttributeOption,
+        raw_value: str,
+        source_line: str,
+        parsed: tuple[float, float | None, str] | None = None,
+    ) -> AttributeSuggestion | None:
+        value_format = option.value_format.strip().casefold()
+        if value_format == "kein wert":
+            return None
+        if parsed is None:
+            parsed = parse_numeric_value(raw_value)
+
+        if value_format == "numerisch":
+            if parsed is None:
+                return AttributeSuggestion(
+                    option=option, value=raw_value.strip(), source_line=source_line,
+                    confident=False, note="Wert nicht als Zahl erkannt",
+                )
+            number, number_to, unit = parsed
+            target_unit = extract_attribute_unit(option.label)
+            note = ""
+            if unit and target_unit and unit != target_unit:
+                converted = convert_unit_value(number, unit, target_unit)
+                converted_to = convert_unit_value(number_to, unit, target_unit) if number_to is not None else None
+                if converted is None:
+                    return AttributeSuggestion(
+                        option=option, value=format_german_number(number), source_line=source_line,
+                        confident=False, note=f"Einheit '{unit}' passt nicht zu [{target_unit}]",
+                    )
+                note = f"umgerechnet aus {format_german_number(number)} {unit}"
+                number, number_to = converted, converted_to
+            return AttributeSuggestion(
+                option=option,
+                value=format_german_number(number),
+                value_to=format_german_number(number_to) if number_to is not None else "",
+                source_line=source_line,
+                confident=True,
+                note=note,
+            )
+
+        if is_attribute_key_value_format(option.value_format):
+            candidates = [raw_value.strip()]
+            if parsed is not None:
+                number, _number_to, unit = parsed
+                target_unit = extract_attribute_unit(option.label)
+                if unit and target_unit and unit != target_unit:
+                    converted = convert_unit_value(number, unit, target_unit)
+                    if converted is not None:
+                        number = converted
+                candidates.insert(0, format_german_number(number))
+                candidates.append(format_german_number(number).replace(",", "."))
+            probe = AttributeRow(
+                criteria_id=option.criteria_id, label=option.label,
+                value_format=option.value_format, type_name=option.type_name,
+            )
+            for candidate in candidates:
+                resolved = resolve_attribute_key_value_option(probe, candidate, attribute_key_values_by_group)
+                if resolved is not None:
+                    return AttributeSuggestion(
+                        option=option, value=resolved.display_label(), source_line=source_line,
+                        confident=True, note="Schluesselwert",
+                    )
+            return AttributeSuggestion(
+                option=option, value=raw_value.strip(), source_line=source_line,
+                confident=False, note="Schluesselwert nicht in Werteliste gefunden",
+            )
+
+        # Alphanumerisch und alles Uebrige: Text direkt uebernehmen
+        cleaned = " ".join(raw_value.split())
+        max_length = option.max_length if option.max_length else None
+        if max_length and len(cleaned) > max_length:
+            return AttributeSuggestion(
+                option=option, value=cleaned, source_line=source_line,
+                confident=False, note=f"laenger als {max_length} Zeichen",
+            )
+        return AttributeSuggestion(option=option, value=cleaned, source_line=source_line, confident=True)
+
+    for spec in extract_spec_lines_from_text(text):
+        base_label = normalize_mapping_label(spec.label)
+        if not base_label:
+            continue
+
+        # Abmessungen wie '390 x 450 x 130 mm' in Laenge/Breite/Hoehe/Tiefe aufteilen
+        dimensions = parse_dimension_value(spec.raw_value)
+        if dimensions is not None and (is_dimension_spec_label(spec.label) or base_label in mapping):
+            numbers, unit = dimensions
+            order = parse_dimension_order_hint(spec.label + " " + spec.raw_value)
+            if is_dimension_spec_label(spec.label):
+                handled = False
+                for dimension_label, number in zip(order, numbers):
+                    criteria_id = mapping.get(dimension_label)
+                    option = attribute_options_by_id.get(criteria_id or "")
+                    if option is None:
+                        continue
+                    suggestion = suggest_for_option(
+                        option, f"{format_german_number(number)} {unit}", spec.source_line,
+                        parsed=(number, None, unit),
+                    )
+                    if suggestion is not None:
+                        add_suggestion(suggestion)
+                        handled = True
+                if handled:
+                    continue
+
+        criteria_id = mapping.get(base_label)
+        option = attribute_options_by_id.get(criteria_id or "") if criteria_id else None
+        if option is None:
+            unmatched.append(spec)
+            continue
+
+        raw_value, _paren_note = _strip_trailing_parenthetical(spec.raw_value)
+        # Mehrfachwerte ('80.000 / 40.000 kg', '8 - 9 - 10 mm' mit Aufzaehlungszeichen) nur als unsicher vorschlagen
+        if re.search(rf"{_NUMBER_PATTERN}\s*[/|•]\s*{_NUMBER_PATTERN}", raw_value):
+            first_number = parse_numeric_value(re.split(r"[/|•]", raw_value, 1)[0].strip() + " " + (re.search(r"([A-Za-z/%\".]{1,6})\s*$", raw_value).group(1) if re.search(r"([A-Za-z/%\".]{1,6})\s*$", raw_value) else ""))
+            suggestion = AttributeSuggestion(
+                option=option,
+                value=format_german_number(first_number[0]) if first_number else raw_value,
+                source_line=spec.source_line,
+                confident=False,
+                note="Mehrere Werte in der Zeile - bitte pruefen",
+            )
+            add_suggestion(suggestion)
+            continue
+
+        suggestion = suggest_for_option(option, raw_value, spec.source_line)
+        if suggestion is not None:
+            add_suggestion(suggestion)
+        else:
+            unmatched.append(spec)
+
+    return suggestions, unmatched
 
 
 def normalize_attribute_rows(rows: list[AttributeRow]) -> list[AttributeRow]:
@@ -1097,6 +1573,188 @@ def load_competitor_options(csv_path: Path, *, comparison_only: bool = True) -> 
     return []
 
 
+class VehicleCatalog:
+    """Nachschlagewerk fuer KTyp-Stammdaten (Motorcode -> Fahrzeuge)."""
+
+    def __init__(self) -> None:
+        self.by_motorcode: dict[str, list[VehicleMatch]] = {}
+        self.by_ktyp_topmotive: dict[str, VehicleMatch] = {}
+        self.by_ktyp_tecdoc: dict[str, VehicleMatch] = {}
+        self.count = 0
+        self._motorcode_set: set[str] = set()
+        self._sorted_motorcodes: list[str] | None = None
+
+    def _register(self, match: VehicleMatch) -> None:
+        for key in motorcode_keys(match.motorcode):
+            bucket = self.by_motorcode.setdefault(key, [])
+            if not any(existing.identity() == match.identity() for existing in bucket):
+                bucket.append(match)
+        if match.motorcode:
+            self._motorcode_set.add(match.motorcode)
+        if match.ktyp_topmotive:
+            self.by_ktyp_topmotive.setdefault(match.ktyp_topmotive, match)
+        if match.ktyp_tecdoc:
+            self.by_ktyp_tecdoc.setdefault(match.ktyp_tecdoc, match)
+        self.count += 1
+
+    def sorted_motorcodes(self) -> list[str]:
+        if self._sorted_motorcodes is None:
+            self._sorted_motorcodes = sorted(self._motorcode_set)
+        return self._sorted_motorcodes
+
+    def suggest(self, query: str, limit: int = 12) -> list[str]:
+        """Vorschlaege fuer einen (Teil-)Motorcode inkl. Fuzzy-Naehe."""
+        normalized = normalize_motorcode(query)
+        if not normalized:
+            return []
+        codes = self.sorted_motorcodes()
+        query_ns = normalized.replace(" ", "")
+        prefix: list[str] = []
+        substring: list[str] = []
+        for code in codes:
+            code_ns = code.replace(" ", "")
+            if code.startswith(normalized) or code_ns.startswith(query_ns):
+                prefix.append(code)
+            elif normalized in code or query_ns in code_ns:
+                substring.append(code)
+        results: list[str] = prefix[:limit]
+        for code in substring:
+            if len(results) >= limit:
+                break
+            results.append(code)
+        if len(results) < limit and len(query_ns) >= 2:
+            for code in get_close_matches(normalized, codes, n=limit, cutoff=0.6):
+                if code not in results:
+                    results.append(code)
+                    if len(results) >= limit:
+                        break
+        return results[:limit]
+
+    def lookup(self, motorcode: str) -> list[VehicleMatch]:
+        seen: set[tuple[str, str]] = set()
+        results: list[VehicleMatch] = []
+        for key in motorcode_keys(motorcode):
+            for match in self.by_motorcode.get(key, []):
+                identity = match.identity()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                results.append(match)
+        return results
+
+    def lookup_by_ktyp(self, ktyp_topmotive: str = "", ktyp_tecdoc: str = "") -> VehicleMatch | None:
+        ktyp_topmotive = str(ktyp_topmotive or "").strip()
+        ktyp_tecdoc = str(ktyp_tecdoc or "").strip()
+        if ktyp_topmotive and ktyp_topmotive in self.by_ktyp_topmotive:
+            return self.by_ktyp_topmotive[ktyp_topmotive]
+        if ktyp_tecdoc and ktyp_tecdoc in self.by_ktyp_tecdoc:
+            return self.by_ktyp_tecdoc[ktyp_tecdoc]
+        return None
+
+
+def _clean_ktyp_value(value: object) -> str:
+    text = str(value if value is not None else "").strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
+def _format_vehicle_date(value: object) -> str:
+    """Reduziert ein BJ-Datum auf ``MM.YYYY`` (aus ``01.09.1997 00:00:00``)."""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return ""
+    date_part = text.split(" ", 1)[0]
+    match = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", date_part)
+    if match:
+        return f"{match.group(2).zfill(2)}.{match.group(3)}"
+    iso_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", date_part)
+    if iso_match:
+        return f"{iso_match.group(2)}.{iso_match.group(1)}"
+    return date_part
+
+
+def load_vehicle_catalog(workbook_path: Path) -> VehicleCatalog:
+    catalog = VehicleCatalog()
+    if not path_exists_safe(workbook_path):
+        return catalog
+
+    try:
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError(f"KTyp-Datei konnte nicht geladen werden: {exc}") from exc
+
+    try:
+        sheet_name = "Daten" if "Daten" in workbook.sheetnames else workbook.sheetnames[0]
+        worksheet = workbook[sheet_name]
+        row_iter = worksheet.iter_rows(values_only=True)
+        header_row = next(row_iter, None)
+        if header_row is None:
+            raise ValueError("Die KTyp-Datei hat keine Kopfzeile.")
+        header_map = {
+            normalize_header_key(str(value)): index
+            for index, value in enumerate(header_row)
+            if str(value or "").strip()
+        }
+        idx_motor = header_map.get("motorcode")
+        idx_topmotive = header_map.get("ktypnrtopmotive")
+        idx_tecdoc = header_map.get("ktypnrtecdoc")
+        idx_manufacturer = header_map.get("herstellerbezeichnung")
+        idx_model = header_map.get("modellbezeichnung")
+        idx_description = header_map.get("bezeichnung")
+        idx_year_from = header_map.get("bjvon")
+        idx_year_to = header_map.get("bjbis")
+        idx_kw = header_map.get("lw") or header_map.get("kw")
+        idx_ps = header_map.get("ps")
+        idx_deleted = header_map.get("gelscht") or header_map.get("geloescht")
+        if idx_motor is None or (idx_topmotive is None and idx_tecdoc is None):
+            raise ValueError("In der KTyp-Datei fehlen die Spalten 'Motorcode' und 'KTypNr'.")
+
+        def cell(values: tuple, index: int | None) -> str:
+            if index is None or index >= len(values):
+                return ""
+            value = values[index]
+            return str(value).strip() if value is not None else ""
+
+        for values in row_iter:
+            motorcode = cell(values, idx_motor)
+            if not motorcode:
+                continue
+            if idx_deleted is not None and parse_bool_flag(values[idx_deleted] if idx_deleted < len(values) else ""):
+                continue
+            ktyp_topmotive = _clean_ktyp_value(values[idx_topmotive]) if idx_topmotive is not None and idx_topmotive < len(values) else ""
+            ktyp_tecdoc = _clean_ktyp_value(values[idx_tecdoc]) if idx_tecdoc is not None and idx_tecdoc < len(values) else ""
+            if not ktyp_topmotive and not ktyp_tecdoc:
+                continue
+            power_kw = cell(values, idx_kw)
+            power_ps = cell(values, idx_ps)
+            if power_kw and power_ps:
+                power = f"{power_kw} kW / {power_ps} PS"
+            elif power_kw:
+                power = f"{power_kw} kW"
+            elif power_ps:
+                power = f"{power_ps} PS"
+            else:
+                power = ""
+            catalog._register(
+                VehicleMatch(
+                    motorcode=normalize_motorcode(motorcode),
+                    ktyp_topmotive=ktyp_topmotive,
+                    ktyp_tecdoc=ktyp_tecdoc,
+                    manufacturer=cell(values, idx_manufacturer),
+                    model=cell(values, idx_model),
+                    description=cell(values, idx_description),
+                    year_from=_format_vehicle_date(values[idx_year_from]) if idx_year_from is not None and idx_year_from < len(values) else "",
+                    year_to=_format_vehicle_date(values[idx_year_to]) if idx_year_to is not None and idx_year_to < len(values) else "",
+                    power=power,
+                )
+            )
+    finally:
+        workbook.close()
+
+    return catalog
+
+
 def load_attribute_options(workbook_path: Path) -> list[AttributeOption]:
     if not path_exists_safe(workbook_path):
         return []
@@ -1163,6 +1821,64 @@ def load_attribute_options(workbook_path: Path) -> list[AttributeOption]:
         return options
     finally:
         workbook.close()
+
+
+def load_attribute_mapping(workbook_path: Path) -> dict[str, str]:
+    """Laedt die Text-Label -> TecDoc Kriterien ID Zuordnung fuer Attributvorschlaege."""
+    if not path_exists_safe(workbook_path):
+        return {}
+
+    try:
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError(f"Attribut-Zuordnung konnte nicht geladen werden: {exc}") from exc
+
+    try:
+        sheet_name = ATTRIBUTE_MAPPING_SHEET if ATTRIBUTE_MAPPING_SHEET in workbook.sheetnames else workbook.sheetnames[0]
+        worksheet = workbook[sheet_name]
+        row_iter = worksheet.iter_rows(values_only=True)
+        header_row = next(row_iter, None)
+        if header_row is None:
+            raise ValueError("Die Attribut-Zuordnung hat keine Kopfzeile.")
+        header_map = {
+            normalize_header_key(str(value)): index
+            for index, value in enumerate(header_row)
+            if str(value or "").strip()
+        }
+        label_index = header_map.get("textlabel")
+        criteria_index = header_map.get("tecdockriterienid")
+        if label_index is None or criteria_index is None:
+            raise ValueError("In der Attribut-Zuordnung fehlen die Spalten 'Text-Label' und 'TecDoc Kriterien ID'.")
+
+        mapping: dict[str, str] = {}
+        for values in row_iter:
+            label = str(values[label_index] or "").strip() if label_index < len(values) else ""
+            criteria_id = str(values[criteria_index] or "").strip() if criteria_index < len(values) else ""
+            if criteria_id.endswith(".0") and criteria_id[:-2].isdigit():
+                criteria_id = criteria_id[:-2]
+            key = normalize_mapping_label(label)
+            if key and criteria_id:
+                mapping[key] = criteria_id
+        return mapping
+    finally:
+        workbook.close()
+
+
+def append_attribute_mapping_entries(workbook_path: Path, entries: list[tuple[str, str, str]]) -> None:
+    """Haengt gelernte Zuordnungen (Text-Label, Kriterien-ID, Hinweis) an die Zuordnungsdatei an."""
+    if not entries:
+        return
+    if workbook_path.exists():
+        workbook = load_workbook(workbook_path)
+        worksheet = workbook[ATTRIBUTE_MAPPING_SHEET] if ATTRIBUTE_MAPPING_SHEET in workbook.sheetnames else workbook.active
+    else:
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = ATTRIBUTE_MAPPING_SHEET
+        worksheet.append(ATTRIBUTE_MAPPING_HEADERS)
+    for label, criteria_id, note in entries:
+        worksheet.append([label, criteria_id, note])
+    workbook.save(workbook_path)
 
 
 def load_attribute_key_value_options(workbook_path: Path) -> list[AttributeKeyValueOption]:
@@ -1393,115 +2109,6 @@ def infer_document_art(document_path: str) -> str:
     if any(token in normalized for token in ["produktinfo", "zubehoer", "zubehor", "datenblatt", "broschuere", "flyer"]):
         return "17"
     return "17"
-
-
-def extract_match_text_from_path_or_link(path_or_link: str) -> str:
-    value = path_or_link.strip()
-    if not value:
-        return ""
-
-    parsed = urlparse(value)
-    raw_path = unquote(parsed.path if parsed.scheme else value)
-    path = Path(raw_path)
-    parts: list[str] = []
-
-    if parsed.netloc:
-        parts.append(parsed.netloc.replace(".", " "))
-    if path.stem:
-        parts.append(path.stem)
-
-    for part in path.parts[-4:-1]:
-        cleaned = str(part).strip("/\\")
-        if cleaned and cleaned not in {path.name, "."}:
-            parts.append(cleaned)
-
-    return normalize_match_text(" ".join(parts))
-
-
-def _get_lanczos_resample() -> object:
-    if Image is None:  # pragma: no cover - guarded by caller
-        raise RuntimeError("Pillow ist nicht installiert.")
-    if hasattr(Image, "Resampling"):
-        return Image.Resampling.LANCZOS
-    return Image.LANCZOS
-
-
-def load_image_for_signature(path_or_link: str, timeout_seconds: int = 10) -> object:
-    if Image is None:  # pragma: no cover - guarded by caller
-        raise RuntimeError("Pillow ist nicht installiert.")
-
-    parsed = urlparse(path_or_link.strip())
-    if parsed.scheme in {"http", "https"}:
-        request = urllib_request.Request(path_or_link, headers={"User-Agent": "ApolloImportGui/1.0"})
-        with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
-            data = response.read()
-        with Image.open(io.BytesIO(data)) as opened:
-            return opened.convert("RGB")
-
-    image_path = Path(path_or_link)
-    if not image_path.exists():
-        raise FileNotFoundError("Datei nicht gefunden")
-    with Image.open(image_path) as opened:
-        return opened.convert("RGB")
-
-
-def build_image_signature(path_or_link: str) -> ImageSignature:
-    image = load_image_for_signature(path_or_link)
-    resample = _get_lanczos_resample()
-
-    grayscale = image.convert("L")
-    average_image = grayscale.resize((8, 8), resample)
-    average_pixels = list(average_image.getdata())
-    pixel_average = sum(average_pixels) / max(1, len(average_pixels))
-    average_hash = 0
-    for pixel in average_pixels:
-        average_hash = (average_hash << 1) | int(pixel >= pixel_average)
-
-    difference_image = grayscale.resize((9, 8), resample)
-    difference_pixels = list(difference_image.getdata())
-    difference_hash = 0
-    for row_index in range(8):
-        for column_index in range(8):
-            left_pixel = difference_pixels[row_index * 9 + column_index]
-            right_pixel = difference_pixels[row_index * 9 + column_index + 1]
-            difference_hash = (difference_hash << 1) | int(left_pixel >= right_pixel)
-
-    return ImageSignature(average_hash=average_hash, difference_hash=difference_hash)
-
-
-def compare_image_signatures(first: ImageSignature, second: ImageSignature) -> float:
-    average_distance = (first.average_hash ^ second.average_hash).bit_count()
-    difference_distance = (first.difference_hash ^ second.difference_hash).bit_count()
-    max_distance = 128
-    return max(0.0, 1.0 - ((average_distance + difference_distance) / max_distance))
-
-
-def build_google_lens_search_url(image_url: str) -> str:
-    return f"https://lens.google.com/uploadbyurl?url={quote(image_url, safe=':/?&=%#')}&hl=de"
-
-
-def prepare_local_image_for_lens(path_or_link: str) -> Path | None:
-    value = path_or_link.strip()
-    if not value:
-        return None
-
-    parsed = urlparse(value)
-    if parsed.scheme in {"http", "https"}:
-        return None
-
-    file_path = Path(value)
-    if not file_path.exists():
-        return None
-
-    if Image is not None:
-        with Image.open(file_path) as opened:
-            converted = opened.convert("RGB")
-            converted.thumbnail((1400, 1400), _get_lanczos_resample())
-            temp_path = Path(os.getenv("TEMP", str(Path.cwd()))) / f"apollo_lens_{random.randint(100000, 999999)}.jpg"
-            converted.save(temp_path, format="JPEG", quality=88, optimize=True)
-        return temp_path
-
-    return file_path
 
 
 def safe_folder_name(article_number: str) -> str:
@@ -1928,122 +2535,6 @@ class GenArtRegistry:
                 return option
         return None
 
-    def suggest(
-        self,
-        short_text: str,
-        long_text: str,
-        image_context: str = "",
-        category_context: str = "",
-        web_context: str = "",
-        limit: int = 5,
-    ) -> list[tuple[GenArtOption, float]]:
-        if not self.options:
-            return []
-
-        short_norm = normalize_match_text(short_text)
-        long_norm = normalize_match_text(long_text)
-        image_norm = normalize_match_text(image_context)
-        category_norm = normalize_match_text(category_context)
-        web_norm = normalize_match_text(web_context)
-        text_query = " ".join(part for part in [short_norm, long_norm] if part).strip()
-        query_text = " ".join(part for part in [short_norm, long_norm, image_norm, category_norm, web_norm] if part).strip()
-        if not query_text:
-            return []
-        query_tokens = set(build_match_tokens(query_text))
-        image_tokens = set(build_match_tokens(image_context))
-        category_tokens = set(build_match_tokens(category_context))
-        web_tokens = set(build_match_tokens(web_context))
-        query_families = infer_match_families_from_tokens(query_tokens)
-        suggestions: list[tuple[GenArtOption, float]] = []
-
-        for option in self.options:
-            score = 0.0
-            if option.normalized_bezeichnung and option.normalized_bezeichnung in text_query:
-                score += 220
-            if option.normalized_genart and option.normalized_genart in text_query:
-                score += 180
-            if option.normalized_genart and any(option.normalized_genart == token or option.normalized_genart in token for token in query_tokens):
-                score += 90
-            if option.normalized_bezeichnung and any(
-                option.normalized_bezeichnung == token or option.normalized_bezeichnung in token for token in query_tokens
-            ):
-                score += 115
-            if short_norm and option.normalized_bezeichnung and short_norm in option.normalized_bezeichnung:
-                score += 120
-            if short_norm and option.normalized_genart and short_norm in option.normalized_genart:
-                score += 95
-
-            overlap = query_tokens & option.tokens
-            if overlap:
-                score += len(overlap) * 24
-                score += (len(overlap) / max(1, len(option.tokens))) * 40
-
-            family_overlap = query_families & option.families
-            if family_overlap:
-                score += 260 * len(family_overlap)
-            elif query_families and option.families:
-                for query_family in query_families:
-                    for option_family in option.families:
-                        score -= GENART_OPPOSING_FAMILY_PENALTIES.get((query_family, option_family), 0)
-
-            extra_tokens = option.tokens - query_tokens
-            if extra_tokens:
-                score -= min(len(extra_tokens) * 14, 84)
-
-            if image_norm:
-                if option.normalized_bezeichnung and option.normalized_bezeichnung in image_norm:
-                    score += 185
-                if option.normalized_genart and option.normalized_genart in image_norm:
-                    score += 165
-                image_overlap = image_tokens & option.tokens
-                if image_overlap:
-                    score += len(image_overlap) * 38
-                    score += (len(image_overlap) / max(1, len(option.tokens))) * 65
-
-            if category_norm:
-                if option.normalized_bezeichnung and option.normalized_bezeichnung in category_norm:
-                    score += 160
-                if option.normalized_genart and option.normalized_genart in category_norm:
-                    score += 140
-                category_overlap = category_tokens & option.tokens
-                if category_overlap:
-                    score += len(category_overlap) * 44
-                    score += (len(category_overlap) / max(1, len(option.tokens))) * 80
-
-            if web_norm:
-                if option.normalized_bezeichnung and option.normalized_bezeichnung in web_norm:
-                    score += 220
-                if option.normalized_genart and option.normalized_genart in web_norm:
-                    score += 200
-                web_overlap = web_tokens & option.tokens
-                if web_overlap:
-                    score += len(web_overlap) * 58
-                    score += (len(web_overlap) / max(1, len(option.tokens))) * 110
-
-            if score > 0 or short_norm or image_norm:
-                if option.normalized_bezeichnung:
-                    score += SequenceMatcher(None, short_norm, option.normalized_bezeichnung).ratio() * 55
-                if option.normalized_genart:
-                    score += SequenceMatcher(None, short_norm, option.normalized_genart).ratio() * 45
-                if image_norm and option.normalized_bezeichnung:
-                    score += SequenceMatcher(None, image_norm, option.normalized_bezeichnung).ratio() * 70
-                if image_norm and option.normalized_genart:
-                    score += SequenceMatcher(None, image_norm, option.normalized_genart).ratio() * 60
-                if category_norm and option.normalized_bezeichnung:
-                    score += SequenceMatcher(None, category_norm, option.normalized_bezeichnung).ratio() * 75
-                if category_norm and option.normalized_genart:
-                    score += SequenceMatcher(None, category_norm, option.normalized_genart).ratio() * 65
-                if web_norm and option.normalized_bezeichnung:
-                    score += SequenceMatcher(None, web_norm, option.normalized_bezeichnung).ratio() * 110
-                if web_norm and option.normalized_genart:
-                    score += SequenceMatcher(None, web_norm, option.normalized_genart).ratio() * 95
-
-            if score >= 70:
-                suggestions.append((option, score))
-
-        suggestions.sort(key=lambda item: (-item[1], item[0].display_label()))
-        return suggestions[:limit]
-
 
 class DeepLTranslationError(RuntimeError):
     pass
@@ -2096,144 +2587,6 @@ class DeepLClient:
         for ui_code, deepl_code in DEEPL_TARGET_LANGUAGES.items():
             translations[ui_code] = self.translate_texts([text], target_lang=deepl_code, source_lang="DE")[0]
         return translations
-
-
-class GoogleLensScrapeError(RuntimeError):
-    pass
-
-
-class GoogleLensScraper:
-    def __init__(self, timeout_seconds: int = 60) -> None:
-        self.timeout_seconds = timeout_seconds
-
-    def detect_web(self, path_or_link: str) -> GoogleLensWebResult:
-        browser_path = detect_browser_path()
-        if browser_path is None:
-            raise GoogleLensScrapeError("Kein kompatibler Browser fuer Google Lens gefunden.")
-
-        local_upload_path = prepare_local_image_for_lens(path_or_link)
-        target_url = ""
-        is_remote = urlparse(path_or_link.strip()).scheme in {"http", "https"}
-        if is_remote:
-            target_url = build_google_lens_search_url(path_or_link.strip())
-
-        try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(executable_path=str(browser_path), headless=True)
-                page = browser.new_page(viewport={"width": 1440, "height": 2200})
-                try:
-                    if is_remote:
-                        page.goto(target_url, wait_until="domcontentloaded", timeout=self.timeout_seconds * 1000)
-                    else:
-                        page.goto("https://lens.google.com/", wait_until="domcontentloaded", timeout=self.timeout_seconds * 1000)
-                        self._accept_google_cookies_if_present(page)
-                        self._upload_local_image(page, local_upload_path)
-
-                    self._accept_google_cookies_if_present(page)
-                    page.wait_for_timeout(1800)
-                    page.wait_for_load_state("networkidle", timeout=self.timeout_seconds * 1000)
-                    page.wait_for_timeout(1800)
-                    return self._extract_lens_result(page)
-                finally:
-                    browser.close()
-        except PlaywrightTimeoutError as exc:
-            raise GoogleLensScrapeError("Google Lens hat nicht rechtzeitig geantwortet.") from exc
-        except Exception as exc:
-            raise GoogleLensScrapeError(f"Google Lens konnte nicht gelesen werden: {exc}") from exc
-        finally:
-            if local_upload_path is not None and local_upload_path.exists() and local_upload_path.name.startswith("apollo_lens_"):
-                try:
-                    local_upload_path.unlink()
-                except OSError:
-                    pass
-
-    def _accept_google_cookies_if_present(self, page: object) -> None:
-        for label in ["Alle akzeptieren", "Accept all", "Ich stimme zu", "I agree"]:
-            try:
-                page.get_by_role("button", name=label).click(timeout=2500)
-                page.wait_for_timeout(600)
-                return
-            except Exception:
-                continue
-
-    def _upload_local_image(self, page: object, upload_path: Path | None) -> None:
-        if upload_path is None:
-            raise GoogleLensScrapeError("Lokales Bild konnte nicht fuer Google Lens vorbereitet werden.")
-
-        selectors = [
-            "input[type='file']",
-            "input[accept*='image']",
-        ]
-        for selector in selectors:
-            try:
-                locator = page.locator(selector).first
-                if locator.count() > 0:
-                    locator.set_input_files(str(upload_path))
-                    return
-            except Exception:
-                continue
-        raise GoogleLensScrapeError("Google Lens Upload-Feld wurde nicht gefunden.")
-
-    def _extract_lens_result(self, page: object) -> GoogleLensWebResult:
-        script = """
-        () => {
-            const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-            const body = document.body ? clean(document.body.innerText) : '';
-            const lines = body.split('\\n').map(clean).filter(Boolean);
-            const generic = new Set([
-              'Alle', 'Shopping', 'Visuelle Treffer', 'Genaue Treffer', 'Ergebnisse',
-              'Mehr', 'Google Apps', 'Anmelden', 'Bilder', 'Videos', 'Maps',
-              'About this image', 'Zu diesem Bild'
-            ]);
-
-            const headlineLines = [];
-            for (const line of lines) {
-              if (line.length < 3 || line.length > 90 || generic.has(line)) continue;
-              if (!headlineLines.includes(line)) headlineLines.push(line);
-              if (headlineLines.length >= 12) break;
-            }
-
-            const titleCandidates = [];
-            const snippetCandidates = [];
-            const urls = [];
-            const seenTitles = new Set();
-            const seenUrls = new Set();
-
-            for (const anchor of document.querySelectorAll('a[href]')) {
-              const href = clean(anchor.href);
-              const text = clean(anchor.textContent);
-              if (!href || href.startsWith('javascript:') || href.startsWith('https://accounts.google.com')) continue;
-              if (href.includes('/preferences?') || href.includes('/advanced_search')) continue;
-              if (text && text.length >= 3 && text.length <= 120 && !seenTitles.has(text)) {
-                titleCandidates.push(text);
-                seenTitles.add(text);
-              }
-              const parentText = clean(anchor.parentElement ? anchor.parentElement.innerText : '');
-              if (parentText && parentText.length > text.length && parentText.length <= 220 && !snippetCandidates.includes(parentText)) {
-                snippetCandidates.push(parentText);
-              }
-              if (!seenUrls.has(href)) {
-                urls.push(href);
-                seenUrls.add(href);
-              }
-              if (titleCandidates.length >= 20 && urls.length >= 20) break;
-            }
-
-            return {
-              headlineLines,
-              resultTitles: titleCandidates.slice(0, 20),
-              resultSnippets: snippetCandidates.slice(0, 16),
-              pageUrls: urls.slice(0, 20),
-            };
-        }
-        """
-        raw = page.evaluate(script)
-        return GoogleLensWebResult(
-            headline_lines=[str(item).strip() for item in raw.get("headlineLines", []) if str(item).strip()],
-            result_titles=[str(item).strip() for item in raw.get("resultTitles", []) if str(item).strip()],
-            result_snippets=[str(item).strip() for item in raw.get("resultSnippets", []) if str(item).strip()],
-            page_urls=[str(item).strip() for item in raw.get("pageUrls", []) if str(item).strip()],
-        )
 
 
 class KunzerScrapeError(RuntimeError):
@@ -2856,12 +3209,32 @@ def build_comparison_export_rows(bundle: ExportBundle) -> list[list[str]]:
     ]
 
 
+def build_vehicle_link_export_rows(bundle: ExportBundle) -> list[list[str]]:
+    """Je Fahrzeug eine Zeile pro KTyp-Nummer (Topmotive und TecDoc)."""
+    export_rows: list[list[str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in normalize_vehicle_link_rows(bundle.vehicle_link_rows):
+        for ktyp, system in ((row.ktyp_topmotive, "Topmotive"), (row.ktyp_tecdoc, "TecDoc")):
+            ktyp = ktyp.strip()
+            if not ktyp:
+                continue
+            dedupe_key = (row.vehicle_type_id, ktyp)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            export_rows.append([bundle.article_number, row.vehicle_type_id, ktyp, system])
+    return export_rows
+
+
 def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
     export_rows: list[list[str]] = []
+    seen_search_values: set[str] = set()
     for row in normalize_attribute_rows(bundle.attribute_rows):
         export_value = row.value
         if is_attribute_key_value_format(row.value_format):
             export_value = resolve_attribute_export_value(row, bundle.attribute_key_values_by_group)
+        if row.criteria_id == SEARCH_TERM_CRITERIA_ID:
+            seen_search_values.add(export_value.strip().casefold())
         export_rows.append(
             [
                 bundle.article_number,
@@ -2870,6 +3243,21 @@ def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
                 row.value_format,
                 export_value,
                 row.value_to,
+            ]
+        )
+    # Suchwoerter als zusaetzliche 'Zusatzbezeichnung'-Zeilen (eine pro Suchwort).
+    for term in normalize_search_terms(bundle.search_terms):
+        if term.casefold() in seen_search_values:
+            continue
+        seen_search_values.add(term.casefold())
+        export_rows.append(
+            [
+                bundle.article_number,
+                SEARCH_TERM_CRITERIA_ID,
+                SEARCH_TERM_ATTRIBUTE_LABEL,
+                SEARCH_TERM_ATTRIBUTE_FORMAT,
+                term,
+                "",
             ]
         )
     return export_rows
@@ -2898,6 +3286,7 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
     web_rows = [append_written_at(row, written_at) for row in build_web_export_rows(bundle)] if bundle.include_web_links else []
     oe_rows = [append_written_at(row, written_at) for row in build_oe_export_rows(bundle)]
     comparison_rows = [append_written_at(row, written_at) for row in build_comparison_export_rows(bundle)]
+    vehicle_link_rows = [append_written_at(row, written_at) for row in build_vehicle_link_export_rows(bundle)]
     attribute_rows = [append_written_at(row, written_at) for row in build_attribute_export_rows(bundle)]
 
     if use_timestamp_subdir:
@@ -2912,6 +3301,8 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
             write_workbook(export_dir / OE_FILE[0], OE_FILE[1], OE_HEADERS, oe_rows)
         if comparison_rows:
             write_workbook(export_dir / COMPARISON_FILE[0], COMPARISON_FILE[1], COMPARISON_HEADERS, comparison_rows)
+        if vehicle_link_rows:
+            write_workbook(export_dir / VEHICLE_LINK_FILE[0], VEHICLE_LINK_FILE[1], VEHICLE_LINK_HEADERS, vehicle_link_rows)
         if attribute_rows:
             write_workbook(export_dir / ATTRIBUTE_FILE[0], ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS, attribute_rows)
         if bundle.include_images:
@@ -2966,6 +3357,13 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
             COMPARISON_FILE[1],
             COMPARISON_HEADERS,
             comparison_rows,
+            replace_article_keys=article_keys,
+        )
+        write_workbook_with_upsert(
+            export_dir / VEHICLE_LINK_FILE[0],
+            VEHICLE_LINK_FILE[1],
+            VEHICLE_LINK_HEADERS,
+            vehicle_link_rows,
             replace_article_keys=article_keys,
         )
         write_workbook_with_upsert(
@@ -3027,7 +3425,9 @@ def build_preview(bundle: ExportBundle) -> str:
         "Referenzen",
         f"- OE-Nummern: {len(normalize_oe_number_rows(bundle.oe_number_rows))}",
         f"- Vergleichsnummern: {len(normalize_comparison_number_rows(bundle.comparison_number_rows))}",
+        f"- Fahrzeugverknuepfungen: {len(normalize_vehicle_link_rows(bundle.vehicle_link_rows))} Fahrzeuge / {len(build_vehicle_link_export_rows(bundle))} Zeilen",
         f"- Attribute: {len(normalize_attribute_rows(bundle.attribute_rows))}",
+        f"- Suchwoerter: {len(normalize_search_terms(bundle.search_terms))} (als Attribut {SEARCH_TERM_CRITERIA_ID} {SEARCH_TERM_ATTRIBUTE_LABEL})",
         "",
         "Medien",
         f"- Bilder: {len(bundle.image_rows)}",
@@ -3042,6 +3442,7 @@ def build_preview(bundle: ExportBundle) -> str:
         f"- {GENART_FILE[0]}",
         f"- {OE_FILE[0]}",
         f"- {COMPARISON_FILE[0]}",
+        f"- {VEHICLE_LINK_FILE[0]}",
         f"- {ATTRIBUTE_FILE[0]}",
         f"- {IMAGE_FILE[0]}",
         f"- {DOCUMENT_FILE[0]}",
@@ -3075,6 +3476,39 @@ def format_media_rows(label: str, rows: list[MediaRow], include_meta: bool = Tru
     return "\n".join(lines)
 
 
+def format_vehicle_link_rows(label: str, rows: list[VehicleLinkRow]) -> str:
+    lines = [label]
+    normalized = normalize_vehicle_link_rows(rows)
+    if not normalized:
+        lines.append("-")
+        return "\n".join(lines)
+    for index, row in enumerate(normalized, start=1):
+        vehicle = row.display_vehicle_label()
+        meta_parts = [part for part in [format_year_range(row.year_from, row.year_to), row.power] if part]
+        meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+        ktyp_parts = []
+        if row.ktyp_topmotive:
+            ktyp_parts.append(f"TM {row.ktyp_topmotive}")
+        if row.ktyp_tecdoc:
+            ktyp_parts.append(f"TecDoc {row.ktyp_tecdoc}")
+        lines.append(
+            f"{index}. [{row.vehicle_type_label or row.vehicle_type_id}] {vehicle}{meta}"
+            f" | Motorcode: {row.motorcode or '-'} | KTyp: {', '.join(ktyp_parts) or '-'}"
+        )
+    return "\n".join(lines)
+
+
+def format_search_terms(label: str, terms: list[str]) -> str:
+    normalized = normalize_search_terms(terms)
+    lines = [label]
+    if not normalized:
+        lines.append("-")
+        return "\n".join(lines)
+    for index, term in enumerate(normalized, start=1):
+        lines.append(f"{index}. {term}")
+    return "\n".join(lines)
+
+
 def format_article_snapshot(snapshot: StoredArticleSnapshot) -> str:
     sections = [
         f"Artikelnummer: {snapshot.article_number}",
@@ -3093,7 +3527,11 @@ def format_article_snapshot(snapshot: StoredArticleSnapshot) -> str:
         "",
         format_comparison_number_rows("Vergleichsnummern", snapshot.comparison_number_rows),
         "",
+        format_vehicle_link_rows("Fahrzeugverknuepfungen", snapshot.vehicle_link_rows),
+        "",
         format_attribute_rows("Attribute", snapshot.attribute_rows),
+        "",
+        format_search_terms("Suchwoerter", snapshot.search_terms),
         "",
         format_media_rows("Bilder", snapshot.image_rows),
         "",
@@ -3126,6 +3564,7 @@ def load_article_snapshots_from_folder(
     manufacturer_lookup: dict[str, CompetitorOption] | None = None,
     attribute_lookup: dict[str, AttributeOption] | None = None,
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] | None = None,
+    vehicle_catalog: VehicleCatalog | None = None,
 ) -> dict[str, StoredArticleSnapshot]:
     if not folder.exists():
         return {}
@@ -3200,12 +3639,65 @@ def load_article_snapshots_from_folder(
             )
         )
 
+    vehicle_link_rows = read_workbook_rows(folder / VEHICLE_LINK_FILE[0], VEHICLE_LINK_FILE[1], len(VEHICLE_LINK_HEADERS))
+    for row in vehicle_link_rows:
+        article_number = normalize_article_number(row[0])
+        if not article_number:
+            continue
+        vehicle_type_id = row[1].strip() or DEFAULT_VEHICLE_TYPE_ID
+        ktyp = row[2].strip()
+        if not ktyp:
+            continue
+        system = row[3].strip().casefold()
+        match = None
+        if vehicle_catalog is not None:
+            if system.startswith("topmotive") or system.startswith("tm"):
+                match = vehicle_catalog.lookup_by_ktyp(ktyp_topmotive=ktyp)
+            elif system.startswith("tecdoc"):
+                match = vehicle_catalog.lookup_by_ktyp(ktyp_tecdoc=ktyp)
+            else:
+                match = vehicle_catalog.lookup_by_ktyp(ktyp_topmotive=ktyp, ktyp_tecdoc=ktyp)
+        if match is not None:
+            link_row = VehicleLinkRow(
+                vehicle_type_id=vehicle_type_id,
+                vehicle_type_label=vehicle_type_label_for_id(vehicle_type_id),
+                motorcode=match.motorcode,
+                ktyp_topmotive=match.ktyp_topmotive,
+                ktyp_tecdoc=match.ktyp_tecdoc,
+                manufacturer=match.manufacturer,
+                model=match.model,
+                description=match.description,
+                year_from=match.year_from,
+                year_to=match.year_to,
+                power=match.power,
+            )
+        else:
+            link_row = VehicleLinkRow(
+                vehicle_type_id=vehicle_type_id,
+                vehicle_type_label=vehicle_type_label_for_id(vehicle_type_id),
+                ktyp_topmotive=ktyp if system.startswith("topmotive") or system.startswith("tm") else "",
+                ktyp_tecdoc=ktyp if system.startswith("tecdoc") else "",
+            )
+            if not link_row.has_ktyp():
+                link_row = VehicleLinkRow(
+                    vehicle_type_id=vehicle_type_id,
+                    vehicle_type_label=vehicle_type_label_for_id(vehicle_type_id),
+                    ktyp_tecdoc=ktyp,
+                )
+        ensure_snapshot(article_number).vehicle_link_rows.append(link_row)
+
     attribute_rows = prepare_existing_rows_for_write(folder / ATTRIBUTE_FILE[0], ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS)
     for row in attribute_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
         criteria_id = row[1].strip()
+        if criteria_id == SEARCH_TERM_CRITERIA_ID:
+            # 'Zusatzbezeichnung'-Zeilen sind Suchwoerter und gehoeren in den Suchwoerter-Tab.
+            search_term = row[4].strip()
+            if search_term:
+                ensure_snapshot(article_number).search_terms.append(search_term)
+            continue
         attribute_option = attribute_lookup.get(criteria_id) if attribute_lookup is not None else None
         label = row[2].strip() or (attribute_option.label if attribute_option is not None else "")
         value_format = row[3].strip() or (attribute_option.value_format if attribute_option is not None else "")
@@ -3266,7 +3758,9 @@ def load_article_snapshots_from_folder(
         snapshot.sync_genart_fields()
         snapshot.oe_number_rows = normalize_oe_number_rows(snapshot.oe_number_rows)
         snapshot.comparison_number_rows = normalize_comparison_number_rows(snapshot.comparison_number_rows)
+        snapshot.vehicle_link_rows = normalize_vehicle_link_rows(snapshot.vehicle_link_rows)
         snapshot.attribute_rows = normalize_attribute_rows(snapshot.attribute_rows)
+        snapshot.search_terms = normalize_search_terms(snapshot.search_terms)
 
     return snapshots
 
@@ -5301,6 +5795,466 @@ class ComparisonTableFrame(ttk.LabelFrame):
         self.context_menu.grab_release()
 
 
+class VehicleLinkTableFrame(ttk.LabelFrame):
+    def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
+        super().__init__(master, text="Fahrzeugverknuepfungen", padding=14)
+        self.on_change = on_change
+        self.catalog: VehicleCatalog | None = None
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
+        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+
+        self.motorcode_var = tk.StringVar()
+        self.vehicle_type_var = tk.StringVar(value=format_vehicle_type_choice(*VEHICLE_TYPE_CHOICES[0]))
+        self.result_var = tk.StringVar(value="")
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            header,
+            text=(
+                "Motorcode(s) eingeben - die passenden KTyp-Nummern (TopMotive und TecDoc) werden automatisch "
+                "aus den KTyp-Stammdaten ergaenzt. Fuer den Apollo-Import: Fahrzeugtyp -> TecDoc Verknuepfungstyp ID "
+                "(PKW = 2), KTypNr -> TecDoc Verknuepfungs ID. Mehrere Motorcodes mit ; trennen."
+            ),
+            foreground="#5E6472",
+            wraplength=980,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+
+        ttk.Label(header, text="Motorcode(s)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.motorcode_entry = ttk.Entry(header, textvariable=self.motorcode_var)
+        self.motorcode_entry.grid(row=1, column=1, sticky="ew", pady=4)
+        self.motorcode_suggestions = SearchSuggestionPopup(
+            self,
+            self.motorcode_entry,
+            self._update_motorcode_suggestions,
+            self._accept_motorcode_suggestion,
+            min_width=340,
+        )
+        # Enter soll die Fahrzeuge hinzufuegen (ueberschreibt die Popup-Bindung bewusst danach).
+        self.motorcode_entry.bind("<Return>", self._on_motorcode_return)
+
+        ttk.Label(header, text="Fahrzeugtyp").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=4)
+        self.vehicle_type_combo = ttk.Combobox(
+            header,
+            textvariable=self.vehicle_type_var,
+            state="readonly",
+            width=14,
+            values=[format_vehicle_type_choice(type_id, label) for type_id, label in VEHICLE_TYPE_CHOICES],
+        )
+        self.vehicle_type_combo.grid(row=1, column=3, sticky="w", pady=4)
+
+        actions = ttk.Frame(header)
+        actions.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Button(actions, text="Fahrzeuge hinzufuegen", command=self.add_from_motorcodes).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text="Alle entfernen", command=self.clear_rows).grid(row=0, column=2, padx=(0, 8))
+        ttk.Label(actions, textvariable=self.result_var, foreground="#5E6472", wraplength=520).grid(row=0, column=3, padx=(8, 0), sticky="w")
+
+        columns = (
+            "vehicle_type_id",
+            "vehicle_type",
+            "motorcode",
+            "manufacturer",
+            "model",
+            "description",
+            "year",
+            "power",
+            "ktyp_topmotive",
+            "ktyp_tecdoc",
+        )
+        display_columns = (
+            "vehicle_type",
+            "motorcode",
+            "manufacturer",
+            "model",
+            "description",
+            "year",
+            "power",
+            "ktyp_topmotive",
+            "ktyp_tecdoc",
+        )
+        self.tree = ttk.Treeview(
+            self,
+            columns=columns,
+            show="headings",
+            height=13,
+            selectmode="extended",
+            displaycolumns=display_columns,
+        )
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        headings = {
+            "vehicle_type": "Fahrzeugtyp",
+            "motorcode": "Motorcode",
+            "manufacturer": "Hersteller",
+            "model": "Modell",
+            "description": "Bezeichnung",
+            "year": "Bauzeit",
+            "power": "Leistung",
+            "ktyp_topmotive": "KTyp TopMotive",
+            "ktyp_tecdoc": "KTyp TecDoc",
+        }
+        widths = {
+            "vehicle_type": 90,
+            "motorcode": 110,
+            "manufacturer": 120,
+            "model": 210,
+            "description": 150,
+            "year": 120,
+            "power": 120,
+            "ktyp_topmotive": 120,
+            "ktyp_tecdoc": 110,
+        }
+        for column, text in headings.items():
+            self.tree.heading(column, text=text)
+            self.tree.column(column, width=widths[column], anchor="w")
+        self.tree.column("vehicle_type", anchor="center")
+        self.tree.column("ktyp_topmotive", anchor="center")
+        self.tree.column("ktyp_tecdoc", anchor="center")
+        self.tree.bind("<Button-3>", self._open_context_menu)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+    def set_vehicle_catalog(self, catalog: VehicleCatalog | None) -> None:
+        self.catalog = catalog
+        if self.motorcode_suggestions is not None:
+            self.motorcode_suggestions.hide()
+
+    @staticmethod
+    def _split_last_motorcode_token(text: str) -> tuple[str, str]:
+        separator_index = text.rfind(";")
+        if separator_index >= 0:
+            return text[: separator_index + 1], text[separator_index + 1 :]
+        return "", text
+
+    def _update_motorcode_suggestions(self, query: str = "") -> list[str]:
+        if self.catalog is None or self.catalog.count == 0:
+            return []
+        _prefix, token = self._split_last_motorcode_token(query)
+        return self.catalog.suggest(token.strip(), limit=12)
+
+    def _accept_motorcode_suggestion(self, value: str) -> None:
+        prefix, _token = self._split_last_motorcode_token(self.motorcode_var.get())
+        new_value = f"{prefix} {value}".strip() if prefix else value
+        self.motorcode_var.set(new_value)
+        self.motorcode_entry.icursor("end")
+
+    def _on_motorcode_return(self, _event: tk.Event[tk.Misc]) -> str:
+        if self.motorcode_suggestions is not None:
+            self.motorcode_suggestions.hide()
+        self.add_from_motorcodes()
+        return "break"
+
+    def _current_vehicle_type(self) -> tuple[str, str]:
+        text = self.vehicle_type_var.get().strip()
+        match = re.search(r"\((\d+)\)\s*$", text)
+        if match:
+            type_id = match.group(1)
+            label = text[: match.start()].strip() or vehicle_type_label_for_id(type_id)
+            return type_id, label
+        type_id = vehicle_type_id_for_label(text) or (text if text.isdigit() else DEFAULT_VEHICLE_TYPE_ID)
+        return type_id, vehicle_type_label_for_id(type_id) or text
+
+    def _emit_change(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def add_from_motorcodes(self) -> None:
+        raw = self.motorcode_var.get().strip()
+        if not raw:
+            messagebox.showwarning(APP_TITLE, "Bitte mindestens einen Motorcode eingeben.")
+            return
+        if self.catalog is None or self.catalog.count == 0:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Keine KTyp-Stammdaten geladen. Bitte die KTyp-Datei im Projekt-Tab unter 'Datenstaemme' laden.",
+            )
+            return
+        codes = [code.strip() for code in re.split(r"[;\n\r\t]+", raw) if code.strip()]
+        type_id, type_label = self._current_vehicle_type()
+        existing = {(row.vehicle_type_id, row.ktyp_topmotive, row.ktyp_tecdoc) for row in self.get_rows()}
+        added = 0
+        matched_codes = 0
+        not_found: list[str] = []
+        for code in codes:
+            matches = self.catalog.lookup(code)
+            if not matches:
+                not_found.append(code)
+                continue
+            matched_codes += 1
+            for match in matches:
+                key = (type_id, match.ktyp_topmotive, match.ktyp_tecdoc)
+                if key in existing:
+                    continue
+                existing.add(key)
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        type_id,
+                        format_vehicle_type_choice(type_id, type_label),
+                        match.motorcode or normalize_motorcode(code),
+                        match.manufacturer,
+                        match.model,
+                        match.description,
+                        format_year_range(match.year_from, match.year_to),
+                        match.power,
+                        match.ktyp_topmotive,
+                        match.ktyp_tecdoc,
+                    ),
+                )
+                added += 1
+        summary = f"{added} Fahrzeug(e) aus {matched_codes} Motorcode(s) hinzugefuegt."
+        if not_found:
+            shown = ", ".join(not_found[:8]) + (" ..." if len(not_found) > 8 else "")
+            summary += f" Ohne Treffer: {shown}"
+        if added == 0 and not not_found:
+            summary = "Alle gefundenen Fahrzeuge sind bereits vorhanden."
+        self.result_var.set(summary)
+        if added:
+            self.motorcode_var.set("")
+            self._select_last_row()
+            self._emit_change()
+
+    def remove_selected(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        for item_id in selection:
+            self.tree.delete(item_id)
+        self._emit_change()
+
+    def clear_rows(self) -> None:
+        if not self.tree.get_children():
+            return
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        self.result_var.set("")
+        self._emit_change()
+
+    def copy_selected_rows(self) -> None:
+        selected = list(self.tree.selection())
+        if not selected:
+            return
+        rows = []
+        for item_id in selected:
+            values = [str(value).strip() for value in self.tree.item(item_id, "values")[1:]]
+            rows.append("\t".join(values))
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(rows))
+
+    def _select_last_row(self) -> None:
+        children = list(self.tree.get_children())
+        if children:
+            self.tree.selection_set(children[-1])
+            self.tree.see(children[-1])
+
+    def get_rows(self) -> list[VehicleLinkRow]:
+        rows: list[VehicleLinkRow] = []
+        for item_id in self.tree.get_children():
+            values = list(self.tree.item(item_id, "values"))
+            values += [""] * (10 - len(values))
+            vehicle_type_id, _display, motorcode, manufacturer, model, description, year, power, ktyp_tm, ktyp_td = values[:10]
+            year_text = str(year).strip()
+            if " - " in year_text:
+                year_from, year_to = [part.strip() for part in year_text.split(" - ", 1)]
+            else:
+                year_from, year_to = year_text, ""
+            type_id = str(vehicle_type_id).strip() or DEFAULT_VEHICLE_TYPE_ID
+            rows.append(
+                VehicleLinkRow(
+                    vehicle_type_id=type_id,
+                    vehicle_type_label=vehicle_type_label_for_id(type_id),
+                    motorcode=str(motorcode).strip(),
+                    ktyp_topmotive=str(ktyp_tm).strip(),
+                    ktyp_tecdoc=str(ktyp_td).strip(),
+                    manufacturer=str(manufacturer).strip(),
+                    model=str(model).strip(),
+                    description=str(description).strip(),
+                    year_from=year_from,
+                    year_to=year_to,
+                    power=str(power).strip(),
+                )
+            )
+        return normalize_vehicle_link_rows(rows)
+
+    def set_rows(self, rows: list[VehicleLinkRow]) -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        for row in normalize_vehicle_link_rows(rows):
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    row.vehicle_type_id,
+                    format_vehicle_type_choice(row.vehicle_type_id, row.vehicle_type_label),
+                    row.motorcode,
+                    row.manufacturer,
+                    row.model,
+                    row.description,
+                    format_year_range(row.year_from, row.year_to),
+                    row.power,
+                    row.ktyp_topmotive,
+                    row.ktyp_tecdoc,
+                ),
+            )
+
+    def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id and item_id not in self.tree.selection():
+            self.tree.selection_set(item_id)
+        has_selection = bool(self.tree.selection())
+        self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.grab_release()
+
+
+class SearchTermFrame(ttk.LabelFrame):
+    def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
+        super().__init__(master, text="Suchwoerter", padding=14)
+        self.on_change = on_change
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Suchwoerter kopieren", command=self.copy_selected_terms)
+        self.context_menu.add_command(label="Suchwoerter loeschen", command=self.remove_selected)
+
+        self.term_var = tk.StringVar()
+        self.count_var = tk.StringVar(value="0 Suchwoerter")
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            header,
+            text=(
+                "Apollo kennt keine nativen Suchbegriffe. Suchwoerter werden deshalb beim Export als Attribut "
+                f"'{SEARCH_TERM_ATTRIBUTE_LABEL}' (TecDoc Kriterien ID {SEARCH_TERM_CRITERIA_ID}) in die Attribute.xlsx geschrieben - "
+                f"eine Zeile pro Suchwort, maximal {SEARCH_TERM_MAX_LENGTH} Zeichen. Mehrere Suchwoerter mit ; trennen."
+            ),
+            foreground="#5E6472",
+            wraplength=980,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(header, text="Suchwort(e)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.term_entry = ttk.Entry(header, textvariable=self.term_var)
+        self.term_entry.grid(row=1, column=1, sticky="ew", pady=4)
+        self.term_entry.bind("<Return>", lambda _event: self.add_terms())
+
+        actions = ttk.Frame(header)
+        actions.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(actions, text="Hinzufuegen", command=self.add_terms).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text="Alle entfernen", command=self.clear_terms).grid(row=0, column=2, padx=(0, 8))
+        ttk.Label(actions, textvariable=self.count_var, foreground="#5E6472").grid(row=0, column=3, padx=(8, 0), sticky="w")
+
+        columns = ("term", "length")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=13, selectmode="extended")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.tree.heading("term", text="Suchwort")
+        self.tree.heading("length", text="Zeichen")
+        self.tree.column("term", width=420, anchor="w")
+        self.tree.column("length", width=90, anchor="center")
+        self.tree.bind("<Button-3>", self._open_context_menu)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+    def _emit_change(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def _update_count(self) -> None:
+        count = len(self.tree.get_children())
+        self.count_var.set(f"{count} Suchwoerter" if count != 1 else "1 Suchwort")
+
+    def add_terms(self) -> None:
+        raw = self.term_var.get().strip()
+        if not raw:
+            messagebox.showwarning(APP_TITLE, "Bitte mindestens ein Suchwort eingeben.")
+            return
+        candidates = normalize_search_terms(re.split(r"[;\n\r\t]+", raw))
+        if not candidates:
+            return
+        too_long = [term for term in candidates if len(term) > SEARCH_TERM_MAX_LENGTH]
+        candidates = [term for term in candidates if len(term) <= SEARCH_TERM_MAX_LENGTH]
+        existing = {term.casefold() for term in self.get_terms()}
+        added = 0
+        for term in candidates:
+            if term.casefold() in existing:
+                continue
+            existing.add(term.casefold())
+            self.tree.insert("", "end", values=(term, len(term)))
+            added += 1
+        self._update_count()
+        if too_long:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Diese Suchwoerter sind laenger als {SEARCH_TERM_MAX_LENGTH} Zeichen und wurden nicht uebernommen:\n"
+                + "\n".join(too_long),
+            )
+        if added:
+            self.term_var.set("")
+            self._emit_change()
+
+    def remove_selected(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        for item_id in selection:
+            self.tree.delete(item_id)
+        self._update_count()
+        self._emit_change()
+
+    def clear_terms(self) -> None:
+        if not self.tree.get_children():
+            return
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        self._update_count()
+        self._emit_change()
+
+    def copy_selected_terms(self) -> None:
+        selected = list(self.tree.selection())
+        if not selected:
+            return
+        terms = [str(self.tree.item(item_id, "values")[0]) for item_id in selected]
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(terms))
+
+    def get_terms(self) -> list[str]:
+        terms = [str(self.tree.item(item_id, "values")[0]) for item_id in self.tree.get_children()]
+        return normalize_search_terms(terms)
+
+    def set_terms(self, terms: list[str]) -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        for term in normalize_search_terms(terms):
+            self.tree.insert("", "end", values=(term, len(term)))
+        self._update_count()
+
+    def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id and item_id not in self.tree.selection():
+            self.tree.selection_set(item_id)
+        has_selection = bool(self.tree.selection())
+        self.context_menu.entryconfigure("Suchwoerter kopieren", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Suchwoerter loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.grab_release()
+
+
 class AttributeTableFrame(ttk.LabelFrame):
     def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
         super().__init__(master, text="Attribute", padding=14)
@@ -6292,6 +7246,238 @@ class GenArtSearchDialog:
         self.window.destroy()
 
 
+class AttributeSuggestionDialog(tk.Toplevel):
+    """Bestaetigungsdialog fuer aus Produkttext erkannte Attribute."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        suggestions: list[AttributeSuggestion],
+        unmatched: list[ExtractedSpecLine],
+        attribute_options: list[AttributeOption],
+        on_apply: Callable[[list[AttributeRow], list[tuple[str, str]]], None],
+    ) -> None:
+        super().__init__(master)
+        self.title("Attribute aus Text vorschlagen")
+        self.on_apply = on_apply
+        self.attribute_options = list(attribute_options)
+        self.options_by_display = {option.display_label(): option for option in self.attribute_options}
+        self.options_by_id = {option.criteria_id: option for option in self.attribute_options}
+        self.suggestions_by_item: dict[str, AttributeSuggestion] = {}
+        self.checked_items: set[str] = set()
+        self.unmatched = list(unmatched)
+        self.learned_entries: list[tuple[str, str]] = []
+        self.selected_unmatched_label = ""
+
+        self.transient(master.winfo_toplevel())
+        self.configure(background="#F6F2EA", padx=16, pady=14)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=3)
+        self.rowconfigure(3, weight=2)
+
+        ttk.Label(
+            self,
+            text=(
+                "Gefundene Attribute aus dem Produkttext. Angehakte Zeilen werden in den Attribute-Tab uebernommen. "
+                "Klick auf eine Zeile schaltet das Haekchen um."
+            ),
+            foreground="#5E6472",
+            wraplength=900,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        columns = ("use", "attribute", "value", "value_to", "note", "source")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=11, selectmode="browse")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        headings = {
+            "use": "✓", "attribute": "Attribut", "value": "Wert",
+            "value_to": "Wert bis", "note": "Hinweis", "source": "Quellzeile",
+        }
+        widths = {"use": 40, "attribute": 250, "value": 130, "value_to": 90, "note": 210, "source": 260}
+        for column in columns:
+            self.tree.heading(column, text=headings[column])
+            self.tree.column(column, width=widths[column], anchor="center" if column == "use" else "w")
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>", self._on_tree_space)
+
+        tree_scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        tree_scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+
+        for suggestion in suggestions:
+            self._insert_suggestion(suggestion, checked=suggestion.confident)
+
+        unmatched_frame = ttk.LabelFrame(self, text="Nicht erkannte Angaben", padding=10)
+        unmatched_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+        unmatched_frame.columnconfigure(1, weight=1)
+        unmatched_frame.rowconfigure(0, weight=1)
+
+        self.unmatched_list = tk.Listbox(unmatched_frame, height=5, exportselection=False)
+        self.unmatched_list.grid(row=0, column=0, columnspan=4, sticky="nsew", pady=(0, 8))
+        for spec in self.unmatched:
+            self.unmatched_list.insert("end", spec.source_line)
+        self.unmatched_list.bind("<<ListboxSelect>>", self._on_unmatched_select)
+
+        ttk.Label(unmatched_frame, text="Attribut").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        self.assign_display_var = tk.StringVar()
+        self.assign_entry = ttk.Entry(unmatched_frame, textvariable=self.assign_display_var)
+        self.assign_entry.grid(row=1, column=1, sticky="ew")
+        self.assign_suggestions = SearchSuggestionPopup(
+            self,
+            self.assign_entry,
+            self._assign_suggestion_values,
+            self._accept_assign_suggestion,
+            min_width=420,
+        )
+        ttk.Label(unmatched_frame, text="Wert").grid(row=1, column=2, sticky="w", padx=(12, 8))
+        self.assign_value_var = tk.StringVar()
+        ttk.Entry(unmatched_frame, textvariable=self.assign_value_var, width=18).grid(row=1, column=3, sticky="w")
+
+        self.remember_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            unmatched_frame,
+            text="Zuordnung merken (Text-Label wird in die Zuordnungstabelle uebernommen)",
+            variable=self.remember_var,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Button(unmatched_frame, text="Zuweisen", command=self._assign_unmatched).grid(row=2, column=3, sticky="e", pady=(8, 0))
+
+        buttons = ttk.Frame(self)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Abbrechen", command=self.destroy).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Uebernehmen", style="Accent.TButton", command=self._apply).grid(row=0, column=1)
+
+        self.geometry("1020x640")
+        self.grab_set()
+        self.tree.focus_set()
+
+    def _insert_suggestion(self, suggestion: AttributeSuggestion, checked: bool) -> None:
+        item_id = self.tree.insert(
+            "",
+            "end",
+            values=(
+                "☑" if checked else "☐",
+                suggestion.option.display_label(),
+                suggestion.value,
+                suggestion.value_to,
+                suggestion.note,
+                suggestion.source_line,
+            ),
+        )
+        self.suggestions_by_item[item_id] = suggestion
+        if checked:
+            self.checked_items.add(item_id)
+
+    def _toggle_item(self, item_id: str) -> None:
+        if item_id in self.checked_items:
+            self.checked_items.discard(item_id)
+        else:
+            self.checked_items.add(item_id)
+        values = list(self.tree.item(item_id, "values"))
+        values[0] = "☑" if item_id in self.checked_items else "☐"
+        self.tree.item(item_id, values=values)
+
+    def _on_tree_click(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            self._toggle_item(item_id)
+
+    def _on_tree_space(self, _event: tk.Event[tk.Misc]) -> str:
+        selected = self.tree.selection()
+        if selected:
+            self._toggle_item(selected[0])
+        return "break"
+
+    def _assign_suggestion_values(self, query: str = "") -> list[str]:
+        query_text = query.strip().casefold()
+        return [
+            option.display_label()
+            for option in self.attribute_options
+            if not query_text or query_text in option.search_blob
+        ][:200]
+
+    def _accept_assign_suggestion(self, value: str) -> None:
+        self.assign_display_var.set(value)
+
+    def _on_unmatched_select(self, _event: tk.Event[tk.Misc]) -> None:
+        selection = self.unmatched_list.curselection()
+        if not selection:
+            return
+        spec = self.unmatched[selection[0]]
+        self.selected_unmatched_label = spec.label
+        parsed = parse_numeric_value(spec.raw_value)
+        if parsed is not None:
+            number, number_to, _unit = parsed
+            value_text = format_german_number(number)
+            if number_to is not None:
+                value_text += f" - {format_german_number(number_to)}"
+            self.assign_value_var.set(value_text)
+        else:
+            self.assign_value_var.set(spec.raw_value)
+
+    def _resolve_assign_option(self) -> AttributeOption | None:
+        value = self.assign_display_var.get().strip()
+        if not value:
+            return None
+        if value in self.options_by_display:
+            return self.options_by_display[value]
+        if value in self.options_by_id:
+            return self.options_by_id[value]
+        return None
+
+    def _assign_unmatched(self) -> None:
+        selection = self.unmatched_list.curselection()
+        if not selection:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile aus 'Nicht erkannte Angaben' auswaehlen.", parent=self)
+            return
+        option = self._resolve_assign_option()
+        if option is None:
+            messagebox.showwarning(APP_TITLE, "Bitte ein Attribut aus der Liste auswaehlen.", parent=self)
+            return
+        index = selection[0]
+        spec = self.unmatched[index]
+        raw_value = self.assign_value_var.get().strip()
+        value, value_to = raw_value, ""
+        range_match = re.match(r"^(.+?)\s*-\s*(.+)$", raw_value)
+        if range_match and option.value_format.strip().casefold() == "numerisch":
+            value, value_to = range_match.group(1).strip(), range_match.group(2).strip()
+        suggestion = AttributeSuggestion(
+            option=option, value=value, value_to=value_to,
+            source_line=spec.source_line, confident=True, note="manuell zugeordnet",
+        )
+        self._insert_suggestion(suggestion, checked=True)
+        if self.remember_var.get() and spec.label.strip():
+            self.learned_entries.append((spec.label.strip(), option.criteria_id))
+        self.unmatched_list.delete(index)
+        del self.unmatched[index]
+        self.assign_display_var.set("")
+        self.assign_value_var.set("")
+        self.selected_unmatched_label = ""
+
+    def _apply(self) -> None:
+        rows: list[AttributeRow] = []
+        for item_id in self.tree.get_children():
+            if item_id not in self.checked_items:
+                continue
+            suggestion = self.suggestions_by_item.get(item_id)
+            if suggestion is None:
+                continue
+            values = self.tree.item(item_id, "values")
+            option = suggestion.option
+            rows.append(
+                AttributeRow(
+                    criteria_id=option.criteria_id,
+                    label=option.label,
+                    value_format=option.value_format,
+                    max_length=option.max_length,
+                    type_name=option.type_name,
+                    value=str(values[2]).strip(),
+                    value_to=str(values[3]).strip(),
+                )
+            )
+        learned = list(self.learned_entries)
+        self.destroy()
+        self.on_apply(rows, learned)
+
+
 class ApolloImportApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -6316,6 +7502,12 @@ class ApolloImportApp:
         self.attribute_key_value_source_path_var = tk.StringVar(
             value=str(DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE) if path_exists_safe(DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE) else ""
         )
+        self.vehicle_source_path_var = tk.StringVar(
+            value=str(DEFAULT_VEHICLE_SOURCE) if path_exists_safe(DEFAULT_VEHICLE_SOURCE) else ""
+        )
+        self.attribute_mapping_source_path_var = tk.StringVar(
+            value=str(DEFAULT_ATTRIBUTE_MAPPING_SOURCE) if path_exists_safe(DEFAULT_ATTRIBUTE_MAPPING_SOURCE) else ""
+        )
         self.product_list_path_var = tk.StringVar()
         self.deepl_api_key_var = tk.StringVar(value=os.getenv("DEEPL_API_KEY", ""))
         self.deepl_base_url_var = tk.StringVar(value=os.getenv("DEEPL_API_BASE_URL", DEEPL_DEFAULT_BASE_URL))
@@ -6324,7 +7516,6 @@ class ApolloImportApp:
         self.genart_suggestion_var = tk.StringVar(value="Keine GenArt geladen.")
         self.selected_genart_count_var = tk.StringVar(value="0 GenArten gesetzt")
         self.auto_translate_after_scrape_var = tk.BooleanVar(value=True)
-        self.google_lens_enabled_var = tk.BooleanVar(value=True)
         self.fixed_export_path_var = tk.BooleanVar(value=True)
         self.batch_short_text_var = tk.BooleanVar(value=True)
         self.batch_long_text_var = tk.BooleanVar(value=True)
@@ -6342,6 +7533,8 @@ class ApolloImportApp:
         self.competitor_count_var = tk.StringVar(value="0 Hersteller / 0 Mitbewerber geladen")
         self.attribute_count_var = tk.StringVar(value="0 Attribute geladen")
         self.attribute_key_value_count_var = tk.StringVar(value="0 Schluesselwerte geladen")
+        self.vehicle_count_var = tk.StringVar(value="0 KTyp-Datensaetze geladen")
+        self.attribute_mapping_count_var = tk.StringVar(value="0 Zuordnungen geladen")
         self.article_section_collapsed = False
         self.api_section_collapsed = False
         self.article_browser_collapsed = False
@@ -6360,11 +7553,9 @@ class ApolloImportApp:
         self.attribute_options_by_id: dict[str, AttributeOption] = {}
         self.attribute_key_value_options: list[AttributeKeyValueOption] = []
         self.attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] = {}
-        self.current_kunzer_category_context = ""
-        self.google_lens_web_cache: dict[str, GoogleLensWebResult | None] = {}
-        self.genart_image_signature_cache: dict[str, ImageSignature | None] = {}
-        self.genart_image_reference_index: list[tuple[str, str, ImageSignature]] = []
-        self.genart_image_index_dirty = True
+        self.vehicle_catalog: VehicleCatalog = VehicleCatalog()
+        self.vehicle_catalog_loading = False
+        self.attribute_mapping: dict[str, str] = {}
         self.article_browser_cache_dir = ""
         self.article_browser_cache_signature: tuple[tuple[str, int, int], ...] | None = None
         self.live_write_suspended = False
@@ -6386,6 +7577,8 @@ class ApolloImportApp:
         self._load_competitor_catalog(initial=True)
         self._load_attribute_catalog(initial=True)
         self._load_attribute_key_value_catalog(initial=True)
+        self._load_vehicle_catalog(initial=True)
+        self._load_attribute_mapping(initial=True)
         self.refresh_preview()
         self._apply_pending_session_selection()
 
@@ -6445,8 +7638,10 @@ class ApolloImportApp:
         self.long_tab = ttk.Frame(self.main_notebook, padding=18)
         self.genart_tab = ttk.Frame(self.main_notebook, padding=18)
         self.attribute_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.search_term_tab = ttk.Frame(self.main_notebook, padding=18)
         self.oe_tab = ttk.Frame(self.main_notebook, padding=18)
         self.comparison_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.vehicle_tab = ttk.Frame(self.main_notebook, padding=18)
         self.image_tab = ttk.Frame(self.main_notebook, padding=18)
         self.document_tab = ttk.Frame(self.main_notebook, padding=18)
         self.links_tab = ttk.Frame(self.main_notebook, padding=18)
@@ -6456,8 +7651,10 @@ class ApolloImportApp:
         self.main_notebook.add(self.long_tab, text="Text")
         self.main_notebook.add(self.genart_tab, text="GenArten")
         self.main_notebook.add(self.attribute_tab, text="Attribute")
+        self.main_notebook.add(self.search_term_tab, text="Suchwoerter")
         self.main_notebook.add(self.oe_tab, text="OE-Nummern")
         self.main_notebook.add(self.comparison_tab, text="Vergleichsnummern")
+        self.main_notebook.add(self.vehicle_tab, text="Fahrzeuge")
         self.main_notebook.add(self.image_tab, text="Bilder")
         self.main_notebook.add(self.document_tab, text="Dokumente")
         self.main_notebook.add(self.links_tab, text="Links")
@@ -6616,6 +7813,49 @@ class ApolloImportApp:
             )
         return normalize_comparison_number_rows(rows)
 
+    def _vehicle_link_rows_to_state(self, rows: list[VehicleLinkRow]) -> list[dict[str, str]]:
+        return [
+            {
+                "vehicle_type_id": row.vehicle_type_id,
+                "vehicle_type_label": row.vehicle_type_label,
+                "motorcode": row.motorcode,
+                "ktyp_topmotive": row.ktyp_topmotive,
+                "ktyp_tecdoc": row.ktyp_tecdoc,
+                "manufacturer": row.manufacturer,
+                "model": row.model,
+                "description": row.description,
+                "year_from": row.year_from,
+                "year_to": row.year_to,
+                "power": row.power,
+            }
+            for row in normalize_vehicle_link_rows(rows)
+        ]
+
+    def _vehicle_link_rows_from_state(self, payload: object) -> list[VehicleLinkRow]:
+        if not isinstance(payload, list):
+            return []
+        rows: list[VehicleLinkRow] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            type_id = str(item.get("vehicle_type_id", DEFAULT_VEHICLE_TYPE_ID)) or DEFAULT_VEHICLE_TYPE_ID
+            rows.append(
+                VehicleLinkRow(
+                    vehicle_type_id=type_id,
+                    vehicle_type_label=str(item.get("vehicle_type_label", "")) or vehicle_type_label_for_id(type_id),
+                    motorcode=str(item.get("motorcode", "")),
+                    ktyp_topmotive=str(item.get("ktyp_topmotive", "")),
+                    ktyp_tecdoc=str(item.get("ktyp_tecdoc", "")),
+                    manufacturer=str(item.get("manufacturer", "")),
+                    model=str(item.get("model", "")),
+                    description=str(item.get("description", "")),
+                    year_from=str(item.get("year_from", "")),
+                    year_to=str(item.get("year_to", "")),
+                    power=str(item.get("power", "")),
+                )
+            )
+        return normalize_vehicle_link_rows(rows)
+
     def _attribute_rows_to_state(self, rows: list[AttributeRow]) -> list[dict[str, object]]:
         return [
             {
@@ -6708,6 +7948,8 @@ class ApolloImportApp:
                 "competitor_source_path": self.competitor_source_path_var.get(),
                 "attribute_source_path": self.attribute_source_path_var.get(),
                 "attribute_key_value_source_path": self.attribute_key_value_source_path_var.get(),
+                "vehicle_source_path": self.vehicle_source_path_var.get(),
+                "attribute_mapping_source_path": self.attribute_mapping_source_path_var.get(),
                 "product_list_path": self.product_list_path_var.get(),
             },
             "api": {
@@ -6716,7 +7958,6 @@ class ApolloImportApp:
             },
             "options": {
                 "auto_translate_after_scrape": self.auto_translate_after_scrape_var.get(),
-                "google_lens_enabled": self.google_lens_enabled_var.get(),
                 "fixed_export_path": self.fixed_export_path_var.get(),
                 "batch_short_text": self.batch_short_text_var.get(),
                 "batch_long_text": self.batch_long_text_var.get(),
@@ -6733,7 +7974,6 @@ class ApolloImportApp:
                 "genart_selections": self._genart_selections_to_state(self.selected_genart_selections),
                 "genart_display": self.genart_display_var.get(),
                 "genart_suggestion": self.genart_suggestion_var.get(),
-                "current_kunzer_category_context": self.current_kunzer_category_context,
             },
             "translations": {
                 "short_auto_uni": self.short_text_frame.auto_uni_var.get(),
@@ -6773,6 +8013,19 @@ class ApolloImportApp:
                         "competitor_code": self.comparison_frame.competitor_code_var.get(),
                         "competitor_name": self.comparison_frame.competitor_name_var.get(),
                         "reference_number": self.comparison_frame.reference_number_var.get(),
+                    },
+                },
+                "vehicle_links": {
+                    "rows": self._vehicle_link_rows_to_state(self.vehicle_link_frame.get_rows()),
+                    "form": {
+                        "motorcode": self.vehicle_link_frame.motorcode_var.get(),
+                        "vehicle_type": self.vehicle_link_frame.vehicle_type_var.get(),
+                    },
+                },
+                "search_terms": {
+                    "terms": self.search_term_frame.get_terms(),
+                    "form": {
+                        "term": self.search_term_frame.term_var.get(),
                     },
                 },
             },
@@ -6854,6 +8107,10 @@ class ApolloImportApp:
                 self.attribute_key_value_source_path_var.set(
                     str(paths.get("attribute_key_value_source_path", self.attribute_key_value_source_path_var.get()))
                 )
+                self.vehicle_source_path_var.set(str(paths.get("vehicle_source_path", self.vehicle_source_path_var.get())))
+                self.attribute_mapping_source_path_var.set(
+                    str(paths.get("attribute_mapping_source_path", self.attribute_mapping_source_path_var.get()))
+                )
                 self.product_list_path_var.set(str(paths.get("product_list_path", self.product_list_path_var.get())))
 
             api = payload.get("api")
@@ -6864,7 +8121,6 @@ class ApolloImportApp:
             options = payload.get("options")
             if isinstance(options, dict):
                 self.auto_translate_after_scrape_var.set(bool(options.get("auto_translate_after_scrape", self.auto_translate_after_scrape_var.get())))
-                self.google_lens_enabled_var.set(bool(options.get("google_lens_enabled", self.google_lens_enabled_var.get())))
                 self.fixed_export_path_var.set(bool(options.get("fixed_export_path", self.fixed_export_path_var.get())))
                 self.batch_short_text_var.set(bool(options.get("batch_short_text", self.batch_short_text_var.get())))
                 self.batch_long_text_var.set(bool(options.get("batch_long_text", self.batch_long_text_var.get())))
@@ -6888,7 +8144,6 @@ class ApolloImportApp:
                 self._set_selected_genart_selections(restored_genart_selections)
                 self.genart_display_var.set(str(article.get("genart_display", "")))
                 self.genart_suggestion_var.set(str(article.get("genart_suggestion", self.genart_suggestion_var.get())))
-                self.current_kunzer_category_context = str(article.get("current_kunzer_category_context", ""))
                 self.current_id_article_number = article_number if article_number else ""
 
             translations = payload.get("translations")
@@ -6943,6 +8198,25 @@ class ApolloImportApp:
                         self.comparison_frame.competitor_code_var.set(str(form.get("competitor_code", "")))
                         self.comparison_frame.competitor_name_var.set(str(form.get("competitor_name", "")))
                         self.comparison_frame.reference_number_var.set(str(form.get("reference_number", "")))
+
+                vehicle_payload = references.get("vehicle_links")
+                if isinstance(vehicle_payload, dict):
+                    self.vehicle_link_frame.set_rows(self._vehicle_link_rows_from_state(vehicle_payload.get("rows")))
+                    form = vehicle_payload.get("form")
+                    if isinstance(form, dict):
+                        self.vehicle_link_frame.motorcode_var.set(str(form.get("motorcode", "")))
+                        vehicle_type = str(form.get("vehicle_type", "")).strip()
+                        if vehicle_type:
+                            self.vehicle_link_frame.vehicle_type_var.set(vehicle_type)
+
+                search_term_payload = references.get("search_terms")
+                if isinstance(search_term_payload, dict):
+                    terms_payload = search_term_payload.get("terms")
+                    if isinstance(terms_payload, list):
+                        self.search_term_frame.set_terms([str(term) for term in terms_payload])
+                    form = search_term_payload.get("form")
+                    if isinstance(form, dict):
+                        self.search_term_frame.term_var.set(str(form.get("term", "")))
 
             media = payload.get("media")
             if isinstance(media, dict):
@@ -7537,7 +8811,7 @@ if ($copied) {{
         deepl_header = ttk.Frame(deepl_frame)
         deepl_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         deepl_header.columnconfigure(0, weight=1)
-        ttk.Label(deepl_header, text="DeepL, Google Lens und Datenstamm-Einstellungen", foreground="#5E6472").grid(
+        ttk.Label(deepl_header, text="DeepL und Datenstamm-Einstellungen", foreground="#5E6472").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Button(deepl_header, textvariable=self.api_section_toggle_var, command=self._toggle_api_section).grid(row=0, column=1, padx=(8, 0))
@@ -7573,26 +8847,6 @@ if ($copied) {{
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         ttk.Separator(self.deepl_content_frame, orient="horizontal").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(14, 12))
-
-        ttk.Label(self.deepl_content_frame, text="Google Lens", font=("Segoe UI Semibold", 10)).grid(row=6, column=0, sticky="w", pady=(0, 4))
-        ttk.Checkbutton(
-            self.deepl_content_frame,
-            text="Google Lens ohne API-Key fuer GenArt verwenden (inoffiziell)",
-            variable=self.google_lens_enabled_var,
-        ).grid(row=6, column=1, sticky="w", pady=(0, 4))
-
-        ttk.Label(
-            self.deepl_content_frame,
-            text=(
-                "Wenn aktiviert, nutzt die GenArt-Vorschlagslogik einen inoffiziellen Google-Lens-Browserabruf ohne API-Key. "
-                "Dabei werden sichtbare Treffertexte und Seiten aus den Lens-Ergebnissen als zusaetzliches Signal fuer die GenArt-Suche verwendet. "
-                "Das ist absichtlich als experimenteller Weg zu verstehen und kann sich durch Google-Aenderungen jederzeit veraendern."
-            ),
-            foreground="#5E6472",
-            wraplength=1000,
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
-
-        ttk.Separator(self.deepl_content_frame, orient="horizontal").grid(row=8, column=0, columnspan=3, sticky="ew", pady=(14, 12))
 
         ttk.Label(self.deepl_content_frame, text="Datenstaemme", font=("Segoe UI Semibold", 10)).grid(
             row=9, column=0, sticky="w", pady=(0, 4)
@@ -7649,6 +8903,44 @@ if ($copied) {{
         )
         ttk.Label(self.deepl_content_frame, textvariable=self.attribute_key_value_count_var, foreground="#5E6472").grid(
             row=19, column=1, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(self.deepl_content_frame, text="KTyp XLSX").grid(row=20, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(self.deepl_content_frame, textvariable=self.vehicle_source_path_var).grid(row=20, column=1, sticky="ew", pady=6)
+        vehicle_actions = ttk.Frame(self.deepl_content_frame)
+        vehicle_actions.grid(row=20, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(vehicle_actions, text="Datei waehlen", command=self.choose_vehicle_source_file).grid(row=0, column=0)
+        ttk.Button(vehicle_actions, text="Neu laden", command=self._reload_vehicle_catalog).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            self.deepl_content_frame,
+            text=(
+                "KTyp-Stammdaten (Motorcode -> KTyp-Nummer). Wird im Tab 'Fahrzeuge' verwendet, um ueber Motorcodes "
+                "die KTyp-Nummern (TopMotive/TecDoc) zu finden. Datei bei Bedarf aktualisieren und 'Neu laden' druecken."
+            ),
+            foreground="#5E6472",
+            wraplength=1000,
+        ).grid(row=21, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(self.deepl_content_frame, textvariable=self.vehicle_count_var, foreground="#5E6472").grid(
+            row=22, column=1, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(self.deepl_content_frame, text="Attribut-Zuordnung XLSX").grid(row=23, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_mapping_source_path_var).grid(row=23, column=1, sticky="ew", pady=6)
+        mapping_actions = ttk.Frame(self.deepl_content_frame)
+        mapping_actions.grid(row=23, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(mapping_actions, text="Datei waehlen", command=self.choose_attribute_mapping_source_file).grid(row=0, column=0)
+        ttk.Button(mapping_actions, text="Neu laden", command=self._reload_attribute_mapping).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            self.deepl_content_frame,
+            text=(
+                "Zuordnung von Text-Labels (z.B. 'Gewicht') zu TecDoc Kriterien IDs fuer 'Attribute aus Text vorschlagen'. "
+                "Manuell zugewiesene Labels koennen aus dem Vorschlagsdialog automatisch ergaenzt werden."
+            ),
+            foreground="#5E6472",
+            wraplength=1000,
+        ).grid(row=24, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(self.deepl_content_frame, textvariable=self.attribute_mapping_count_var, foreground="#5E6472").grid(
+            row=25, column=1, columnspan=2, sticky="w"
         )
 
         self.browser_frame = ttk.LabelFrame(project_parent, text="Artikelverzeichnis", padding=14)
@@ -7818,7 +9110,6 @@ if ($copied) {{
         hint_row.grid(row=2, column=0, sticky="ew")
         hint_row.columnconfigure(0, weight=1)
         ttk.Label(hint_row, textvariable=self.genart_suggestion_var, foreground="#5E6472", wraplength=840).grid(row=0, column=0, sticky="w")
-        ttk.Button(hint_row, text="GenArt vorschlagen", command=self.suggest_genart_for_current_article).grid(row=0, column=1, padx=(8, 0))
 
         table_frame = ttk.Frame(genart_frame)
         table_frame.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
@@ -7858,11 +9149,34 @@ if ($copied) {{
         )
         self.attribute_frame.grid(row=0, column=0, sticky="nsew")
 
+        attribute_actions = ttk.Frame(self.attribute_tab)
+        attribute_actions.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(
+            attribute_actions,
+            text="Attribute aus Text vorschlagen",
+            command=self._open_attribute_suggestion_dialog,
+        ).grid(row=0, column=0)
+        ttk.Label(
+            attribute_actions,
+            text="Liest technische Angaben aus Kurzbezeichnung und Text und schlaegt passende Attribute vor.",
+            foreground="#5E6472",
+        ).grid(row=0, column=1, padx=(10, 0))
+
     def _build_reference_tabs(self) -> None:
         self.oe_tab.columnconfigure(0, weight=1)
         self.oe_tab.rowconfigure(0, weight=1)
         self.comparison_tab.columnconfigure(0, weight=1)
         self.comparison_tab.rowconfigure(0, weight=1)
+        self.vehicle_tab.columnconfigure(0, weight=1)
+        self.vehicle_tab.rowconfigure(0, weight=1)
+        self.search_term_tab.columnconfigure(0, weight=1)
+        self.search_term_tab.rowconfigure(0, weight=1)
+
+        self.search_term_frame = SearchTermFrame(
+            self.search_term_tab,
+            on_change=lambda: self._write_live_section("search_terms"),
+        )
+        self.search_term_frame.grid(row=0, column=0, sticky="nsew")
 
         self.oe_frame = OeNumberTableFrame(
             self.oe_tab,
@@ -7875,6 +9189,12 @@ if ($copied) {{
             on_change=lambda: self._write_live_section("comparison_numbers"),
         )
         self.comparison_frame.grid(row=0, column=0, sticky="nsew")
+
+        self.vehicle_link_frame = VehicleLinkTableFrame(
+            self.vehicle_tab,
+            on_change=lambda: self._write_live_section("vehicle_links"),
+        )
+        self.vehicle_link_frame.grid(row=0, column=0, sticky="nsew")
 
     def _build_media_tabs(self) -> None:
         self.image_tab.columnconfigure(0, weight=1)
@@ -8011,6 +9331,187 @@ if ($copied) {{
     def _reload_attribute_key_value_catalog(self) -> None:
         self._load_attribute_key_value_catalog()
 
+    def choose_vehicle_source_file(self) -> None:
+        initial_dir = (
+            str(Path(self.vehicle_source_path_var.get()).parent)
+            if self.vehicle_source_path_var.get().strip()
+            else str(DEFAULT_VEHICLE_SOURCE.parent)
+        )
+        selected = filedialog.askopenfilename(
+            title="KTyp XLSX waehlen",
+            initialdir=initial_dir,
+            filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
+        )
+        if selected:
+            self.vehicle_source_path_var.set(selected)
+            self._load_vehicle_catalog()
+
+    def _reload_vehicle_catalog(self) -> None:
+        self._load_vehicle_catalog()
+
+    def choose_attribute_mapping_source_file(self) -> None:
+        initial_dir = (
+            str(Path(self.attribute_mapping_source_path_var.get()).parent)
+            if self.attribute_mapping_source_path_var.get().strip()
+            else str(DEFAULT_ATTRIBUTE_MAPPING_SOURCE.parent)
+        )
+        selected = filedialog.askopenfilename(
+            title="Attribut-Zuordnung XLSX waehlen",
+            initialdir=initial_dir,
+            filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
+        )
+        if selected:
+            self.attribute_mapping_source_path_var.set(selected)
+            self._load_attribute_mapping()
+
+    def _reload_attribute_mapping(self) -> None:
+        self._load_attribute_mapping()
+
+    def _load_attribute_mapping(self, initial: bool = False) -> None:
+        source_text = self.attribute_mapping_source_path_var.get().strip()
+        source_path = Path(source_text) if source_text else None
+        if source_path is None or not path_exists_safe(source_path):
+            self.attribute_mapping = {}
+            self.attribute_mapping_count_var.set("0 Zuordnungen geladen")
+            if not initial and source_path is not None:
+                self.status_var.set(f"Attribut-Zuordnung nicht gefunden: {source_path}")
+            return
+        try:
+            self.attribute_mapping = load_attribute_mapping(source_path)
+        except ValueError as exc:
+            self.attribute_mapping = {}
+            self.attribute_mapping_count_var.set("0 Zuordnungen geladen")
+            if not initial:
+                self.status_var.set(str(exc))
+                messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        self.attribute_mapping_count_var.set(f"{len(self.attribute_mapping)} Zuordnungen geladen")
+        if not initial:
+            self.status_var.set(f"Attribut-Zuordnung geladen: {len(self.attribute_mapping)} Eintraege")
+
+    def _open_attribute_suggestion_dialog(self, auto: bool = False) -> None:
+        text = "\n".join(
+            part
+            for part in [self.short_text_frame.get_german_text(), self.long_text_frame.get_german_text()]
+            if part.strip()
+        )
+        if not text.strip():
+            if not auto:
+                messagebox.showinfo(APP_TITLE, "Kein deutscher Text vorhanden, aus dem Attribute gelesen werden koennten.")
+            return
+        if not self.attribute_options_by_id:
+            if not auto:
+                messagebox.showwarning(APP_TITLE, "Es ist keine Attributliste geladen (Datenstaemme im Projekt-Tab).")
+            return
+        suggestions, unmatched = build_attribute_suggestions_from_text(
+            text,
+            self.attribute_mapping,
+            self.attribute_options_by_id,
+            self.attribute_key_values_by_group,
+        )
+        if not suggestions and not unmatched:
+            if not auto:
+                messagebox.showinfo(APP_TITLE, "Im Text wurden keine technischen Angaben erkannt.")
+            return
+        if auto and not suggestions:
+            return
+        AttributeSuggestionDialog(
+            self.root,
+            suggestions=suggestions,
+            unmatched=unmatched,
+            attribute_options=self.attribute_options,
+            on_apply=self._apply_attribute_suggestions,
+        )
+
+    def _apply_attribute_suggestions(self, rows: list[AttributeRow], learned: list[tuple[str, str]]) -> None:
+        added = 0
+        if rows:
+            existing = self.attribute_frame.get_rows()
+            seen = {(row.criteria_id, row.value.casefold(), row.value_to.casefold()) for row in existing}
+            new_rows = []
+            for row in rows:
+                key = (row.criteria_id, row.value.casefold(), row.value_to.casefold())
+                if key in seen:
+                    continue
+                seen.add(key)
+                new_rows.append(row)
+            if new_rows:
+                self.attribute_frame.set_rows(existing + new_rows)
+                added = len(new_rows)
+                self._write_live_section("attributes", status_message=f"{added} Attribut(e) aus Text uebernommen")
+
+        if learned:
+            source_text = self.attribute_mapping_source_path_var.get().strip() or str(DEFAULT_ATTRIBUTE_MAPPING_SOURCE)
+            source_path = Path(source_text)
+            entries = []
+            for label, criteria_id in learned:
+                key = normalize_mapping_label(label)
+                if not key or self.attribute_mapping.get(key) == criteria_id:
+                    continue
+                option = self.attribute_options_by_id.get(criteria_id)
+                entries.append((label, criteria_id, option.label if option is not None else "gelernt aus Vorschlagsdialog"))
+                self.attribute_mapping[key] = criteria_id
+            if entries:
+                try:
+                    append_attribute_mapping_entries(source_path, entries)
+                    self.attribute_mapping_source_path_var.set(str(source_path))
+                    self.attribute_mapping_count_var.set(f"{len(self.attribute_mapping)} Zuordnungen geladen")
+                    self.status_var.set(
+                        f"{added} Attribut(e) uebernommen, {len(entries)} Zuordnung(en) gemerkt."
+                    )
+                except Exception as exc:  # pragma: no cover - defensive UI feedback
+                    messagebox.showwarning(APP_TITLE, f"Zuordnung konnte nicht gespeichert werden:\n{exc}")
+        elif added == 0:
+            self.status_var.set("Keine neuen Attribute uebernommen.")
+
+    def _apply_vehicle_catalog(self, catalog: VehicleCatalog) -> None:
+        self.vehicle_catalog = catalog
+        if hasattr(self, "vehicle_link_frame"):
+            self.vehicle_link_frame.set_vehicle_catalog(catalog)
+        self.vehicle_count_var.set(f"{catalog.count} KTyp-Datensaetze geladen")
+
+    def _load_vehicle_catalog(self, initial: bool = False) -> None:
+        source_text = self.vehicle_source_path_var.get().strip()
+        source_path = Path(source_text) if source_text else None
+        if source_path is None or not path_exists_safe(source_path):
+            self._apply_vehicle_catalog(VehicleCatalog())
+            if not initial and source_path is not None:
+                self.status_var.set(f"KTyp-Datei nicht gefunden: {source_path}")
+            return
+
+        if self.vehicle_catalog_loading:
+            return
+        self.vehicle_catalog_loading = True
+        self.vehicle_count_var.set("KTyp-Stammdaten werden geladen ...")
+        if not initial:
+            self.status_var.set(f"KTyp-Stammdaten werden geladen: {source_path}")
+
+        def worker() -> None:
+            error: Exception | None = None
+            catalog = VehicleCatalog()
+            try:
+                catalog = load_vehicle_catalog(source_path)
+            except Exception as exc:  # pragma: no cover - defensive UI feedback
+                error = exc
+
+            def finish() -> None:
+                self.vehicle_catalog_loading = False
+                if error is not None:
+                    self._apply_vehicle_catalog(VehicleCatalog())
+                    self.vehicle_count_var.set("KTyp-Datei konnte nicht geladen werden")
+                    if not initial:
+                        self.status_var.set(f"KTyp-Datei konnte nicht geladen werden: {error}")
+                        messagebox.showwarning(APP_TITLE, f"KTyp-Datei konnte nicht geladen werden:\n{error}")
+                    return
+                self._apply_vehicle_catalog(catalog)
+                self.article_browser_cache_signature = None
+                if not initial:
+                    self.status_var.set(f"KTyp-Stammdaten geladen: {catalog.count} Datensaetze")
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def choose_competitor_source_file(self) -> None:
         initial_dir = (
             str(Path(self.competitor_source_path_var.get()).parent)
@@ -8033,7 +9534,6 @@ if ($copied) {{
         source_path = Path(self.genart_source_path_var.get().strip()) if self.genart_source_path_var.get().strip() else None
         if source_path is None or not path_exists_safe(source_path):
             self.genart_registry = GenArtRegistry()
-            self.genart_image_index_dirty = True
             self.genart_count_var.set("0 GenArts geladen")
             if self.selected_genart_selections:
                 self.genart_suggestion_var.set(
@@ -8051,7 +9551,6 @@ if ($copied) {{
         try:
             count = self.genart_registry.load_from_workbook(source_path)
         except Exception as exc:
-            self.genart_image_index_dirty = True
             self.genart_count_var.set("0 GenArts geladen")
             if self.selected_genart_selections:
                 self.genart_suggestion_var.set(
@@ -8067,7 +9566,6 @@ if ($copied) {{
             return
 
         self.genart_count_var.set(f"{count} GenArts geladen")
-        self.genart_image_index_dirty = True
         if self.genart_suggestions is not None:
             self._refresh_genart_combobox_values()
         if self.selected_genart_selections:
@@ -8077,7 +9575,7 @@ if ($copied) {{
             )
         else:
             self.genart_suggestion_var.set(
-                "GenArt-Katalog geladen. Du kannst im Feld tippen, ueber 'Suchen...' gezielt filtern oder Vorschlaege nutzen."
+                "GenArt-Katalog geladen. Du kannst im Feld tippen oder ueber 'Suchen...' gezielt filtern."
             )
         if self.genart_display_var.get().strip():
             self._normalize_genart_selection()
@@ -8417,354 +9915,6 @@ if ($copied) {{
         self.genart_display_var.set(self._canonicalize_genart_selection(parsed_selection).display_label())
         return True
 
-    def _get_selected_genart(self) -> GenArtOption | None:
-        return self.genart_registry.resolve(self.genart_display_var.get())
-
-    def _set_genart_option(self, option: GenArtOption | None) -> None:
-        if option is None:
-            self.genart_display_var.set("")
-            self._refresh_genart_combobox_values()
-            return
-        self.genart_display_var.set(option.display_label())
-        self._refresh_genart_combobox_values()
-
-    def _build_genart_image_context(self, image_rows: list[MediaRow]) -> str:
-        parts = [extract_match_text_from_path_or_link(row.path_or_link) for row in image_rows[:3] if row.path_or_link.strip()]
-        return " ".join(part for part in parts if part).strip()
-
-    def _get_image_signature_for_path(self, path_or_link: str) -> ImageSignature | None:
-        key = path_or_link.strip()
-        if not key or Image is None:
-            return None
-        if key not in self.genart_image_signature_cache:
-            try:
-                self.genart_image_signature_cache[key] = build_image_signature(key)
-            except Exception:  # pragma: no cover - depends on user files/network
-                self.genart_image_signature_cache[key] = None
-        return self.genart_image_signature_cache[key]
-
-    def _ensure_genart_image_index(self) -> None:
-        if not self.genart_image_index_dirty:
-            return
-
-        references: list[tuple[str, str, ImageSignature]] = []
-        references_per_genart: dict[str, int] = {}
-        for article_number in sorted(self.article_browser_records):
-            if len(references) >= 400:
-                break
-            snapshot = self.article_browser_records[article_number]
-            if not snapshot.genart_selections or not snapshot.image_rows:
-                continue
-
-            for row in snapshot.image_rows[:3]:
-                signature = self._get_image_signature_for_path(row.path_or_link)
-                if signature is None:
-                    continue
-                for selection in snapshot.genart_selections:
-                    option = self.genart_registry.resolve(selection.id) or self.genart_registry.resolve(selection.bezeichnung)
-                    if option is None:
-                        continue
-                    if references_per_genart.get(option.id, 0) >= 10:
-                        continue
-                    references.append((article_number, option.id, signature))
-                    references_per_genart[option.id] = references_per_genart.get(option.id, 0) + 1
-                break
-
-        self.genart_image_reference_index = references
-        self.genart_image_index_dirty = False
-
-    def _suggest_genart_from_images(self, image_rows: list[MediaRow], limit: int = 5) -> list[tuple[GenArtOption, float]]:
-        if Image is None:
-            return []
-
-        current_signatures = [
-            signature
-            for signature in (self._get_image_signature_for_path(row.path_or_link) for row in image_rows[:3])
-            if signature is not None
-        ]
-        if not current_signatures:
-            return []
-
-        self._ensure_genart_image_index()
-        if not self.genart_image_reference_index:
-            return []
-
-        best_scores_by_id: dict[str, float] = {}
-        matched_articles_by_id: dict[str, set[str]] = {}
-        for current_signature in current_signatures:
-            for article_number, option_id, reference_signature in self.genart_image_reference_index:
-                similarity = compare_image_signatures(current_signature, reference_signature)
-                if similarity < 0.58:
-                    continue
-                score = max(0.0, (similarity - 0.55) * 720)
-                if score <= 0:
-                    continue
-                best_scores_by_id[option_id] = max(best_scores_by_id.get(option_id, 0.0), score)
-                matched_articles_by_id.setdefault(option_id, set()).add(article_number)
-
-        suggestions: list[tuple[GenArtOption, float]] = []
-        for option_id, score in best_scores_by_id.items():
-            option = self.genart_registry.resolve(option_id)
-            if option is None:
-                continue
-            article_bonus = min(max(len(matched_articles_by_id.get(option_id, set())) - 1, 0) * 18, 54)
-            suggestions.append((option, score + article_bonus))
-
-        suggestions.sort(key=lambda item: (-item[1], item[0].display_label()))
-        return suggestions[:limit]
-
-    def _should_use_google_lens(self) -> bool:
-        return self.google_lens_enabled_var.get()
-
-    def _build_genart_source_label(self, suggestion: GenArtSuggestion) -> str:
-        source_parts: list[str] = []
-        if suggestion.web_score > 0:
-            source_parts.append("Google Lens")
-        if suggestion.text_score > 0:
-            source_parts.append("Text")
-        if suggestion.image_score > 0:
-            source_parts.append("Bild")
-        return " + ".join(source_parts) if source_parts else "Regel"
-
-    def _get_google_lens_result_for_path(self, path_or_link: str) -> GoogleLensWebResult | None:
-        key = path_or_link.strip()
-        if not key:
-            return None
-        if key not in self.google_lens_web_cache:
-            try:
-                client = GoogleLensScraper()
-                self.google_lens_web_cache[key] = client.detect_web(key)
-            except Exception:  # pragma: no cover - depends on user files/network
-                self.google_lens_web_cache[key] = None
-        return self.google_lens_web_cache[key]
-
-    def _collect_local_genart_suggestions(
-        self,
-        short_text: str,
-        long_text: str,
-        image_rows: list[MediaRow],
-        category_context: str = "",
-        limit: int = 5,
-    ) -> list[GenArtSuggestion]:
-        if not self.genart_registry.options:
-            return []
-
-        image_context = self._build_genart_image_context(image_rows)
-        text_suggestions = self.genart_registry.suggest(
-            short_text,
-            long_text,
-            image_context=image_context,
-            category_context=category_context,
-            limit=max(limit * 6, 24),
-        )
-        image_suggestions = self._suggest_genart_from_images(image_rows, limit=max(limit * 6, 24))
-
-        combined_scores: dict[str, dict[str, object]] = {}
-        for option, score in text_suggestions:
-            combined_scores.setdefault(option.id, {"option": option, "text": 0.0, "image": 0.0})
-            combined_scores[option.id]["text"] = score
-        for option, score in image_suggestions:
-            combined_scores.setdefault(option.id, {"option": option, "text": 0.0, "image": 0.0})
-            combined_scores[option.id]["image"] = score
-
-        suggestions: list[GenArtSuggestion] = []
-        for data in combined_scores.values():
-            option = data["option"]
-            text_score = float(data["text"])
-            image_score = float(data["image"])
-            synergy_bonus = 55.0 if text_score > 0 and image_score > 0 else 0.0
-            total_score = text_score + image_score + synergy_bonus
-            suggestions.append(
-                GenArtSuggestion(
-                    option=option,
-                    total_score=total_score,
-                    text_score=text_score,
-                    image_score=image_score,
-                )
-            )
-
-        suggestions.sort(key=lambda item: (-item.total_score, -item.image_score, -item.text_score, item.option.display_label()))
-        return suggestions[:limit]
-
-    def _collect_google_lens_result(self, image_rows: list[MediaRow], limit: int = 2) -> GoogleLensWebResult | None:
-        if not self._should_use_google_lens():
-            return None
-
-        aggregated = GoogleLensWebResult()
-        for row in image_rows:
-            result = self._get_google_lens_result_for_path(row.path_or_link)
-            if result is None:
-                continue
-
-            for title in result.headline_lines:
-                if title not in aggregated.headline_lines:
-                    aggregated.headline_lines.append(title)
-            for title in result.result_titles:
-                if title not in aggregated.result_titles:
-                    aggregated.result_titles.append(title)
-            for snippet in result.result_snippets:
-                if snippet not in aggregated.result_snippets:
-                    aggregated.result_snippets.append(snippet)
-            for page_url in result.page_urls:
-                if page_url not in aggregated.page_urls:
-                    aggregated.page_urls.append(page_url)
-
-            if len(aggregated.headline_lines) >= 10 and len(aggregated.result_titles) >= 20:
-                break
-            limit -= 1
-            if limit <= 0:
-                break
-
-        if not aggregated.as_context_text():
-            return None
-        return aggregated
-
-    def _build_google_lens_reason(self, result: GoogleLensWebResult) -> str:
-        parts: list[str] = []
-        if result.headline_lines:
-            parts.append("Lens: " + ", ".join(result.headline_lines[:3]))
-        if result.result_titles:
-            parts.append("Seiten: " + ", ".join(result.result_titles[:3]))
-        return " | ".join(parts)
-
-    def _collect_google_lens_genart_suggestions(
-        self,
-        short_text: str,
-        long_text: str,
-        image_rows: list[MediaRow],
-        category_context: str = "",
-        limit: int = 5,
-    ) -> list[GenArtSuggestion]:
-        web_result = self._collect_google_lens_result(image_rows)
-        if web_result is None:
-            return []
-
-        web_context = web_result.as_context_text()
-        suggestions = self.genart_registry.suggest(
-            short_text="",
-            long_text="",
-            image_context="",
-            category_context=category_context,
-            web_context=web_context,
-            limit=max(limit * 6, 24),
-        )
-        reason = self._build_google_lens_reason(web_result)
-        return [
-            GenArtSuggestion(
-                option=option,
-                total_score=score,
-                web_score=score,
-                web_reason=reason,
-            )
-            for option, score in suggestions[:limit]
-        ]
-
-    def _collect_genart_suggestions(
-        self,
-        short_text: str,
-        long_text: str,
-        image_rows: list[MediaRow],
-        category_context: str = "",
-        limit: int = 5,
-    ) -> list[GenArtSuggestion]:
-        local_suggestions = self._collect_local_genart_suggestions(
-            short_text,
-            long_text,
-            image_rows,
-            category_context=category_context,
-            limit=max(limit * 8, 40),
-        )
-        suggestion_map: dict[str, GenArtSuggestion] = {
-            suggestion.option.id: GenArtSuggestion(
-                option=suggestion.option,
-                total_score=suggestion.total_score,
-                text_score=suggestion.text_score,
-                image_score=suggestion.image_score,
-                web_score=suggestion.web_score,
-                web_reason=suggestion.web_reason,
-            )
-            for suggestion in local_suggestions
-        }
-
-        try:
-            web_suggestions = self._collect_google_lens_genart_suggestions(
-                short_text,
-                long_text,
-                image_rows,
-                category_context=category_context,
-                limit=max(limit * 8, 40),
-            )
-        except GoogleLensScrapeError as exc:
-            self.status_var.set(f"Google Lens Fallback: {exc}")
-            web_suggestions = []
-
-        for web_suggestion in web_suggestions:
-            existing = suggestion_map.get(web_suggestion.option.id)
-            if existing is None:
-                existing = web_suggestion
-                suggestion_map[web_suggestion.option.id] = existing
-            else:
-                existing.web_score = max(existing.web_score, web_suggestion.web_score)
-                if web_suggestion.web_reason:
-                    existing.web_reason = web_suggestion.web_reason
-                existing.total_score += web_suggestion.web_score
-
-        suggestions = list(suggestion_map.values())
-        suggestions.sort(
-            key=lambda item: (
-                -item.total_score,
-                -item.web_score,
-                -item.image_score,
-                -item.text_score,
-                item.option.display_label(),
-            )
-        )
-        return suggestions[:limit]
-
-    def _suggest_genart_option(self) -> tuple[GenArtOption | None, float]:
-        if not self.genart_registry.options:
-            return None, 0.0
-        suggestions = self._collect_genart_suggestions(
-            self.short_text_frame.get_german_text(),
-            self.long_text_frame.get_german_text(),
-            self.image_frame.get_rows(),
-            category_context=self.current_kunzer_category_context,
-        )
-        if not suggestions:
-            return None, 0.0
-        return suggestions[0].option, suggestions[0].total_score
-
-    def suggest_genart_for_current_article(self) -> None:
-        if not self.genart_registry.options:
-            self._load_genart_catalog()
-        suggestions = self._collect_genart_suggestions(
-            self.short_text_frame.get_german_text(),
-            self.long_text_frame.get_german_text(),
-            self.image_frame.get_rows(),
-            category_context=self.current_kunzer_category_context,
-        )
-        if not suggestions:
-            self.genart_suggestion_var.set("Keine passende GenArt gefunden.")
-            messagebox.showinfo(APP_TITLE, "Es konnte keine passende GenArt vorgeschlagen werden.")
-            return
-
-        suggestion = suggestions[0]
-        option = suggestion.option
-        source_label = self._build_genart_source_label(suggestion)
-        alternative_labels = ", ".join(candidate.option.display_label() for candidate in suggestions[1:3])
-
-        message = f"Vorschlag uebernommen: {option.display_label()} ({source_label}, Score {suggestion.total_score:.0f})"
-        if suggestion.web_reason:
-            message += f" | Google: {suggestion.web_reason}"
-        if alternative_labels:
-            message += f" | Alternativen: {alternative_labels}"
-        added = self._add_genart_selection(
-            GenArtSelection(id=option.id, bezeichnung=option.bezeichnung),
-            suggestion_message=message,
-        )
-        if not added:
-            self.genart_suggestion_var.set(f"GenArt bereits gesetzt: {option.display_label()}")
-
     def _on_genart_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
         self._normalize_genart_selection()
 
@@ -8803,7 +9953,9 @@ if ($copied) {{
             web_rows=bundle.web_rows,
             oe_number_rows=bundle.oe_number_rows,
             comparison_number_rows=bundle.comparison_number_rows,
+            vehicle_link_rows=bundle.vehicle_link_rows,
             attribute_rows=bundle.attribute_rows,
+            search_terms=list(bundle.search_terms),
         )
 
     def _copy_snapshot(self, snapshot: StoredArticleSnapshot) -> StoredArticleSnapshot:
@@ -8842,6 +9994,22 @@ if ($copied) {{
                 )
                 for row in snapshot.comparison_number_rows
             ],
+            vehicle_link_rows=[
+                VehicleLinkRow(
+                    vehicle_type_id=row.vehicle_type_id,
+                    vehicle_type_label=row.vehicle_type_label,
+                    motorcode=row.motorcode,
+                    ktyp_topmotive=row.ktyp_topmotive,
+                    ktyp_tecdoc=row.ktyp_tecdoc,
+                    manufacturer=row.manufacturer,
+                    model=row.model,
+                    description=row.description,
+                    year_from=row.year_from,
+                    year_to=row.year_to,
+                    power=row.power,
+                )
+                for row in snapshot.vehicle_link_rows
+            ],
             attribute_rows=[
                 AttributeRow(
                     criteria_id=row.criteria_id,
@@ -8854,6 +10022,7 @@ if ($copied) {{
                 )
                 for row in snapshot.attribute_rows
             ],
+            search_terms=list(snapshot.search_terms),
         )
 
     def _render_article_browser(self, current_article: str | None = None) -> None:
@@ -8901,6 +10070,7 @@ if ($copied) {{
             GENART_FILE[0],
             OE_FILE[0],
             COMPARISON_FILE[0],
+            VEHICLE_LINK_FILE[0],
             ATTRIBUTE_FILE[0],
             IMAGE_FILE[0],
             DOCUMENT_FILE[0],
@@ -8917,7 +10087,6 @@ if ($copied) {{
 
     def _upsert_article_browser_from_bundle(self, bundle: ExportBundle, output_root: Path) -> None:
         self.article_browser_records[bundle.article_number] = self._snapshot_from_bundle(bundle, output_root)
-        self.genart_image_index_dirty = True
         self.article_browser_cache_dir = str(output_root)
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
@@ -8982,6 +10151,23 @@ if ($copied) {{
                 )
                 for row in bundle.comparison_number_rows
             ]
+        if section in {"vehicle_links", "all"}:
+            snapshot.vehicle_link_rows = [
+                VehicleLinkRow(
+                    vehicle_type_id=row.vehicle_type_id,
+                    vehicle_type_label=row.vehicle_type_label,
+                    motorcode=row.motorcode,
+                    ktyp_topmotive=row.ktyp_topmotive,
+                    ktyp_tecdoc=row.ktyp_tecdoc,
+                    manufacturer=row.manufacturer,
+                    model=row.model,
+                    description=row.description,
+                    year_from=row.year_from,
+                    year_to=row.year_to,
+                    power=row.power,
+                )
+                for row in bundle.vehicle_link_rows
+            ]
         if section in {"attributes", "all"}:
             snapshot.attribute_rows = [
                 AttributeRow(
@@ -8995,9 +10181,10 @@ if ($copied) {{
                 )
                 for row in bundle.attribute_rows
             ]
+        if section in {"search_terms", "all"}:
+            snapshot.search_terms = list(bundle.search_terms)
 
         self.article_browser_records[bundle.article_number] = snapshot
-        self.genart_image_index_dirty = True
         self.article_browser_cache_dir = str(output_root)
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
@@ -9058,6 +10245,15 @@ if ($copied) {{
             build_comparison_export_rows(bundle),
         )
 
+    def _write_vehicle_link_live(self, bundle: ExportBundle, output_root: Path) -> None:
+        replace_article_rows_preserving_timestamps(
+            output_root / VEHICLE_LINK_FILE[0],
+            VEHICLE_LINK_FILE[1],
+            VEHICLE_LINK_HEADERS,
+            bundle.article_number,
+            build_vehicle_link_export_rows(bundle),
+        )
+
     def _write_attribute_live(self, bundle: ExportBundle, output_root: Path) -> None:
         replace_article_rows_preserving_timestamps(
             output_root / ATTRIBUTE_FILE[0],
@@ -9105,7 +10301,12 @@ if ($copied) {{
                 self._write_oe_live(bundle, output_root)
             elif section == "comparison_numbers":
                 self._write_comparison_live(bundle, output_root)
+            elif section == "vehicle_links":
+                self._write_vehicle_link_live(bundle, output_root)
             elif section == "attributes":
+                self._write_attribute_live(bundle, output_root)
+            elif section == "search_terms":
+                # Suchwoerter liegen mit in der Attribute-Datei.
                 self._write_attribute_live(bundle, output_root)
             elif section == "images":
                 self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
@@ -9241,18 +10442,6 @@ if ($copied) {{
         short_texts = self._build_translation_set(result.short_text_de, client, sanitize_short_text=True) if scrape_options["short_text"] else TranslationSet()
         long_texts = self._build_translation_set(result.long_text_de, client) if scrape_options["long_text"] else TranslationSet()
         image_rows = [MediaRow(link, art="5", sprache="255") for link in result.image_links] if scrape_options["images"] else []
-        genart_suggestions = self._collect_genart_suggestions(
-            result.short_text_de,
-            result.long_text_de,
-            image_rows,
-            category_context=result.breadcrumb_text,
-            limit=1,
-        )
-        suggested_genart = (
-            genart_suggestions[0].option
-            if genart_suggestions and genart_suggestions[0].total_score >= GENART_AUTO_APPLY_MIN_SCORE
-            else None
-        )
         return ExportBundle(
             article_number=article_number,
             short_module_id=short_module_id,
@@ -9261,9 +10450,6 @@ if ($copied) {{
             short_auto_uni=True,
             long_texts=long_texts,
             long_auto_uni=True,
-            genart_selections=[GenArtSelection(id=suggested_genart.id, bezeichnung=suggested_genart.bezeichnung)] if suggested_genart else [],
-            genart_id=suggested_genart.id if suggested_genart else "",
-            genart_bezeichnung=suggested_genart.bezeichnung if suggested_genart else "",
             image_rows=image_rows,
             document_rows=[MediaRow(link, art=infer_document_art(link), sprache="255") for link in result.document_links] if scrape_options["documents"] else [],
             video_rows=[MediaRow(link) for link in result.video_links] if scrape_options["videos"] else [],
@@ -9291,7 +10477,6 @@ if ($copied) {{
                 self.article_number_var.set(normalize_article_number(result.article_number))
             self._ensure_ids_for_article(self.article_number_var.get())
             self.kunzer_product_url_var.set(result.product_url)
-            self.current_kunzer_category_context = result.breadcrumb_text
 
             self.short_text_frame.set_value(
                 TranslationSet(de=result.short_text_de, uni=result.short_text_de),
@@ -9321,32 +10506,11 @@ if ($copied) {{
             self.video_frame.set_rows(video_rows)
             self.web_frame.set_rows(web_rows)
             self.attribute_frame.set_rows([])
+            self.search_term_frame.set_terms([])
             self.oe_frame.set_rows([])
             self.comparison_frame.set_rows([])
-            suggestions = self._collect_genart_suggestions(
-                result.short_text_de,
-                result.long_text_de,
-                image_rows,
-                category_context=result.breadcrumb_text,
-                limit=3,
-            )
-            if suggestions and suggestions[0].total_score >= GENART_AUTO_APPLY_MIN_SCORE:
-                suggestion = suggestions[0]
-                self._set_selected_genart_selections([GenArtSelection(id=suggestion.option.id, bezeichnung=suggestion.option.bezeichnung)])
-                self._set_genart_option(suggestion.option)
-                source_label = self._build_genart_source_label(suggestion)
-                self.genart_suggestion_var.set(
-                    f"Automatisch vorgeschlagen: {suggestion.option.display_label()} ({source_label}, Score {suggestion.total_score:.0f})"
-                )
-            elif suggestions:
-                suggestion = suggestions[0]
-                self._set_genart_option(suggestion.option)
-                source_label = self._build_genart_source_label(suggestion)
-                self.genart_suggestion_var.set(
-                    f"Vorschlag pruefen: {suggestion.option.display_label()} ({source_label}, Score {suggestion.total_score:.0f})"
-                )
-            else:
-                self.genart_suggestion_var.set("Keine passende GenArt gefunden.")
+            self.vehicle_link_frame.set_rows([])
+            self.genart_suggestion_var.set("GenArt bitte ueber das Suchfeld oder 'Suchen...' auswaehlen.")
 
         if translate_after_load and self.auto_translate_after_scrape_var.get() and self.deepl_api_key_var.get().strip():
             self._translate_loaded_texts()
@@ -9354,6 +10518,8 @@ if ($copied) {{
         self.refresh_preview()
         if write_live:
             self._write_live_database(status_message=f"Live gespeichert: {normalize_article_number(result.article_number)}")
+        # Nach dem Laden automatisch Attributvorschlaege aus dem Text anbieten.
+        self.root.after(200, lambda: self._open_attribute_suggestion_dialog(auto=True))
 
     def _translate_loaded_texts(self) -> None:
         client = self._build_deepl_client()
@@ -9469,8 +10635,10 @@ if ($copied) {{
             else:
                 self.long_text_frame.set_value(TranslationSet(), auto_uni=True)
             self.attribute_frame.set_rows(last_bundle.attribute_rows)
+            self.search_term_frame.set_terms(last_bundle.search_terms)
             self.oe_frame.set_rows(last_bundle.oe_number_rows)
             self.comparison_frame.set_rows(last_bundle.comparison_number_rows)
+            self.vehicle_link_frame.set_rows(last_bundle.vehicle_link_rows)
             if not last_bundle.include_images:
                 self.image_frame.set_rows([])
             if not last_bundle.include_documents:
@@ -9619,7 +10787,6 @@ if ($copied) {{
 
     def load_demo_data(self) -> None:
         with self._suspend_live_write():
-            self.current_kunzer_category_context = ""
             self.article_number_var.set("WK DEMO-1000")
             self._ensure_ids_for_article(self.article_number_var.get())
             self._set_selected_genart_selections([])
@@ -9681,6 +10848,24 @@ if ($copied) {{
                     ComparisonNumberRow(competitor_id="521", competitor_code="VALEO", competitor_name="VALEO", reference_number="574385"),
                 ]
             )
+            self.vehicle_link_frame.set_rows(
+                [
+                    VehicleLinkRow(
+                        vehicle_type_id="2",
+                        vehicle_type_label="PKW",
+                        motorcode="K9K",
+                        ktyp_topmotive="21468",
+                        ktyp_tecdoc="5840",
+                        manufacturer="Renault",
+                        model="Clio 4 (BH)",
+                        description="1.5 dCi",
+                        year_from="11.2012",
+                        year_to="",
+                        power="66 kW / 90 PS",
+                    ),
+                ]
+            )
+            self.search_term_frame.set_terms(["Wagenheber", "Rangierheber 10t"])
         self.status_var.set("Beispieldaten geladen.")
         self.refresh_preview()
         self._write_live_database(status_message="Live gespeichert: WK DEMO-1000")
@@ -9705,12 +10890,12 @@ if ($copied) {{
                 manufacturer_lookup=self.manufacturer_options_by_id,
                 attribute_lookup=self.attribute_options_by_id,
                 attribute_key_values_by_group=self.attribute_key_values_by_group,
+                vehicle_catalog=self.vehicle_catalog,
             )
 
         self.article_browser_records = records
         self.article_browser_cache_dir = str(output_folder)
         self.article_browser_cache_signature = signature
-        self.genart_image_index_dirty = True
         self._render_article_browser()
 
     def _update_article_browser_detail(self, snapshot: StoredArticleSnapshot | None) -> None:
@@ -9742,7 +10927,6 @@ if ($copied) {{
         self.article_browser_detail.configure(state="disabled")
 
     def _apply_article_snapshot(self, snapshot: StoredArticleSnapshot) -> None:
-        self.current_kunzer_category_context = ""
         self.article_number_var.set(snapshot.article_number)
         self.current_id_article_number = snapshot.article_number
         self.short_module_id_var.set(snapshot.short_module_id)
@@ -9759,8 +10943,10 @@ if ($copied) {{
         self.short_text_frame.set_value(snapshot.short_texts, auto_uni=snapshot.short_auto_uni)
         self.long_text_frame.set_value(snapshot.long_texts, auto_uni=snapshot.long_auto_uni)
         self.attribute_frame.set_rows(snapshot.attribute_rows)
+        self.search_term_frame.set_terms(snapshot.search_terms)
         self.oe_frame.set_rows(snapshot.oe_number_rows)
         self.comparison_frame.set_rows(snapshot.comparison_number_rows)
+        self.vehicle_link_frame.set_rows(snapshot.vehicle_link_rows)
         self.image_frame.set_rows(snapshot.image_rows)
         self.document_frame.set_rows(snapshot.document_rows)
         self.video_frame.set_rows(snapshot.video_rows)
@@ -9895,9 +11081,11 @@ if ($copied) {{
             long_auto_uni=self.long_text_frame.auto_uni_var.get(),
             genart_selections=self._get_selected_genart_selections(),
             attribute_rows=self.attribute_frame.get_rows(),
+            search_terms=self.search_term_frame.get_terms(),
             attribute_key_values_by_group=self.attribute_key_values_by_group,
             oe_number_rows=self.oe_frame.get_rows(),
             comparison_number_rows=self.comparison_frame.get_rows(),
+            vehicle_link_rows=self.vehicle_link_frame.get_rows(),
             image_rows=self.image_frame.get_rows(),
             document_rows=self.document_frame.get_rows(),
             video_rows=self.video_frame.get_rows(),
