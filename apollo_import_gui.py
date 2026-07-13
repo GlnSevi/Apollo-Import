@@ -8694,6 +8694,17 @@ if ($copied) {{
         except Exception:
             pass
 
+        # Der PowerShell-Prozess erbt die Bootloader-Variablen der laufenden
+        # Onefile-EXE (_PYI_*). Ohne Bereinigung haelt sich die danach neu
+        # gestartete EXE fuer den Extraktions-Kindprozess der alten, bereits
+        # beendeten Instanz und bricht mit einem Bootloader-Fehler ab.
+        launch_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "_MEIPASS2" and not key.startswith("_PYI_")
+        }
+        launch_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+
         subprocess.Popen(
             [
                 "powershell",
@@ -8706,6 +8717,7 @@ if ($copied) {{
                 str(script_path),
             ],
             close_fds=True,
+            env=launch_env,
         )
         self.status_var.set(f"Update wird installiert: {release.tag_name}")
         messagebox.showinfo(
