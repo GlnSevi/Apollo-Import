@@ -138,8 +138,9 @@ Der Export erzeugt `Fahrzeugverknuepfungen.xlsx` mit den Spalten:
 - `Fahrzeugtyp` (fuer den Apollo-Import auf `TecDoc Verknuepfungstyp ID` mappen, `PKW = 2`)
 - `KTypNr` (fuer den Apollo-Import auf `TecDoc Verknuepfungs ID` mappen)
 - `KTyp-System` (Info, ob die `KTypNr` aus dem `Topmotive`- oder `TecDoc`-Nummernkreis stammt)
+- `GenArt ID` und `GenArt Bezeichnung` (die GenArt des Artikels aus dem GenArt-Tab)
 
-Pro Fahrzeug werden zwei Zeilen geschrieben: eine mit der TopMotive-Nummer und eine mit der TecDoc-Nummer. So kann im Apollo-Import genau die eine passende Spalte auf `TecDoc Verknuepfungs ID` gemappt werden. Ueber die Spalte `KTyp-System` lassen sich die Zeilen bei Bedarf vorher filtern.
+Pro Fahrzeug werden zwei Zeilen geschrieben: eine mit der TopMotive-Nummer und eine mit der TecDoc-Nummer. So kann im Apollo-Import genau die eine passende Spalte auf `TecDoc Verknuepfungs ID` gemappt werden. Ueber die Spalte `KTyp-System` lassen sich die Zeilen bei Bedarf vorher filtern. Jede Zeile traegt zusaetzlich die GenArt des Artikels; sind einem Artikel mehrere GenArts zugeordnet, wird je GenArt und KTyp-Nummer eine eigene Zeile geschrieben. Bestehende `Fahrzeugverknuepfungen.xlsx` ohne GenArt-Spalten werden beim naechsten Schreiben automatisch auf das neue Format migriert (GenArt-Spalten bleiben bei alten Zeilen leer, bis der Artikel neu exportiert wird).
 
 ## Attribute aus Text vorschlagen
 

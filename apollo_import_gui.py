@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.9"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
@@ -233,7 +233,9 @@ ATTRIBUTE_HEADERS = [
 # Fahrzeugtyp  -> TecDoc Verknuepfungstyp ID (PKW = 2)
 # KTypNr       -> TecDoc Verknuepfungs ID (pro Zeile eine KTyp-Nummer)
 # KTyp-System  -> Info, aus welchem Nummernkreis die KTypNr stammt (Topmotive/TecDoc)
-VEHICLE_LINK_HEADERS = ["Artikelnummer", "Fahrzeugtyp", "KTypNr", "KTyp-System", LAST_WRITTEN_HEADER]
+# GenArt ID    -> GenArt des Artikels; bei mehreren GenArts eine Zeile je GenArt und KTyp
+LEGACY_VEHICLE_LINK_HEADERS = ["Artikelnummer", "Fahrzeugtyp", "KTypNr", "KTyp-System", LAST_WRITTEN_HEADER]
+VEHICLE_LINK_HEADERS = ["Artikelnummer", "Fahrzeugtyp", "KTypNr", "KTyp-System", "GenArt ID", "GenArt Bezeichnung", LAST_WRITTEN_HEADER]
 # Zuordnung von Text-Labels (aus gescrapten Produkttexten) zu TecDoc Kriterien IDs.
 ATTRIBUTE_MAPPING_SHEET = "Zuordnung"
 ATTRIBUTE_MAPPING_HEADERS = ["Text-Label", "TecDoc Kriterien ID", "Hinweis"]
@@ -2956,6 +2958,15 @@ def is_attribute_workbook_with_value_from(path: Path, sheet_name: str) -> bool:
     return "wertvon" in header_keys and "wertbis" in header_keys
 
 
+def is_legacy_vehicle_link_workbook(path: Path, sheet_name: str) -> bool:
+    header_keys = [normalize_header_key(value) for value in read_workbook_headers(path, sheet_name)]
+    if not header_keys:
+        return False
+    has_ktyp = "ktypnr" in header_keys
+    has_genart = any(key in header_keys for key in ("genartid", "genart"))
+    return has_ktyp and not has_genart
+
+
 def read_workbook_rows(path: Path, sheet_name: str, expected_width: int) -> list[list[str]]:
     if not path.exists():
         return []
@@ -2997,6 +3008,12 @@ def prepare_existing_rows_for_write(path: Path, sheet_name: str, headers: list[s
         for row in legacy_rows:
             padded = list(row) + [""] * max(0, len(LEGACY_ATTRIBUTE_HEADERS) - len(row))
             existing_rows.append([padded[0], padded[1], padded[2], padded[3], padded[4], "", padded[5]])
+    elif headers == VEHICLE_LINK_HEADERS and is_legacy_vehicle_link_workbook(path, sheet_name):
+        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_VEHICLE_LINK_HEADERS))
+        existing_rows = []
+        for row in legacy_rows:
+            padded = list(row) + [""] * max(0, len(LEGACY_VEHICLE_LINK_HEADERS) - len(row))
+            existing_rows.append([padded[0], padded[1], padded[2], padded[3], "", "", padded[4]])
     else:
         existing_rows = read_workbook_rows(path, sheet_name, len(headers))
     if headers and headers[-1] == LAST_WRITTEN_HEADER and path.exists():
@@ -3210,19 +3227,25 @@ def build_comparison_export_rows(bundle: ExportBundle) -> list[list[str]]:
 
 
 def build_vehicle_link_export_rows(bundle: ExportBundle) -> list[list[str]]:
-    """Je Fahrzeug eine Zeile pro KTyp-Nummer (Topmotive und TecDoc)."""
+    """Je Fahrzeug eine Zeile pro KTyp-Nummer (Topmotive und TecDoc) und GenArt."""
+    genart_values = [
+        (selection.id.strip(), selection.bezeichnung.strip())
+        for selection in bundle.genart_selections
+        if selection.id.strip() or selection.bezeichnung.strip()
+    ] or [("", "")]
     export_rows: list[list[str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for row in normalize_vehicle_link_rows(bundle.vehicle_link_rows):
         for ktyp, system in ((row.ktyp_topmotive, "Topmotive"), (row.ktyp_tecdoc, "TecDoc")):
             ktyp = ktyp.strip()
             if not ktyp:
                 continue
-            dedupe_key = (row.vehicle_type_id, ktyp)
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            export_rows.append([bundle.article_number, row.vehicle_type_id, ktyp, system])
+            for genart_id, genart_bezeichnung in genart_values:
+                dedupe_key = (row.vehicle_type_id, ktyp, genart_id, genart_bezeichnung)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                export_rows.append([bundle.article_number, row.vehicle_type_id, ktyp, system, genart_id, genart_bezeichnung])
     return export_rows
 
 
@@ -11047,6 +11070,7 @@ if ($copied) {{
                 (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
                 (OE_FILE, OE_HEADERS),
                 (COMPARISON_FILE, COMPARISON_HEADERS),
+                (VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS),
                 (IMAGE_FILE, IMAGE_HEADERS),
                 (DOCUMENT_FILE, DOCUMENT_HEADERS),
                 (VIDEO_FILE, VIDEO_HEADERS),
