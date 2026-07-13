@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import random
 import re
+import ssl
 import string
 import subprocess
 import tempfile
@@ -48,7 +49,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.10"
+APP_VERSION = "0.1.11"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -2079,6 +2080,47 @@ def download_release_asset(asset: GitHubReleaseAsset, target_path: Path, timeout
     except urllib_error.URLError as exc:
         raise ValueError(f"Release-Datei konnte nicht geladen werden: {exc.reason}") from exc
     return target_path
+
+
+def _certifi_ssl_context() -> ssl.SSLContext | None:
+    try:
+        import certifi
+    except ImportError:  # pragma: no cover - optional dependency
+        return None
+    try:
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def fetch_preview_bytes_from_url(url: str, timeout_seconds: int, max_bytes: int | None = None) -> bytes:
+    """Lädt Vorschau-Inhalte per HTTP(S) mit tolerantem SSL-Fallback.
+
+    Manche Server (z. B. restapi.kunzer.de seit 11.07.2026) liefern eine
+    unvollständige Zertifikatskette aus; Browser reparieren das selbst
+    (AIA-Fetching), Pythons SSL nicht. Für reine Vorschau-Inhalte wird bei
+    Zertifikatsfehlern deshalb erst das certifi-Bundle und zuletzt eine
+    unverifizierte Verbindung genutzt. Update- und API-Downloads bleiben
+    strikt verifiziert.
+    """
+    request = urllib_request.Request(url, headers={"User-Agent": "ApolloImportGui/1.0"})
+    contexts: list[ssl.SSLContext | None] = [None]
+    certifi_context = _certifi_ssl_context()
+    if certifi_context is not None:
+        contexts.append(certifi_context)
+    contexts.append(ssl._create_unverified_context())
+    last_error: Exception | None = None
+    for context in contexts:
+        try:
+            with urllib_request.urlopen(request, timeout=timeout_seconds, context=context) as response:
+                return response.read(max_bytes) if max_bytes is not None else response.read()
+        except urllib_error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                last_error = exc
+                continue
+            raise
+    raise last_error if last_error is not None else ValueError("Download fehlgeschlagen.")
 
 
 def sanitize_short_translation_set(translations: TranslationSet) -> TranslationSet:
@@ -4475,11 +4517,9 @@ class MediaTableFrame(ttk.LabelFrame):
 
         parsed = urlparse(path_or_link)
         if parsed.scheme in {"http", "https"}:
-            request = urllib_request.Request(path_or_link, headers={"User-Agent": "ApolloImportGui/1.0"})
-            with urllib_request.urlopen(request, timeout=12) as response:
-                data = response.read()
-                self.preview_bytes_cache[cache_key] = data
-                return data
+            data = fetch_preview_bytes_from_url(path_or_link, timeout_seconds=12)
+            self.preview_bytes_cache[cache_key] = data
+            return data
 
         file_path = Path(path_or_link)
         if not file_path.exists():
@@ -4843,9 +4883,7 @@ class LinkTableFrame(ttk.LabelFrame):
     def _load_remote_image(self, url: str) -> object:
         cached = self.remote_image_cache.get(url)
         if cached is None:
-            request = urllib_request.Request(url, headers={"User-Agent": "ApolloImportGui/1.0"})
-            with urllib_request.urlopen(request, timeout=10) as response:
-                cached = response.read()
+            cached = fetch_preview_bytes_from_url(url, timeout_seconds=10)
             self.remote_image_cache[url] = cached
         return Image.open(io.BytesIO(cached))
 
@@ -4896,14 +4934,11 @@ class LinkTableFrame(ttk.LabelFrame):
             return cached
 
         try:
-            request = urllib_request.Request(link, headers={"User-Agent": "ApolloImportGui/1.0"})
-            with urllib_request.urlopen(request, timeout=8) as response:
-                raw = response.read(32768)
-                charset = response.headers.get_content_charset() or "utf-8"
+            raw = fetch_preview_bytes_from_url(link, timeout_seconds=8, max_bytes=32768)
         except Exception:  # pragma: no cover - preview only
             return ""
 
-        text = raw.decode(charset, errors="ignore")
+        text = raw.decode("utf-8", errors="ignore")
         match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
         if not match:
             return ""
