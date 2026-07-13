@@ -19,7 +19,7 @@ import threading
 import sys
 import tkinter as tk
 import unicodedata
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 from urllib import error as urllib_error
@@ -48,8 +48,21 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.1.10"
 APP_VERSION_TAG = f"v{APP_VERSION}"
+
+# Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
+UI_FONT_FAMILY = "Segoe UI"
+UI_BACKGROUND = "#F5F6FA"
+UI_SURFACE = "#FFFFFF"
+UI_BORDER = "#D5DAE1"
+UI_TEXT = "#1F2933"
+UI_TEXT_MUTED = "#5E6472"
+UI_ACCENT = "#2563EB"
+UI_ACCENT_DARK = "#1D4ED8"
+UI_ACCENT_SOFT = "#DCE7FB"
+UI_HEADING_BG = "#EDF0F4"
+UI_TAB_INACTIVE = "#E4E8EE"
 DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
 DEFAULT_GENART_SOURCE = Path(r"C:\Users\heimbuchner\Downloads\Genarten.xlsx")
@@ -99,10 +112,27 @@ def normalize_motorcode(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().upper())
 
 
-def motorcode_keys(value: object) -> list[str]:
-    """Robuste Suchschluessel fuer einen Motorcode.
+def split_code_list_input(raw: str) -> list[str]:
+    """Zerlegt eine eingefügte Code-/Wortliste in einzelne Einträge.
 
-    Beruecksichtigt Gross-/Kleinschreibung, Leerzeichen und Klammerzusaetze,
+    Enthält der Text ein Semikolon, gilt nur das Semikolon als Trenner;
+    Zeilenumbrüche und Tabs innerhalb der Teile (harte Umbrüche aus der
+    Kopierquelle, z. B. ``B 5254<Umbruch>S``) werden zu Leerzeichen
+    zusammengefasst. Ohne Semikolon trennt wie bisher jede neue Zeile
+    bzw. jeder Tab.
+    """
+    text = str(raw or "")
+    if ";" in text:
+        parts = text.split(";")
+    else:
+        parts = re.split(r"[\n\r\t]+", text)
+    return [" ".join(part.split()) for part in parts if part.strip()]
+
+
+def motorcode_keys(value: object) -> list[str]:
+    """Robuste Suchschlüssel für einen Motorcode.
+
+    Berücksichtigt Gross-/Kleinschreibung, Leerzeichen und Klammerzusätze,
     z. B. ``108C (XV8)`` -> ``108C``.
     """
     collapsed = normalize_motorcode(value)
@@ -229,7 +259,7 @@ ATTRIBUTE_HEADERS = [
     "Wert bis",
     LAST_WRITTEN_HEADER,
 ]
-# Fahrzeugverknuepfungen fuer den Apollo-Import.
+# Fahrzeugverknüpfungen für den Apollo-Import.
 # Fahrzeugtyp  -> TecDoc Verknuepfungstyp ID (PKW = 2)
 # KTypNr       -> TecDoc Verknuepfungs ID (pro Zeile eine KTyp-Nummer)
 # KTyp-System  -> Info, aus welchem Nummernkreis die KTypNr stammt (Topmotive/TecDoc)
@@ -239,7 +269,7 @@ VEHICLE_LINK_HEADERS = ["Artikelnummer", "Fahrzeugtyp", "KTypNr", "KTyp-System",
 # Zuordnung von Text-Labels (aus gescrapten Produkttexten) zu TecDoc Kriterien IDs.
 ATTRIBUTE_MAPPING_SHEET = "Zuordnung"
 ATTRIBUTE_MAPPING_HEADERS = ["Text-Label", "TecDoc Kriterien ID", "Hinweis"]
-# Suchwoerter werden als Attribut 'Zusatzbezeichnung' (TOPMOTIVE, alphanumerisch)
+# Suchwörter werden als Attribut 'Zusatzbezeichnung' (TOPMOTIVE, alphanumerisch)
 # exportiert, weil Apollo keine nativen Keywords kennt. Pro Suchwort eine Attributzeile.
 SEARCH_TERM_CRITERIA_ID = "9595"
 SEARCH_TERM_ATTRIBUTE_LABEL = "Zusatzbezeichnung"
@@ -279,9 +309,9 @@ UI_LANGUAGE_ORDER = [
     ("de", "Deutsch"),
     ("en", "Englisch"),
     ("cz", "Tschechisch"),
-    ("fr", "Franzoesisch"),
+    ("fr", "Französisch"),
     ("it", "Italienisch"),
-    ("nl", "Niederlaendisch"),
+    ("nl", "Niederländisch"),
     ("uni", "UNI"),
 ]
 
@@ -444,9 +474,9 @@ class CompetitorOption:
 
 @dataclass(frozen=True)
 class VehicleLinkRow:
-    """Eine Fahrzeugverknuepfung eines Artikels (ein Fahrzeug / KTyp).
+    """Eine Fahrzeugverknüpfung eines Artikels (ein Fahrzeug / KTyp).
 
-    Ein Fahrzeug traegt beide KTyp-Nummern (Topmotive + TecDoc); beim Export
+    Ein Fahrzeug trägt beide KTyp-Nummern (Topmotive + TecDoc); beim Export
     wird daraus je Nummer eine Zeile erzeugt.
     """
 
@@ -472,7 +502,7 @@ class VehicleLinkRow:
 
 @dataclass(frozen=True)
 class VehicleMatch:
-    """Ein Treffer aus den KTyp-Stammdaten fuer einen Motorcode."""
+    """Ein Treffer aus den KTyp-Stammdaten für einen Motorcode."""
 
     motorcode: str = ""
     ktyp_topmotive: str = ""
@@ -601,7 +631,7 @@ class ExtractedSpecLine:
 
 @dataclass
 class AttributeSuggestion:
-    """Ein Attribut-Vorschlag aus einem Produkttext fuer den Bestaetigungsdialog."""
+    """Ein Attribut-Vorschlag aus einem Produkttext für den Bestätigungsdialog."""
 
     option: AttributeOption
     value: str = ""
@@ -924,9 +954,9 @@ def normalize_search_terms(terms: list[str]) -> list[str]:
 
 
 def normalize_mapping_label(value: str) -> str:
-    """Normalisiert ein Text-Label fuer die Attribut-Zuordnung (Umlaute, Klammern, Spaces)."""
+    """Normalisiert ein Text-Label für die Attribut-Zuordnung (Umlaute, Klammern, Spaces)."""
     text = str(value or "").strip()
-    text = re.sub(r"\([^)]*\)", " ", text)  # Klammerzusaetze wie (LxBxH) entfernen
+    text = re.sub(r"\([^)]*\)", " ", text)  # Klammerzusätze wie (LxBxH) entfernen
     text = text.translate(SHORT_TEXT_UMLAUT_REPLACEMENTS)
     text = re.sub(r"[^a-z0-9]+", " ", text.casefold())
     return " ".join(text.split())
@@ -1097,9 +1127,9 @@ def build_attribute_suggestions_from_text(
     attribute_options_by_id: dict[str, AttributeOption],
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
 ) -> tuple[list[AttributeSuggestion], list[ExtractedSpecLine]]:
-    """Erzeugt Attribut-Vorschlaege aus einem Produkttext.
+    """Erzeugt Attribut-Vorschläge aus einem Produkttext.
 
-    Rueckgabe: (Vorschlaege, nicht zugeordnete Spezifikationszeilen).
+    Rückgabe: (Vorschläge, nicht zugeordnete Spezifikationszeilen).
     """
     suggestions: list[AttributeSuggestion] = []
     unmatched: list[ExtractedSpecLine] = []
@@ -1172,20 +1202,20 @@ def build_attribute_suggestions_from_text(
                 if resolved is not None:
                     return AttributeSuggestion(
                         option=option, value=resolved.display_label(), source_line=source_line,
-                        confident=True, note="Schluesselwert",
+                        confident=True, note="Schlüsselwert",
                     )
             return AttributeSuggestion(
                 option=option, value=raw_value.strip(), source_line=source_line,
-                confident=False, note="Schluesselwert nicht in Werteliste gefunden",
+                confident=False, note="Schlüsselwert nicht in Werteliste gefunden",
             )
 
-        # Alphanumerisch und alles Uebrige: Text direkt uebernehmen
+        # Alphanumerisch und alles Übrige: Text direkt übernehmen
         cleaned = " ".join(raw_value.split())
         max_length = option.max_length if option.max_length else None
         if max_length and len(cleaned) > max_length:
             return AttributeSuggestion(
                 option=option, value=cleaned, source_line=source_line,
-                confident=False, note=f"laenger als {max_length} Zeichen",
+                confident=False, note=f"länger als {max_length} Zeichen",
             )
         return AttributeSuggestion(option=option, value=cleaned, source_line=source_line, confident=True)
 
@@ -1194,7 +1224,7 @@ def build_attribute_suggestions_from_text(
         if not base_label:
             continue
 
-        # Abmessungen wie '390 x 450 x 130 mm' in Laenge/Breite/Hoehe/Tiefe aufteilen
+        # Abmessungen wie '390 x 450 x 130 mm' in Länge/Breite/Höhe/Tiefe aufteilen
         dimensions = parse_dimension_value(spec.raw_value)
         if dimensions is not None and (is_dimension_spec_label(spec.label) or base_label in mapping):
             numbers, unit = dimensions
@@ -1223,7 +1253,7 @@ def build_attribute_suggestions_from_text(
             continue
 
         raw_value, _paren_note = _strip_trailing_parenthetical(spec.raw_value)
-        # Mehrfachwerte ('80.000 / 40.000 kg', '8 - 9 - 10 mm' mit Aufzaehlungszeichen) nur als unsicher vorschlagen
+        # Mehrfachwerte ('80.000 / 40.000 kg', '8 - 9 - 10 mm' mit Aufzählungszeichen) nur als unsicher vorschlagen
         if re.search(rf"{_NUMBER_PATTERN}\s*[/|•]\s*{_NUMBER_PATTERN}", raw_value):
             first_number = parse_numeric_value(re.split(r"[/|•]", raw_value, 1)[0].strip() + " " + (re.search(r"([A-Za-z/%\".]{1,6})\s*$", raw_value).group(1) if re.search(r"([A-Za-z/%\".]{1,6})\s*$", raw_value) else ""))
             suggestion = AttributeSuggestion(
@@ -1231,7 +1261,7 @@ def build_attribute_suggestions_from_text(
                 value=format_german_number(first_number[0]) if first_number else raw_value,
                 source_line=spec.source_line,
                 confident=False,
-                note="Mehrere Werte in der Zeile - bitte pruefen",
+                note="Mehrere Werte in der Zeile - bitte prüfen",
             )
             add_suggestion(suggestion)
             continue
@@ -1576,7 +1606,7 @@ def load_competitor_options(csv_path: Path, *, comparison_only: bool = True) -> 
 
 
 class VehicleCatalog:
-    """Nachschlagewerk fuer KTyp-Stammdaten (Motorcode -> Fahrzeuge)."""
+    """Nachschlagewerk für KTyp-Stammdaten (Motorcode -> Fahrzeuge)."""
 
     def __init__(self) -> None:
         self.by_motorcode: dict[str, list[VehicleMatch]] = {}
@@ -1605,7 +1635,7 @@ class VehicleCatalog:
         return self._sorted_motorcodes
 
     def suggest(self, query: str, limit: int = 12) -> list[str]:
-        """Vorschlaege fuer einen (Teil-)Motorcode inkl. Fuzzy-Naehe."""
+        """Vorschläge für einen (Teil-)Motorcode inkl. Fuzzy-Nähe."""
         normalized = normalize_motorcode(query)
         if not normalized:
             return []
@@ -1786,7 +1816,7 @@ def load_attribute_options(workbook_path: Path) -> list[AttributeOption]:
         deleted_index = header_map.get("gelscht") or header_map.get("geloescht")
         deletion_date_index = header_map.get("lschdatum") or header_map.get("loeschdatum")
         if criteria_index is None or label_index is None or format_index is None:
-            raise ValueError("In der Attributdatei fehlen benoetigte Spalten.")
+            raise ValueError("In der Attributdatei fehlen benötigte Spalten.")
 
         options: list[AttributeOption] = []
         seen_ids: set[str] = set()
@@ -1826,7 +1856,7 @@ def load_attribute_options(workbook_path: Path) -> list[AttributeOption]:
 
 
 def load_attribute_mapping(workbook_path: Path) -> dict[str, str]:
-    """Laedt die Text-Label -> TecDoc Kriterien ID Zuordnung fuer Attributvorschlaege."""
+    """Lädt die Text-Label -> TecDoc Kriterien ID Zuordnung für Attributvorschläge."""
     if not path_exists_safe(workbook_path):
         return {}
 
@@ -1867,7 +1897,7 @@ def load_attribute_mapping(workbook_path: Path) -> dict[str, str]:
 
 
 def append_attribute_mapping_entries(workbook_path: Path, entries: list[tuple[str, str, str]]) -> None:
-    """Haengt gelernte Zuordnungen (Text-Label, Kriterien-ID, Hinweis) an die Zuordnungsdatei an."""
+    """Hängt gelernte Zuordnungen (Text-Label, Kriterien-ID, Hinweis) an die Zuordnungsdatei an."""
     if not entries:
         return
     if workbook_path.exists():
@@ -1890,14 +1920,14 @@ def load_attribute_key_value_options(workbook_path: Path) -> list[AttributeKeyVa
     try:
         workbook = load_workbook(workbook_path, read_only=True, data_only=True)
     except Exception as exc:
-        raise ValueError(f"Schluesselwertdatei konnte nicht geladen werden: {exc}") from exc
+        raise ValueError(f"Schlüsselwertdatei konnte nicht geladen werden: {exc}") from exc
 
     try:
         worksheet = workbook[workbook.sheetnames[0]]
         row_iter = worksheet.iter_rows(values_only=True)
         header_row = next(row_iter, None)
         if header_row is None:
-            raise ValueError("Die Schluesselwertdatei hat keine Kopfzeile.")
+            raise ValueError("Die Schlüsselwertdatei hat keine Kopfzeile.")
 
         header_map = {
             normalize_header_key(str(value)): index
@@ -1911,7 +1941,7 @@ def load_attribute_key_value_options(workbook_path: Path) -> list[AttributeKeyVa
         deleted_index = header_map.get("gelscht") or header_map.get("geloescht")
         deletion_date_index = header_map.get("lschdatum") or header_map.get("loeschdatum")
         if key_value_index is None or label_index is None or group_index is None:
-            raise ValueError("In der Schluesselwertdatei fehlen benoetigte Spalten.")
+            raise ValueError("In der Schlüsselwertdatei fehlen benötigte Spalten.")
 
         options: list[AttributeKeyValueOption] = []
         seen_keys: set[tuple[str, str]] = set()
@@ -2147,7 +2177,7 @@ def _read_import_items_from_rows(header_values: list[object], data_rows: list[li
     article_index = next((header_map[key] for key in CSV_ARTICLE_HEADER_ALIASES if key in header_map), None)
     url_index = next((header_map[key] for key in CSV_URL_HEADER_ALIASES if key in header_map), None)
     if article_index is None and url_index is None:
-        raise ValueError(f"Die {source_label} braucht mindestens eine Spalte fuer Artikelnummer oder Produkt-URL.")
+        raise ValueError(f"Die {source_label} braucht mindestens eine Spalte für Artikelnummer oder Produkt-URL.")
 
     items: list[CsvImportItem] = []
     for row in data_rows:
@@ -2183,7 +2213,7 @@ def read_product_import_items(path: Path) -> list[CsvImportItem]:
         return _read_import_items_from_rows(list(rows[0]), [list(row) for row in rows[1:]], "XLSX-Datei")
 
     if suffix != ".csv":
-        raise ValueError("Unterstuetzt werden derzeit CSV- und XLSX-Dateien.")
+        raise ValueError("Unterstützt werden derzeit CSV- und XLSX-Dateien.")
 
     last_error: UnicodeDecodeError | None = None
     for encoding in ("utf-8-sig", "cp1252"):
@@ -2583,7 +2613,7 @@ class DeepLClient:
     def translate_from_german(self, german_text: str) -> dict[str, str]:
         text = german_text.strip()
         if not text:
-            raise DeepLTranslationError("Kein deutscher Quelltext zum Uebersetzen vorhanden.")
+            raise DeepLTranslationError("Kein deutscher Quelltext zum Übersetzen vorhanden.")
 
         translations: dict[str, str] = {}
         for ui_code, deepl_code in DEEPL_TARGET_LANGUAGES.items():
@@ -2804,7 +2834,7 @@ class KunzerScraper:
                     let score = 0;
                     if (/produkte/i.test(text)) score += 120;
                     if (/breadcrumb/i.test(selector)) score += 80;
-                    if (/shop|downloads|kontakt|ueber uns/i.test(text)) score -= 60;
+                    if (/shop|downloads|kontakt|über uns/i.test(text)) score -= 60;
                     score += Math.max(0, 40 - parts.length * 6);
                     score += Math.max(0, 50 - text.length / 3);
                     candidates.push({ text, score });
@@ -3174,7 +3204,7 @@ def build_image_export_rows(bundle: ExportBundle) -> list[list[str]]:
     for row in bundle.image_rows:
         format_type_id = infer_attachment_format_type_id(row.path_or_link)
         if not format_type_id:
-            raise ValueError(f"Kein TecDoc Anhangsformattyp fuer Bild ableitbar: {row.path_or_link}")
+            raise ValueError(f"Kein TecDoc Anhangsformattyp für Bild ableitbar: {row.path_or_link}")
         export_rows.append([bundle.article_number, row.path_or_link, row.art or "5", row.sprache or "255", format_type_id])
     return export_rows
 
@@ -3184,7 +3214,7 @@ def build_document_export_rows(bundle: ExportBundle) -> list[list[str]]:
     for row in bundle.document_rows:
         format_type_id = infer_attachment_format_type_id(row.path_or_link)
         if not format_type_id:
-            raise ValueError(f"Kein TecDoc Anhangsformattyp fuer Dokument ableitbar: {row.path_or_link}")
+            raise ValueError(f"Kein TecDoc Anhangsformattyp für Dokument ableitbar: {row.path_or_link}")
         export_rows.append([bundle.article_number, row.path_or_link, row.sprache or "255", row.art or "17", format_type_id])
     return export_rows
 
@@ -3195,7 +3225,7 @@ def build_video_export_rows(bundle: ExportBundle) -> list[list[str]]:
         normalized_video_link = normalize_youtube_url_for_embed(row.path_or_link)
         format_type_id = infer_attachment_format_type_id(normalized_video_link)
         if not format_type_id:
-            raise ValueError(f"Kein TecDoc Anhangsformattyp fuer Video-Link ableitbar: {row.path_or_link}")
+            raise ValueError(f"Kein TecDoc Anhangsformattyp für Video-Link ableitbar: {row.path_or_link}")
         export_rows.append([bundle.article_number, normalized_video_link, format_type_id])
     return export_rows
 
@@ -3205,7 +3235,7 @@ def build_web_export_rows(bundle: ExportBundle) -> list[list[str]]:
     for row in bundle.web_rows:
         format_type_id = infer_attachment_format_type_id(row.path_or_link)
         if not format_type_id:
-            raise ValueError(f"Kein TecDoc Anhangsformattyp fuer Web-Link ableitbar: {row.path_or_link}")
+            raise ValueError(f"Kein TecDoc Anhangsformattyp für Web-Link ableitbar: {row.path_or_link}")
         export_rows.append([bundle.article_number, row.path_or_link, format_type_id])
     return export_rows
 
@@ -3214,7 +3244,7 @@ def build_oe_export_rows(bundle: ExportBundle) -> list[list[str]]:
     export_rows: list[list[str]] = []
     for row in normalize_oe_number_rows(bundle.oe_number_rows):
         if not row.manufacturer_id:
-            raise ValueError(f"Bitte Hersteller fuer OE-Nummer '{row.value}' auswaehlen.")
+            raise ValueError(f"Bitte Hersteller für OE-Nummer '{row.value}' auswählen.")
         export_rows.append([bundle.article_number, "4", row.manufacturer_id, row.value])
     return export_rows
 
@@ -3268,7 +3298,7 @@ def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
                 row.value_to,
             ]
         )
-    # Suchwoerter als zusaetzliche 'Zusatzbezeichnung'-Zeilen (eine pro Suchwort).
+    # Suchwörter als zusätzliche 'Zusatzbezeichnung'-Zeilen (eine pro Suchwort).
     for term in normalize_search_terms(bundle.search_terms):
         if term.casefold() in seen_search_values:
             continue
@@ -3442,15 +3472,15 @@ def build_preview(bundle: ExportBundle) -> str:
         f"- GenArten: {summarize_genart_selections(bundle.genart_selections, empty_label='(nicht gesetzt)', limit=3)}",
         "",
         "Texte",
-        f"- Kurzbezeichnung: {bundle.short_texts.populated_count(bundle.short_auto_uni)} / 7 Sprachfelder befuellt",
-        f"- Text: {bundle.long_texts.populated_count(bundle.long_auto_uni)} / 7 Sprachfelder befuellt",
+        f"- Kurzbezeichnung: {bundle.short_texts.populated_count(bundle.short_auto_uni)} / 7 Sprachfelder befüllt",
+        f"- Text: {bundle.long_texts.populated_count(bundle.long_auto_uni)} / 7 Sprachfelder befüllt",
         "",
         "Referenzen",
         f"- OE-Nummern: {len(normalize_oe_number_rows(bundle.oe_number_rows))}",
         f"- Vergleichsnummern: {len(normalize_comparison_number_rows(bundle.comparison_number_rows))}",
-        f"- Fahrzeugverknuepfungen: {len(normalize_vehicle_link_rows(bundle.vehicle_link_rows))} Fahrzeuge / {len(build_vehicle_link_export_rows(bundle))} Zeilen",
+        f"- Fahrzeugverknüpfungen: {len(normalize_vehicle_link_rows(bundle.vehicle_link_rows))} Fahrzeuge / {len(build_vehicle_link_export_rows(bundle))} Zeilen",
         f"- Attribute: {len(normalize_attribute_rows(bundle.attribute_rows))}",
-        f"- Suchwoerter: {len(normalize_search_terms(bundle.search_terms))} (als Attribut {SEARCH_TERM_CRITERIA_ID} {SEARCH_TERM_ATTRIBUTE_LABEL})",
+        f"- Suchwörter: {len(normalize_search_terms(bundle.search_terms))} (als Attribut {SEARCH_TERM_CRITERIA_ID} {SEARCH_TERM_ATTRIBUTE_LABEL})",
         "",
         "Medien",
         f"- Bilder: {len(bundle.image_rows)}",
@@ -3550,11 +3580,11 @@ def format_article_snapshot(snapshot: StoredArticleSnapshot) -> str:
         "",
         format_comparison_number_rows("Vergleichsnummern", snapshot.comparison_number_rows),
         "",
-        format_vehicle_link_rows("Fahrzeugverknuepfungen", snapshot.vehicle_link_rows),
+        format_vehicle_link_rows("Fahrzeugverknüpfungen", snapshot.vehicle_link_rows),
         "",
         format_attribute_rows("Attribute", snapshot.attribute_rows),
         "",
-        format_search_terms("Suchwoerter", snapshot.search_terms),
+        format_search_terms("Suchwörter", snapshot.search_terms),
         "",
         format_media_rows("Bilder", snapshot.image_rows),
         "",
@@ -3716,7 +3746,7 @@ def load_article_snapshots_from_folder(
             continue
         criteria_id = row[1].strip()
         if criteria_id == SEARCH_TERM_CRITERIA_ID:
-            # 'Zusatzbezeichnung'-Zeilen sind Suchwoerter und gehoeren in den Suchwoerter-Tab.
+            # 'Zusatzbezeichnung'-Zeilen sind Suchwörter und gehören in den Suchwörter-Tab.
             search_term = row[4].strip()
             if search_term:
                 ensure_snapshot(article_number).search_terms.append(search_term)
@@ -3807,7 +3837,7 @@ class SingleLineTranslationFrame(ttk.LabelFrame):
 
         auto_uni_check = ttk.Checkbutton(
             self,
-            text="UNI automatisch aus Deutsch uebernehmen",
+            text="UNI automatisch aus Deutsch übernehmen",
             variable=self.auto_uni_var,
             command=self._handle_auto_uni_toggle,
         )
@@ -3913,7 +3943,7 @@ class MultiLineTranslationFrame(ttk.LabelFrame):
 
         ttk.Checkbutton(
             controls,
-            text="UNI automatisch aus Deutsch uebernehmen",
+            text="UNI automatisch aus Deutsch übernehmen",
             variable=self.auto_uni_var,
             command=self._handle_auto_uni_toggle,
         ).grid(row=0, column=0, sticky="w")
@@ -4035,7 +4065,7 @@ class MediaTableFrame(ttk.LabelFrame):
         self._layout_after_id: str | None = None
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
-        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+        self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
 
         self.columnconfigure(0, weight=1)
         self.columnconfigure(2, weight=0)
@@ -4051,7 +4081,7 @@ class MediaTableFrame(ttk.LabelFrame):
 
         ttk.Label(form, text=path_label).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(form, textvariable=self.path_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Button(form, text="Dateien waehlen", command=self.browse_files).grid(row=0, column=2, padx=(8, 0), pady=4)
+        ttk.Button(form, text="Dateien wählen", command=self.browse_files).grid(row=0, column=2, padx=(8, 0), pady=4)
 
         ttk.Label(form, text="Art").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(form, textvariable=self.art_var, width=12).grid(row=1, column=1, sticky="w", pady=4)
@@ -4060,7 +4090,7 @@ class MediaTableFrame(ttk.LabelFrame):
 
         actions = ttk.Frame(form)
         actions.grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Button(actions, text="Zeile hinzufuegen", command=self.add_manual_row).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Zeile hinzufügen", command=self.add_manual_row).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(actions, text="Formular leeren", command=self.clear_form).grid(row=0, column=3)
@@ -4088,7 +4118,7 @@ class MediaTableFrame(ttk.LabelFrame):
         self.preview_frame = preview_frame
 
         self.preview_title_var = tk.StringVar(value="Keine Auswahl")
-        self.preview_meta_var = tk.StringVar(value="Waehle eine Zeile aus, um mehr Details zu sehen.")
+        self.preview_meta_var = tk.StringVar(value="Wähle eine Zeile aus, um mehr Details zu sehen.")
         self.preview_badge_var = tk.StringVar(value="DATEI")
 
         ttk.Label(preview_frame, textvariable=self.preview_title_var, font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w")
@@ -4121,7 +4151,7 @@ class MediaTableFrame(ttk.LabelFrame):
     def add_manual_row(self) -> None:
         path = self.path_var.get().strip()
         if not path:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Pfad eingeben oder Dateien waehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Pfad eingeben oder Dateien wählen.")
             return
         art = self.art_var.get().strip() or self.default_art
         sprache = self.sprache_var.get().strip() or self.default_sprache
@@ -4135,7 +4165,7 @@ class MediaTableFrame(ttk.LabelFrame):
     def update_selected_row(self) -> None:
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswählen.")
             return
 
         path = self.path_var.get().strip()
@@ -4204,7 +4234,7 @@ class MediaTableFrame(ttk.LabelFrame):
     def _reset_preview(self) -> None:
         self.preview_photo = None
         self.preview_title_var.set("Keine Auswahl")
-        self.preview_meta_var.set("Waehle eine Zeile aus, um mehr Details zu sehen.")
+        self.preview_meta_var.set("Wähle eine Zeile aus, um mehr Details zu sehen.")
         self.preview_visual.configure(text="Keine Vorschau", image="")
 
     def toggle_preview(self) -> None:
@@ -4266,7 +4296,7 @@ class MediaTableFrame(ttk.LabelFrame):
             self._handle_selection()
         has_selection = bool(self.tree.selection())
         self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
-        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.grab_release()
 
@@ -4377,14 +4407,14 @@ class MediaTableFrame(ttk.LabelFrame):
         )
         if Image is None or ImageTk is None:
             self.preview_photo = None
-            self.preview_visual.configure(text="Pillow fuer Bildvorschau installieren", image="", wraplength=220, justify="center")
+            self.preview_visual.configure(text="Pillow für Bildvorschau installieren", image="", wraplength=220, justify="center")
             return
 
         try:
             image = self._load_preview_image(path_or_link)
         except Exception as exc:  # pragma: no cover - user-specific preview issues
             self.preview_photo = None
-            self.preview_visual.configure(text=f"Keine Bildvorschau verfuegbar\n{exc}", image="", wraplength=220, justify="center")
+            self.preview_visual.configure(text=f"Keine Bildvorschau verfügbar\n{exc}", image="", wraplength=220, justify="center")
             return
 
         image.thumbnail((260, 180))
@@ -4414,18 +4444,18 @@ class MediaTableFrame(ttk.LabelFrame):
     def _update_pdf_preview(self, path_or_link: str) -> None:
         if Image is None or ImageTk is None:
             self.preview_photo = None
-            self.preview_visual.configure(text="Pillow fuer PDF-Vorschau installieren", image="", wraplength=220, justify="center")
+            self.preview_visual.configure(text="Pillow für PDF-Vorschau installieren", image="", wraplength=220, justify="center")
             return
         if pymupdf is None:
             self.preview_photo = None
-            self.preview_visual.configure(text="PyMuPDF fuer PDF-Vorschau installieren", image="", wraplength=220, justify="center")
+            self.preview_visual.configure(text="PyMuPDF für PDF-Vorschau installieren", image="", wraplength=220, justify="center")
             return
 
         try:
             image = self._render_pdf_preview(path_or_link)
         except Exception as exc:  # pragma: no cover - environment-specific PDF issues
             self.preview_photo = None
-            self.preview_visual.configure(text=f"Keine PDF-Vorschau verfuegbar\n{exc}", image="", wraplength=220, justify="center")
+            self.preview_visual.configure(text=f"Keine PDF-Vorschau verfügbar\n{exc}", image="", wraplength=220, justify="center")
             return
 
         image.thumbnail((260, 180))
@@ -4508,7 +4538,7 @@ class LinkTableFrame(ttk.LabelFrame):
         self._layout_after_id: str | None = None
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
-        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+        self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
         self.columnconfigure(0, weight=1)
         self.columnconfigure(2, weight=0)
         self.rowconfigure(1, weight=1)
@@ -4521,7 +4551,7 @@ class LinkTableFrame(ttk.LabelFrame):
 
         ttk.Label(form, text=label_text).grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(form, textvariable=self.link_var).grid(row=0, column=1, sticky="ew")
-        ttk.Button(form, text="Hinzufuegen", command=self.add_row).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(form, text="Hinzufügen", command=self.add_row).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(form, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=3, padx=(8, 0))
         ttk.Button(form, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(form, text="Leeren", command=self.clear_form).grid(row=0, column=5, padx=(8, 0))
@@ -4545,7 +4575,7 @@ class LinkTableFrame(ttk.LabelFrame):
         self.preview_frame = preview_frame
 
         self.preview_title_var = tk.StringVar(value="Keine Auswahl")
-        self.preview_meta_var = tk.StringVar(value="Waehle eine Zeile aus, um mehr Details zu sehen.")
+        self.preview_meta_var = tk.StringVar(value="Wähle eine Zeile aus, um mehr Details zu sehen.")
 
         ttk.Label(preview_frame, textvariable=self.preview_title_var, font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w")
 
@@ -4577,7 +4607,7 @@ class LinkTableFrame(ttk.LabelFrame):
     def update_selected_row(self) -> None:
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswählen.")
             return
 
         link = self.link_var.get().strip()
@@ -4641,7 +4671,7 @@ class LinkTableFrame(ttk.LabelFrame):
             self._handle_selection()
         has_selection = bool(self.tree.selection())
         self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
-        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.grab_release()
 
@@ -4713,7 +4743,7 @@ class LinkTableFrame(ttk.LabelFrame):
     def _reset_preview(self) -> None:
         self.preview_photo = None
         self.preview_title_var.set("Keine Auswahl")
-        self.preview_meta_var.set("Waehle eine Zeile aus, um mehr Details zu sehen.")
+        self.preview_meta_var.set("Wähle eine Zeile aus, um mehr Details zu sehen.")
         self.preview_visual.configure(text="Keine Vorschau", image="", wraplength=220, justify="center")
 
     def toggle_preview(self) -> None:
@@ -4822,7 +4852,7 @@ class LinkTableFrame(ttk.LabelFrame):
     def _render_web_preview(self, link: str) -> tuple[object, str]:
         parsed = urlparse(link)
         if parsed.scheme not in {"http", "https"}:
-            raise ValueError("Nur http/https Links koennen als Webseite vorgeladen werden.")
+            raise ValueError("Nur http/https Links können als Webseite vorgeladen werden.")
 
         cached = self.web_preview_cache.get(link)
         if cached is not None:
@@ -4917,7 +4947,7 @@ class SimpleValueTableFrame(ttk.LabelFrame):
         self.inline_editor_item = ""
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
-        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+        self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -4928,7 +4958,7 @@ class SimpleValueTableFrame(ttk.LabelFrame):
 
         ttk.Label(form, text=entry_label).grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(form, textvariable=self.value_var).grid(row=0, column=1, sticky="ew")
-        ttk.Button(form, text="Hinzufuegen", command=self.add_row).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(form, text="Hinzufügen", command=self.add_row).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(form, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=3, padx=(8, 0))
         ttk.Button(form, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=4, padx=(8, 0))
         ttk.Button(form, text="Leeren", command=self.clear_form).grid(row=0, column=5, padx=(8, 0))
@@ -4961,7 +4991,7 @@ class SimpleValueTableFrame(ttk.LabelFrame):
     def update_selected_row(self) -> None:
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswählen.")
             return
         value = self.value_var.get().strip()
         if not value:
@@ -5032,7 +5062,7 @@ class SimpleValueTableFrame(ttk.LabelFrame):
             self._handle_selection()
         has_selection = bool(self.tree.selection())
         self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
-        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.grab_release()
 
@@ -5190,7 +5220,7 @@ class SearchSuggestionPopup:
         popup.withdraw()
         popup.overrideredirect(True)
         popup.transient(self.owner.winfo_toplevel())
-        popup.configure(background="#C7BFAF", padx=1, pady=1)
+        popup.configure(background=UI_BORDER, padx=1, pady=1)
 
         listbox = tk.Listbox(
             popup,
@@ -5309,7 +5339,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
         self.catalog_by_label: dict[str, CompetitorOption] = {}
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
-        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+        self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
 
         self.manufacturer_display_var = tk.StringVar()
         self.manufacturer_id_var = tk.StringVar()
@@ -5329,7 +5359,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
 
         ttk.Label(
             header,
-            text="Waehle den Hersteller aus und erfasse die zugehoerige OE-Nummer.",
+            text="Wähle den Hersteller aus und erfasse die zugehörige OE-Nummer.",
             foreground="#5E6472",
             wraplength=980,
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 10))
@@ -5348,7 +5378,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
 
         ttk.Label(header, text="KHerNr").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(header, textvariable=self.manufacturer_id_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Label(header, text="Kuerzel").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Label(header, text="Kürzel").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
         ttk.Entry(header, textvariable=self.manufacturer_code_var, width=18).grid(row=2, column=3, sticky="w", pady=4)
         ttk.Label(header, text="Name").grid(row=2, column=4, sticky="w", padx=(12, 8), pady=4)
         ttk.Entry(header, textvariable=self.manufacturer_name_var).grid(row=2, column=5, columnspan=2, sticky="ew", pady=4)
@@ -5358,7 +5388,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
 
         actions = ttk.Frame(header)
         actions.grid(row=3, column=4, columnspan=3, sticky="e", pady=4)
-        ttk.Button(actions, text="Hinzufuegen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Hinzufügen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(actions, text="Leeren", command=self.clear_form).grid(row=0, column=3)
@@ -5367,7 +5397,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=11, selectmode="extended")
         self.tree.grid(row=1, column=0, sticky="nsew")
         self.tree.heading("manufacturer_id", text="KHerNr")
-        self.tree.heading("manufacturer_code", text="Kuerzel")
+        self.tree.heading("manufacturer_code", text="Kürzel")
         self.tree.heading("manufacturer_name", text="Hersteller")
         self.tree.heading("value", text="OE-Nummer")
         self.tree.column("manufacturer_id", width=120, anchor="center")
@@ -5466,7 +5496,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
     def update_selected_row(self) -> None:
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswählen.")
             return
         self._apply_current_manufacturer_selection()
         row = self._build_current_row()
@@ -5554,7 +5584,7 @@ class OeNumberTableFrame(ttk.LabelFrame):
             self._handle_selection()
         has_selection = bool(self.tree.selection())
         self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
-        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.grab_release()
 
@@ -5569,7 +5599,7 @@ class ComparisonTableFrame(ttk.LabelFrame):
         self.catalog_by_label: dict[str, CompetitorOption] = {}
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
-        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+        self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
 
         self.competitor_display_var = tk.StringVar()
         self.competitor_id_var = tk.StringVar()
@@ -5588,7 +5618,7 @@ class ComparisonTableFrame(ttk.LabelFrame):
 
         ttk.Label(
             header,
-            text="Mitbewerber kann direkt aus KHer.csv ausgewaehlt oder manuell ueber die ID gepflegt werden.",
+            text="Mitbewerber kann direkt aus KHer.csv ausgewählt oder manuell über die ID gepflegt werden.",
             foreground="#5E6472",
             wraplength=980,
         ).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 10))
@@ -5607,7 +5637,7 @@ class ComparisonTableFrame(ttk.LabelFrame):
 
         ttk.Label(header, text="Mitbewerber ID").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(header, textvariable=self.competitor_id_var, width=16).grid(row=2, column=1, sticky="w", pady=4)
-        ttk.Label(header, text="Kuerzel").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Label(header, text="Kürzel").grid(row=2, column=2, sticky="w", padx=(12, 8), pady=4)
         ttk.Entry(header, textvariable=self.competitor_code_var, width=18).grid(row=2, column=3, sticky="w", pady=4)
         ttk.Label(header, text="Name").grid(row=2, column=4, sticky="w", padx=(12, 8), pady=4)
         ttk.Entry(header, textvariable=self.competitor_name_var).grid(row=2, column=5, columnspan=2, sticky="ew", pady=4)
@@ -5617,7 +5647,7 @@ class ComparisonTableFrame(ttk.LabelFrame):
 
         actions = ttk.Frame(header)
         actions.grid(row=3, column=4, columnspan=3, sticky="e", pady=4)
-        ttk.Button(actions, text="Hinzufuegen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Hinzufügen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(actions, text="Leeren", command=self.clear_form).grid(row=0, column=3)
@@ -5626,7 +5656,7 @@ class ComparisonTableFrame(ttk.LabelFrame):
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=11, selectmode="extended")
         self.tree.grid(row=1, column=0, sticky="nsew")
         self.tree.heading("competitor_id", text="Mitbewerber ID")
-        self.tree.heading("competitor_code", text="Kuerzel")
+        self.tree.heading("competitor_code", text="Kürzel")
         self.tree.heading("competitor_name", text="Mitbewerber")
         self.tree.heading("reference_number", text="Vergleichsnummer")
         self.tree.column("competitor_id", width=120, anchor="center")
@@ -5725,7 +5755,7 @@ class ComparisonTableFrame(ttk.LabelFrame):
     def update_selected_row(self) -> None:
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswählen.")
             return
         self._apply_current_competitor_selection()
         row = self._build_current_row()
@@ -5813,19 +5843,19 @@ class ComparisonTableFrame(ttk.LabelFrame):
             self._handle_selection()
         has_selection = bool(self.tree.selection())
         self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
-        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.grab_release()
 
 
 class VehicleLinkTableFrame(ttk.LabelFrame):
     def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
-        super().__init__(master, text="Fahrzeugverknuepfungen", padding=14)
+        super().__init__(master, text="Fahrzeugverknüpfungen", padding=14)
         self.on_change = on_change
         self.catalog: VehicleCatalog | None = None
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
-        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+        self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
 
         self.motorcode_var = tk.StringVar()
         self.vehicle_type_var = tk.StringVar(value=format_vehicle_type_choice(*VEHICLE_TYPE_CHOICES[0]))
@@ -5842,7 +5872,7 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             header,
             text=(
                 "Motorcode(s) eingeben - die passenden KTyp-Nummern (TopMotive und TecDoc) werden automatisch "
-                "aus den KTyp-Stammdaten ergaenzt. Fuer den Apollo-Import: Fahrzeugtyp -> TecDoc Verknuepfungstyp ID "
+                "aus den KTyp-Stammdaten ergänzt. Für den Apollo-Import: Fahrzeugtyp -> TecDoc Verknuepfungstyp ID "
                 "(PKW = 2), KTypNr -> TecDoc Verknuepfungs ID. Mehrere Motorcodes mit ; trennen."
             ),
             foreground="#5E6472",
@@ -5859,7 +5889,7 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             self._accept_motorcode_suggestion,
             min_width=340,
         )
-        # Enter soll die Fahrzeuge hinzufuegen (ueberschreibt die Popup-Bindung bewusst danach).
+        # Enter soll die Fahrzeuge hinzufügen (überschreibt die Popup-Bindung bewusst danach).
         self.motorcode_entry.bind("<Return>", self._on_motorcode_return)
 
         ttk.Label(header, text="Fahrzeugtyp").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=4)
@@ -5874,7 +5904,7 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
 
         actions = ttk.Frame(header)
         actions.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Button(actions, text="Fahrzeuge hinzufuegen", command=self.add_from_motorcodes).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Fahrzeuge hinzufügen", command=self.add_from_motorcodes).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Alle entfernen", command=self.clear_rows).grid(row=0, column=2, padx=(0, 8))
         ttk.Label(actions, textvariable=self.result_var, foreground="#5E6472", wraplength=520).grid(row=0, column=3, padx=(8, 0), sticky="w")
@@ -5997,10 +6027,10 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
         if self.catalog is None or self.catalog.count == 0:
             messagebox.showwarning(
                 APP_TITLE,
-                "Keine KTyp-Stammdaten geladen. Bitte die KTyp-Datei im Projekt-Tab unter 'Datenstaemme' laden.",
+                "Keine KTyp-Stammdaten geladen. Bitte die KTyp-Datei im Projekt-Tab unter 'Datenstämme' laden.",
             )
             return
-        codes = [code.strip() for code in re.split(r"[;\n\r\t]+", raw) if code.strip()]
+        codes = split_code_list_input(raw)
         type_id, type_label = self._current_vehicle_type()
         existing = {(row.vehicle_type_id, row.ktyp_topmotive, row.ktyp_tecdoc) for row in self.get_rows()}
         added = 0
@@ -6034,7 +6064,7 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
                     ),
                 )
                 added += 1
-        summary = f"{added} Fahrzeug(e) aus {matched_codes} Motorcode(s) hinzugefuegt."
+        summary = f"{added} Fahrzeug(e) aus {matched_codes} Motorcode(s) hinzugefügt."
         if not_found:
             shown = ", ".join(not_found[:8]) + (" ..." if len(not_found) > 8 else "")
             summary += f" Ohne Treffer: {shown}"
@@ -6135,21 +6165,21 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             self.tree.selection_set(item_id)
         has_selection = bool(self.tree.selection())
         self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
-        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.grab_release()
 
 
 class SearchTermFrame(ttk.LabelFrame):
     def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
-        super().__init__(master, text="Suchwoerter", padding=14)
+        super().__init__(master, text="Suchwörter", padding=14)
         self.on_change = on_change
         self.context_menu = tk.Menu(self, tearoff=0)
-        self.context_menu.add_command(label="Suchwoerter kopieren", command=self.copy_selected_terms)
-        self.context_menu.add_command(label="Suchwoerter loeschen", command=self.remove_selected)
+        self.context_menu.add_command(label="Suchwörter kopieren", command=self.copy_selected_terms)
+        self.context_menu.add_command(label="Suchwörter löschen", command=self.remove_selected)
 
         self.term_var = tk.StringVar()
-        self.count_var = tk.StringVar(value="0 Suchwoerter")
+        self.count_var = tk.StringVar(value="0 Suchwörter")
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -6161,9 +6191,9 @@ class SearchTermFrame(ttk.LabelFrame):
         ttk.Label(
             header,
             text=(
-                "Apollo kennt keine nativen Suchbegriffe. Suchwoerter werden deshalb beim Export als Attribut "
+                "Apollo kennt keine nativen Suchbegriffe. Suchwörter werden deshalb beim Export als Attribut "
                 f"'{SEARCH_TERM_ATTRIBUTE_LABEL}' (TecDoc Kriterien ID {SEARCH_TERM_CRITERIA_ID}) in die Attribute.xlsx geschrieben - "
-                f"eine Zeile pro Suchwort, maximal {SEARCH_TERM_MAX_LENGTH} Zeichen. Mehrere Suchwoerter mit ; trennen."
+                f"eine Zeile pro Suchwort, maximal {SEARCH_TERM_MAX_LENGTH} Zeichen. Mehrere Suchwörter mit ; trennen."
             ),
             foreground="#5E6472",
             wraplength=980,
@@ -6176,7 +6206,7 @@ class SearchTermFrame(ttk.LabelFrame):
 
         actions = ttk.Frame(header)
         actions.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Button(actions, text="Hinzufuegen", command=self.add_terms).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Hinzufügen", command=self.add_terms).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Alle entfernen", command=self.clear_terms).grid(row=0, column=2, padx=(0, 8))
         ttk.Label(actions, textvariable=self.count_var, foreground="#5E6472").grid(row=0, column=3, padx=(8, 0), sticky="w")
@@ -6200,14 +6230,14 @@ class SearchTermFrame(ttk.LabelFrame):
 
     def _update_count(self) -> None:
         count = len(self.tree.get_children())
-        self.count_var.set(f"{count} Suchwoerter" if count != 1 else "1 Suchwort")
+        self.count_var.set(f"{count} Suchwörter" if count != 1 else "1 Suchwort")
 
     def add_terms(self) -> None:
         raw = self.term_var.get().strip()
         if not raw:
             messagebox.showwarning(APP_TITLE, "Bitte mindestens ein Suchwort eingeben.")
             return
-        candidates = normalize_search_terms(re.split(r"[;\n\r\t]+", raw))
+        candidates = normalize_search_terms(split_code_list_input(raw))
         if not candidates:
             return
         too_long = [term for term in candidates if len(term) > SEARCH_TERM_MAX_LENGTH]
@@ -6224,7 +6254,7 @@ class SearchTermFrame(ttk.LabelFrame):
         if too_long:
             messagebox.showwarning(
                 APP_TITLE,
-                f"Diese Suchwoerter sind laenger als {SEARCH_TERM_MAX_LENGTH} Zeichen und wurden nicht uebernommen:\n"
+                f"Diese Suchwörter sind länger als {SEARCH_TERM_MAX_LENGTH} Zeichen und wurden nicht übernommen:\n"
                 + "\n".join(too_long),
             )
         if added:
@@ -6272,8 +6302,8 @@ class SearchTermFrame(ttk.LabelFrame):
         if item_id and item_id not in self.tree.selection():
             self.tree.selection_set(item_id)
         has_selection = bool(self.tree.selection())
-        self.context_menu.entryconfigure("Suchwoerter kopieren", state="normal" if has_selection else "disabled")
-        self.context_menu.entryconfigure("Suchwoerter loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Suchwörter kopieren", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Suchwörter löschen", state="normal" if has_selection else "disabled")
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.grab_release()
 
@@ -6289,7 +6319,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.row_type_names: dict[str, str] = {}
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
-        self.context_menu.add_command(label="Zeilen loeschen", command=self.remove_selected)
+        self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
 
         self.attribute_display_var = tk.StringVar()
         self.criteria_id_var = tk.StringVar()
@@ -6299,7 +6329,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.type_name_var = tk.StringVar()
         self.value_var = tk.StringVar()
         self.value_to_var = tk.StringVar()
-        self.hint_var = tk.StringVar(value="Waehle ein Attribut aus oder gib die Kriterien-ID manuell ein.")
+        self.hint_var = tk.StringVar(value="Wähle ein Attribut aus oder gib die Kriterien-ID manuell ein.")
         self.attribute_suggestion_popup: tk.Toplevel | None = None
         self.attribute_suggestion_listbox: tk.Listbox | None = None
         self.attribute_suggestion_values: list[str] = []
@@ -6317,7 +6347,7 @@ class AttributeTableFrame(ttk.LabelFrame):
 
         ttk.Label(
             header,
-            text="Attribute werden ueber die TecDoc Kriterien ID ausgewaehlt. Format und maximale Laenge dienen als Pflegehilfe.",
+            text="Attribute werden über die TecDoc Kriterien ID ausgewählt. Format und maximale Länge dienen als Pflegehilfe.",
             foreground="#5E6472",
             wraplength=980,
         ).grid(row=0, column=0, columnspan=9, sticky="w", pady=(0, 10))
@@ -6339,7 +6369,7 @@ class AttributeTableFrame(ttk.LabelFrame):
 
         ttk.Label(header, text="Format").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(header, textvariable=self.format_var, width=24).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(header, text="Max. Laenge").grid(row=3, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Label(header, text="Max. Länge").grid(row=3, column=2, sticky="w", padx=(12, 8), pady=4)
         ttk.Entry(header, textvariable=self.max_length_var, width=12).grid(row=3, column=3, sticky="w", pady=4)
         ttk.Label(header, text="Wert").grid(row=3, column=4, sticky="w", padx=(12, 8), pady=4)
         self.value_entry = ttk.Entry(header, textvariable=self.value_var)
@@ -6369,7 +6399,7 @@ class AttributeTableFrame(ttk.LabelFrame):
 
         actions = ttk.Frame(header)
         actions.grid(row=5, column=0, columnspan=9, sticky="w")
-        ttk.Button(actions, text="Hinzufuegen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Hinzufügen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(actions, text="Leeren", command=self.clear_form).grid(row=0, column=3)
@@ -6486,7 +6516,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         popup.withdraw()
         popup.overrideredirect(True)
         popup.transient(self.winfo_toplevel())
-        popup.configure(background="#C7BFAF", padx=1, pady=1)
+        popup.configure(background=UI_BORDER, padx=1, pady=1)
 
         listbox = tk.Listbox(
             popup,
@@ -6732,7 +6762,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         popup.withdraw()
         popup.overrideredirect(True)
         popup.transient(self.winfo_toplevel())
-        popup.configure(background="#C7BFAF", padx=1, pady=1)
+        popup.configure(background=UI_BORDER, padx=1, pady=1)
 
         listbox = tk.Listbox(
             popup,
@@ -6950,11 +6980,11 @@ class AttributeTableFrame(ttk.LabelFrame):
         if row.max_length is not None:
             for value_label, value in [("Wert", row.value), ("Wert bis", row.value_to)]:
                 if value and len(value) > row.max_length:
-                    raise ValueError(f"{value_label} fuer {row.display_label()} ist laenger als erlaubt ({row.max_length}).")
+                    raise ValueError(f"{value_label} für {row.display_label()} ist länger als erlaubt ({row.max_length}).")
         if row.value_format.strip().casefold() != "kein wert" and not any(
             value.strip() for value in [row.value, row.value_to]
         ):
-            raise ValueError("Bitte fuer dieses Attribut einen Wert oder Wert bis eingeben.")
+            raise ValueError("Bitte für dieses Attribut einen Wert oder Wert bis eingeben.")
 
     def add_row(self) -> None:
         self._apply_current_attribute_selection()
@@ -6976,7 +7006,7 @@ class AttributeTableFrame(ttk.LabelFrame):
     def update_selected_row(self) -> None:
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswählen.")
             return
         self._apply_current_attribute_selection()
         row = self._build_current_row()
@@ -7029,26 +7059,26 @@ class AttributeTableFrame(ttk.LabelFrame):
     def _update_hint(self) -> None:
         format_label = self.format_var.get().strip()
         if not format_label:
-            self.hint_var.set("Waehle ein Attribut aus oder gib die Kriterien-ID manuell ein.")
+            self.hint_var.set("Wähle ein Attribut aus oder gib die Kriterien-ID manuell ein.")
             return
         format_key = format_label.casefold()
         max_length = self.max_length_var.get().strip() or "-"
         if format_key == "kein wert":
-            self.hint_var.set(f"Format: {format_label}. Dieses Attribut wird ohne Wert gespeichert. Max. Laenge: {max_length}.")
+            self.hint_var.set(f"Format: {format_label}. Dieses Attribut wird ohne Wert gespeichert. Max. Länge: {max_length}.")
             return
         if format_key == "flag (ja / nein)":
-            self.hint_var.set(f"Format: {format_label}. Bitte bevorzugt 'Ja' oder 'Nein' verwenden. Max. Laenge: {max_length}.")
+            self.hint_var.set(f"Format: {format_label}. Bitte bevorzugt 'Ja' oder 'Nein' verwenden. Max. Länge: {max_length}.")
             return
         if is_attribute_key_value_format(format_label):
             options = self._current_key_value_options()
             group_label = self.type_name_var.get().strip() or self.label_var.get().strip() or "-"
             self.hint_var.set(
-                f"Format: {format_label}. Schluesselwertgruppe: {group_label}. "
-                f"{len(options)} moegliche Werte, Suche mit Live-Vorschlaegen im Feld Wert. "
-                f"Bereiche koennen ueber Wert und Wert bis gepflegt werden. Max. Laenge: {max_length}."
+                f"Format: {format_label}. Schlüsselwertgruppe: {group_label}. "
+                f"{len(options)} mögliche Werte, Suche mit Live-Vorschlägen im Feld Wert. "
+                f"Bereiche können über Wert und Wert bis gepflegt werden. Max. Länge: {max_length}."
             )
             return
-        self.hint_var.set(f"Format: {format_label}. Wert oder Bereich ueber Wert und Wert bis pflegen. Max. Laenge laut Katalog: {max_length}.")
+        self.hint_var.set(f"Format: {format_label}. Wert oder Bereich über Wert und Wert bis pflegen. Max. Länge laut Katalog: {max_length}.")
 
     def get_rows(self) -> list[AttributeRow]:
         rows = []
@@ -7129,7 +7159,7 @@ class AttributeTableFrame(ttk.LabelFrame):
             self._handle_selection()
         has_selection = bool(self.tree.selection())
         self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
-        self.context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.grab_release()
 
@@ -7158,12 +7188,12 @@ class GenArtSearchDialog:
         ttk.Label(header, text="Suche", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", padx=(0, 10))
         self.search_entry = ttk.Entry(header, textvariable=self.search_var)
         self.search_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Button(header, text="Auswaehlen", command=self._accept).grid(row=0, column=2, padx=(10, 0))
+        ttk.Button(header, text="Auswählen", command=self._accept).grid(row=0, column=2, padx=(10, 0))
         ttk.Button(header, text="Abbrechen", command=self._cancel).grid(row=0, column=3, padx=(8, 0))
 
         ttk.Label(
             header,
-            text="Suche in ID, GenArt und Bezeichnung. Mehrere Begriffe sind moeglich.",
+            text="Suche in ID, GenArt und Bezeichnung. Mehrere Begriffe sind möglich.",
             foreground="#5E6472",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(header, textvariable=self.results_var, foreground="#5E6472").grid(
@@ -7270,7 +7300,7 @@ class GenArtSearchDialog:
 
 
 class AttributeSuggestionDialog(tk.Toplevel):
-    """Bestaetigungsdialog fuer aus Produkttext erkannte Attribute."""
+    """Bestätigungsdialog für aus Produkttext erkannte Attribute."""
 
     def __init__(
         self,
@@ -7293,7 +7323,7 @@ class AttributeSuggestionDialog(tk.Toplevel):
         self.selected_unmatched_label = ""
 
         self.transient(master.winfo_toplevel())
-        self.configure(background="#F6F2EA", padx=16, pady=14)
+        self.configure(background=UI_BACKGROUND, padx=16, pady=14)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=3)
         self.rowconfigure(3, weight=2)
@@ -7301,8 +7331,8 @@ class AttributeSuggestionDialog(tk.Toplevel):
         ttk.Label(
             self,
             text=(
-                "Gefundene Attribute aus dem Produkttext. Angehakte Zeilen werden in den Attribute-Tab uebernommen. "
-                "Klick auf eine Zeile schaltet das Haekchen um."
+                "Gefundene Attribute aus dem Produkttext. Angehakte Zeilen werden in den Attribute-Tab übernommen. "
+                "Klick auf eine Zeile schaltet das Häkchen um."
             ),
             foreground="#5E6472",
             wraplength=900,
@@ -7358,7 +7388,7 @@ class AttributeSuggestionDialog(tk.Toplevel):
         self.remember_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             unmatched_frame,
-            text="Zuordnung merken (Text-Label wird in die Zuordnungstabelle uebernommen)",
+            text="Zuordnung merken (Text-Label wird in die Zuordnungstabelle übernommen)",
             variable=self.remember_var,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Button(unmatched_frame, text="Zuweisen", command=self._assign_unmatched).grid(row=2, column=3, sticky="e", pady=(8, 0))
@@ -7366,7 +7396,7 @@ class AttributeSuggestionDialog(tk.Toplevel):
         buttons = ttk.Frame(self)
         buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(buttons, text="Abbrechen", command=self.destroy).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(buttons, text="Uebernehmen", style="Accent.TButton", command=self._apply).grid(row=0, column=1)
+        ttk.Button(buttons, text="Übernehmen", style="Accent.TButton", command=self._apply).grid(row=0, column=1)
 
         self.geometry("1020x640")
         self.grab_set()
@@ -7449,11 +7479,11 @@ class AttributeSuggestionDialog(tk.Toplevel):
     def _assign_unmatched(self) -> None:
         selection = self.unmatched_list.curselection()
         if not selection:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile aus 'Nicht erkannte Angaben' auswaehlen.", parent=self)
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile aus 'Nicht erkannte Angaben' auswählen.", parent=self)
             return
         option = self._resolve_assign_option()
         if option is None:
-            messagebox.showwarning(APP_TITLE, "Bitte ein Attribut aus der Liste auswaehlen.", parent=self)
+            messagebox.showwarning(APP_TITLE, "Bitte ein Attribut aus der Liste auswählen.", parent=self)
             return
         index = selection[0]
         spec = self.unmatched[index]
@@ -7555,8 +7585,8 @@ class ApolloImportApp:
         self.genart_count_var = tk.StringVar(value="0 GenArts geladen")
         self.competitor_count_var = tk.StringVar(value="0 Hersteller / 0 Mitbewerber geladen")
         self.attribute_count_var = tk.StringVar(value="0 Attribute geladen")
-        self.attribute_key_value_count_var = tk.StringVar(value="0 Schluesselwerte geladen")
-        self.vehicle_count_var = tk.StringVar(value="0 KTyp-Datensaetze geladen")
+        self.attribute_key_value_count_var = tk.StringVar(value="0 Schlüsselwerte geladen")
+        self.vehicle_count_var = tk.StringVar(value="0 KTyp-Datensätze geladen")
         self.attribute_mapping_count_var = tk.StringVar(value="0 Zuordnungen geladen")
         self.article_section_collapsed = False
         self.api_section_collapsed = False
@@ -7607,17 +7637,155 @@ class ApolloImportApp:
 
     def _configure_style(self) -> None:
         style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure("TFrame", background="#F6F2EA")
-        style.configure("TLabelframe", background="#F6F2EA")
-        style.configure("TLabelframe.Label", background="#F6F2EA", foreground="#2E4057", font=("Segoe UI Semibold", 11))
-        style.configure("TLabel", background="#F6F2EA", foreground="#243447", font=("Segoe UI", 10))
-        style.configure("TButton", font=("Segoe UI", 10))
-        style.configure("Accent.TButton", font=("Segoe UI Semibold", 10))
-        style.configure("TCheckbutton", background="#F6F2EA", foreground="#243447")
-        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 10))
-        self.root.configure(background="#F6F2EA")
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            try:
+                tkfont.nametofont(font_name).configure(family=UI_FONT_FAMILY, size=10)
+            except tk.TclError:
+                pass
+
+        style.configure(".", background=UI_BACKGROUND, foreground=UI_TEXT, font=(UI_FONT_FAMILY, 10))
+        style.configure("TFrame", background=UI_BACKGROUND)
+        style.configure("TLabel", background=UI_BACKGROUND, foreground=UI_TEXT, font=(UI_FONT_FAMILY, 10))
+        style.configure(
+            "TLabelframe",
+            background=UI_BACKGROUND,
+            bordercolor=UI_BORDER,
+            lightcolor=UI_BACKGROUND,
+            darkcolor=UI_BACKGROUND,
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=UI_BACKGROUND,
+            foreground=UI_ACCENT_DARK,
+            font=(f"{UI_FONT_FAMILY} Semibold", 11),
+        )
+
+        style.configure(
+            "TButton",
+            font=(UI_FONT_FAMILY, 10),
+            padding=(12, 6),
+            background=UI_SURFACE,
+            foreground=UI_TEXT,
+            bordercolor=UI_BORDER,
+            lightcolor=UI_SURFACE,
+            darkcolor=UI_SURFACE,
+        )
+        style.map(
+            "TButton",
+            background=[("disabled", UI_HEADING_BG), ("pressed", UI_ACCENT_SOFT), ("active", "#F2F6FF")],
+            bordercolor=[("focus", UI_ACCENT), ("active", UI_ACCENT)],
+            foreground=[("disabled", "#9AA1AC")],
+        )
+        style.configure(
+            "Accent.TButton",
+            font=(f"{UI_FONT_FAMILY} Semibold", 10),
+            background=UI_ACCENT,
+            foreground="#FFFFFF",
+            bordercolor=UI_ACCENT,
+            lightcolor=UI_ACCENT,
+            darkcolor=UI_ACCENT,
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("disabled", "#A5B8E8"), ("pressed", UI_ACCENT_DARK), ("active", UI_ACCENT_DARK)],
+            foreground=[("disabled", "#F4F6FA")],
+        )
+
+        style.configure("TNotebook", background=UI_BACKGROUND, borderwidth=0, tabmargins=(0, 4, 0, 0))
+        style.configure(
+            "TNotebook.Tab",
+            font=(UI_FONT_FAMILY, 10),
+            padding=(16, 7),
+            background=UI_TAB_INACTIVE,
+            foreground=UI_TEXT_MUTED,
+            bordercolor=UI_BORDER,
+            lightcolor=UI_TAB_INACTIVE,
+            darkcolor=UI_TAB_INACTIVE,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", UI_SURFACE), ("active", "#EFF3F8")],
+            foreground=[("selected", UI_ACCENT_DARK), ("active", UI_TEXT)],
+            lightcolor=[("selected", UI_SURFACE)],
+            darkcolor=[("selected", UI_SURFACE)],
+        )
+
+        style.configure(
+            "TEntry",
+            fieldbackground=UI_SURFACE,
+            foreground=UI_TEXT,
+            bordercolor=UI_BORDER,
+            lightcolor=UI_SURFACE,
+            darkcolor=UI_SURFACE,
+            insertcolor=UI_TEXT,
+            padding=4,
+        )
+        style.map(
+            "TEntry",
+            bordercolor=[("focus", UI_ACCENT)],
+            lightcolor=[("focus", UI_ACCENT_SOFT)],
+            darkcolor=[("focus", UI_ACCENT_SOFT)],
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=UI_SURFACE,
+            background=UI_SURFACE,
+            foreground=UI_TEXT,
+            bordercolor=UI_BORDER,
+            arrowcolor=UI_TEXT_MUTED,
+            padding=4,
+        )
+        style.map("TCombobox", fieldbackground=[("readonly", UI_SURFACE)], bordercolor=[("focus", UI_ACCENT)])
+        style.configure("TSpinbox", fieldbackground=UI_SURFACE, bordercolor=UI_BORDER, arrowcolor=UI_TEXT_MUTED)
+
+        style.configure("TCheckbutton", background=UI_BACKGROUND, foreground=UI_TEXT)
+        style.map("TCheckbutton", background=[("active", UI_BACKGROUND)])
+        style.configure("TRadiobutton", background=UI_BACKGROUND, foreground=UI_TEXT)
+        style.map("TRadiobutton", background=[("active", UI_BACKGROUND)])
+
+        style.configure(
+            "Treeview",
+            background=UI_SURFACE,
+            fieldbackground=UI_SURFACE,
+            foreground=UI_TEXT,
+            font=(UI_FONT_FAMILY, 10),
+            rowheight=26,
+            bordercolor=UI_BORDER,
+            lightcolor=UI_SURFACE,
+            darkcolor=UI_SURFACE,
+        )
+        style.map("Treeview", background=[("selected", UI_ACCENT_SOFT)], foreground=[("selected", UI_TEXT)])
+        style.configure(
+            "Treeview.Heading",
+            font=(f"{UI_FONT_FAMILY} Semibold", 10),
+            background=UI_HEADING_BG,
+            foreground=UI_TEXT,
+            bordercolor=UI_BORDER,
+            relief="flat",
+            padding=(8, 6),
+        )
+        style.map("Treeview.Heading", background=[("active", "#E2E7EE")])
+
+        for orientation in ("Vertical", "Horizontal"):
+            style.configure(
+                f"{orientation}.TScrollbar",
+                background=UI_HEADING_BG,
+                troughcolor=UI_BACKGROUND,
+                bordercolor=UI_BACKGROUND,
+                arrowcolor=UI_TEXT_MUTED,
+            )
+        style.configure("TSeparator", background=UI_BORDER)
+
+        self.root.option_add("*TCombobox*Listbox.background", UI_SURFACE)
+        self.root.option_add("*TCombobox*Listbox.foreground", UI_TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", UI_ACCENT_SOFT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", UI_TEXT)
+        self.root.configure(background=UI_BACKGROUND)
 
     def _configure_window_icon(self) -> None:
         ico_path = resolve_application_asset_path(APP_ICON_ICO_RELATIVE_PATH)
@@ -7649,7 +7817,7 @@ class ApolloImportApp:
         ttk.Label(header, text="Apollo Import GUI", font=("Segoe UI Semibold", 20)).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="Prototyp fuer die Erfassung eines Artikels und den Export der zugehoerigen Importdateien.",
+            text="Prototyp für die Erfassung eines Artikels und den Export der zugehörigen Importdateien.",
             foreground="#5E6472",
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
@@ -7674,7 +7842,7 @@ class ApolloImportApp:
         self.main_notebook.add(self.long_tab, text="Text")
         self.main_notebook.add(self.genart_tab, text="GenArten")
         self.main_notebook.add(self.attribute_tab, text="Attribute")
-        self.main_notebook.add(self.search_term_tab, text="Suchwoerter")
+        self.main_notebook.add(self.search_term_tab, text="Suchwörter")
         self.main_notebook.add(self.oe_tab, text="OE-Nummern")
         self.main_notebook.add(self.comparison_tab, text="Vergleichsnummern")
         self.main_notebook.add(self.vehicle_tab, text="Fahrzeuge")
@@ -7710,7 +7878,7 @@ class ApolloImportApp:
         error_status_prefix: str,
     ) -> bool:
         if self.background_task_running:
-            self.status_var.set("Es laeuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
+            self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
             return False
 
         self._set_background_task_state(True, start_message)
@@ -8317,17 +8485,17 @@ class ApolloImportApp:
         webbrowser.open(GITHUB_RELEASES_PAGE_URL)
 
     def _check_for_github_updates(self) -> None:
-        self.update_status_var.set("Pruefe GitHub-Releases...")
+        self.update_status_var.set("Prüfe GitHub-Releases...")
 
         def worker() -> GitHubReleaseInfo:
             release = fetch_latest_github_release()
             if not release.tag_name:
-                raise ValueError("GitHub Release enthaelt kein gueltiges Versions-Tag.")
+                raise ValueError("GitHub Release enthält kein gültiges Versions-Tag.")
             return release
 
         def on_success(result: object) -> None:
             if not isinstance(result, GitHubReleaseInfo):
-                raise ValueError("Unerwartete Antwort bei der Update-Pruefung.")
+                raise ValueError("Unerwartete Antwort bei der Update-Prüfung.")
 
             release = result
             latest_label = release.name or release.tag_name
@@ -8338,7 +8506,7 @@ class ApolloImportApp:
                 return
 
             asset = choose_release_asset(release)
-            self.update_status_var.set(f"Update verfuegbar: {release.tag_name}")
+            self.update_status_var.set(f"Update verfügbar: {release.tag_name}")
 
             body_lines = [line.strip("- ").strip() for line in release.body.splitlines() if line.strip()]
             notes_preview = "\n".join(body_lines[:4])
@@ -8357,7 +8525,7 @@ class ApolloImportApp:
             message_parts.append("Soll das Update jetzt heruntergeladen und gestartet werden?")
             wants_update = messagebox.askyesno(APP_TITLE, "\n".join(message_parts))
             if not wants_update:
-                self.status_var.set(f"Update verfuegbar: {release.tag_name}")
+                self.status_var.set(f"Update verfügbar: {release.tag_name}")
                 return
 
             if asset is None:
@@ -8365,7 +8533,7 @@ class ApolloImportApp:
                 messagebox.showinfo(
                     APP_TITLE,
                     "Im neuesten Release wurde kein direkt installierbares Paket gefunden.\n\n"
-                    "Die Release-Seite wird jetzt geoeffnet.",
+                    "Die Release-Seite wird jetzt geöffnet.",
                 )
                 self._open_github_releases_page()
                 return
@@ -8376,7 +8544,7 @@ class ApolloImportApp:
             "Suche auf GitHub nach neuen Releases...",
             worker,
             on_success,
-            "Update-Pruefung fehlgeschlagen",
+            "Update-Prüfung fehlgeschlagen",
         )
 
     def _download_and_install_github_release(self, release: GitHubReleaseInfo, asset: GitHubReleaseAsset) -> None:
@@ -8409,7 +8577,7 @@ class ApolloImportApp:
                 APP_TITLE,
                 "Das neueste Release wurde als ZIP heruntergeladen.\n\n"
                 f"Datei: {downloaded_path}\n\n"
-                "Ich oeffne jetzt den Ordner, damit du das Paket direkt verwenden kannst.",
+                "Ich öffne jetzt den Ordner, damit du das Paket direkt verwenden kannst.",
             )
             os.startfile(str(downloaded_path.parent))
             return
@@ -8430,7 +8598,7 @@ class ApolloImportApp:
                 APP_TITLE,
                 "Das Update wurde heruntergeladen, aber die automatische Ersetzung funktioniert nur in der gebauten EXE.\n\n"
                 f"Datei: {downloaded_path}\n\n"
-                "Ich oeffne jetzt den Ordner mit der heruntergeladenen Datei.",
+                "Ich öffne jetzt den Ordner mit der heruntergeladenen Datei.",
             )
             os.startfile(str(downloaded_path.parent))
             return
@@ -8673,7 +8841,7 @@ if ($copied) {{
         self.project_tab.columnconfigure(0, weight=1)
         self.project_tab.rowconfigure(0, weight=1)
 
-        self.project_canvas = tk.Canvas(self.project_tab, background="#F6F2EA", borderwidth=0, highlightthickness=0)
+        self.project_canvas = tk.Canvas(self.project_tab, background=UI_BACKGROUND, borderwidth=0, highlightthickness=0)
         self.project_canvas.grid(row=0, column=0, sticky="nsew")
         project_scrollbar = ttk.Scrollbar(self.project_tab, orient="vertical", command=self.project_canvas.yview)
         project_scrollbar.grid(row=0, column=1, sticky="ns")
@@ -8697,17 +8865,17 @@ if ($copied) {{
 
         ttk.Label(file_frame, text="Importordner").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Entry(file_frame, textvariable=self.import_dir_var).grid(row=0, column=1, sticky="ew", pady=6)
-        ttk.Button(file_frame, text="Waehlen", command=self.choose_import_dir).grid(row=0, column=2, padx=(8, 0), pady=6)
+        ttk.Button(file_frame, text="Wählen", command=self.choose_import_dir).grid(row=0, column=2, padx=(8, 0), pady=6)
         ttk.Button(file_frame, text="IDs laden", command=self._load_known_ids).grid(row=0, column=3, padx=(8, 0), pady=6)
 
         ttk.Label(file_frame, text="Ausgabeordner / Importpfad").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Entry(file_frame, textvariable=self.output_dir_var).grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Button(file_frame, text="Waehlen", command=self.choose_output_dir).grid(row=1, column=2, padx=(8, 0), pady=6)
+        ttk.Button(file_frame, text="Wählen", command=self.choose_output_dir).grid(row=1, column=2, padx=(8, 0), pady=6)
         ttk.Label(file_frame, textvariable=self.known_id_count_var, foreground="#5E6472").grid(row=1, column=3, sticky="w", padx=(8, 0), pady=6)
 
         ttk.Label(file_frame, text="Produktliste CSV/XLSX").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Entry(file_frame, textvariable=self.product_list_path_var).grid(row=2, column=1, sticky="ew", pady=6)
-        ttk.Button(file_frame, text="Datei waehlen", command=self.choose_product_list_file).grid(row=2, column=2, padx=(8, 0), pady=6)
+        ttk.Button(file_frame, text="Datei wählen", command=self.choose_product_list_file).grid(row=2, column=2, padx=(8, 0), pady=6)
         ttk.Button(file_frame, text="Liste importieren", command=self.import_products_from_file).grid(row=2, column=3, padx=(8, 0), pady=6)
 
         ttk.Label(file_frame, text="App-Update").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
@@ -8765,7 +8933,7 @@ if ($copied) {{
         options_row.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
             options_row,
-            text="Nach dem Laden automatisch mit DeepL uebersetzen",
+            text="Nach dem Laden automatisch mit DeepL übersetzen",
             variable=self.auto_translate_after_scrape_var,
         ).grid(row=0, column=0)
 
@@ -8794,7 +8962,7 @@ if ($copied) {{
 
         ttk.Label(
             export_frame,
-            text="Wenn aktiv, bleiben die Dateien bestehen: neue Artikel werden angehaengt und bestehende Zeilen derselben Artikelnummer ersetzt.",
+            text="Wenn aktiv, bleiben die Dateien bestehen: neue Artikel werden angehängt und bestehende Zeilen derselben Artikelnummer ersetzt.",
             wraplength=500,
             foreground="#5E6472",
         ).grid(row=2, column=0, sticky="w", pady=(8, 0))
@@ -8807,7 +8975,7 @@ if ($copied) {{
         batch_frame.grid(row=4, column=0, sticky="ew", pady=(14, 0))
         ttk.Label(
             batch_frame,
-            text="Waehle, welche Daten bei CSV/XLSX-Listen von Kunzer gescraped und direkt in die Output-Dateien geschrieben werden sollen.",
+            text="Wähle, welche Daten bei CSV/XLSX-Listen von Kunzer gescraped und direkt in die Output-Dateien geschrieben werden sollen.",
             wraplength=470,
             foreground="#5E6472",
         ).grid(row=0, column=0, columnspan=2, sticky="w")
@@ -8821,7 +8989,7 @@ if ($copied) {{
 
         ttk.Label(
             batch_frame,
-            text="Der Listenimport uebersetzt ausgewaehlte Texte automatisch und schreibt immer direkt in den festen Output-Pfad.",
+            text="Der Listenimport übersetzt ausgewählte Texte automatisch und schreibt immer direkt in den festen Output-Pfad.",
             wraplength=470,
             foreground="#5E6472",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
@@ -8858,27 +9026,27 @@ if ($copied) {{
 
         deepl_actions = ttk.Frame(self.deepl_content_frame)
         deepl_actions.grid(row=3, column=1, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Button(deepl_actions, text="Kurzbezeichnung uebersetzen", command=self.translate_short_texts).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(deepl_actions, text="Text uebersetzen", command=self.translate_long_texts).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(deepl_actions, text="Alles uebersetzen", command=self.translate_all_texts).grid(row=0, column=2)
+        ttk.Button(deepl_actions, text="Kurzbezeichnung übersetzen", command=self.translate_short_texts).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(deepl_actions, text="Text übersetzen", command=self.translate_long_texts).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(deepl_actions, text="Alles übersetzen", command=self.translate_all_texts).grid(row=0, column=2)
 
         ttk.Label(
             self.deepl_content_frame,
-            text="Die Uebersetzung laeuft jeweils aus dem deutschen Feld in EN, CZ, FR, IT und NL. UNI bleibt an Deutsch gekoppelt.",
+            text="Die Übersetzung läuft jeweils aus dem deutschen Feld in EN, CZ, FR, IT und NL. UNI bleibt an Deutsch gekoppelt.",
             foreground="#5E6472",
             wraplength=1000,
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         ttk.Separator(self.deepl_content_frame, orient="horizontal").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(14, 12))
 
-        ttk.Label(self.deepl_content_frame, text="Datenstaemme", font=("Segoe UI Semibold", 10)).grid(
+        ttk.Label(self.deepl_content_frame, text="Datenstämme", font=("Segoe UI Semibold", 10)).grid(
             row=9, column=0, sticky="w", pady=(0, 4)
         )
         ttk.Label(self.deepl_content_frame, text="GenArt XLSX").grid(row=10, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Entry(self.deepl_content_frame, textvariable=self.genart_source_path_var).grid(row=10, column=1, sticky="ew", pady=6)
         genart_actions = ttk.Frame(self.deepl_content_frame)
         genart_actions.grid(row=10, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(genart_actions, text="Datei waehlen", command=self.choose_genart_source_file).grid(row=0, column=0)
+        ttk.Button(genart_actions, text="Datei wählen", command=self.choose_genart_source_file).grid(row=0, column=0)
         ttk.Button(genart_actions, text="Neu laden", command=self._reload_genart_catalog).grid(row=0, column=1, padx=(8, 0))
         ttk.Label(self.deepl_content_frame, textvariable=self.genart_count_var, foreground="#5E6472").grid(
             row=11, column=1, columnspan=2, sticky="w"
@@ -8887,12 +9055,12 @@ if ($copied) {{
         ttk.Label(self.deepl_content_frame, text="KHer CSV").grid(row=12, column=0, sticky="w", padx=(0, 10), pady=6)
         kher_actions = ttk.Frame(self.deepl_content_frame)
         kher_actions.grid(row=12, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(kher_actions, text="Datei waehlen", command=self.choose_competitor_source_file).grid(row=0, column=0)
+        ttk.Button(kher_actions, text="Datei wählen", command=self.choose_competitor_source_file).grid(row=0, column=0)
         ttk.Button(kher_actions, text="Neu laden", command=self._reload_competitor_catalog).grid(row=0, column=1, padx=(8, 0))
         ttk.Entry(self.deepl_content_frame, textvariable=self.competitor_source_path_var).grid(row=12, column=1, sticky="ew", pady=6)
         ttk.Label(
             self.deepl_content_frame,
-            text="Diese Datei wird fuer OE-Nummern und Vergleichsnummern verwendet. OE nutzt alle Hersteller, Vergleichsnummern nur Eintraege mit VGL-Flag.",
+            text="Diese Datei wird für OE-Nummern und Vergleichsnummern verwendet. OE nutzt alle Hersteller, Vergleichsnummern nur Einträge mit VGL-Flag.",
             foreground="#5E6472",
             wraplength=1000,
         ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -8904,20 +9072,20 @@ if ($copied) {{
         ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_source_path_var).grid(row=15, column=1, sticky="ew", pady=6)
         attribute_actions = ttk.Frame(self.deepl_content_frame)
         attribute_actions.grid(row=15, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(attribute_actions, text="Datei waehlen", command=self.choose_attribute_source_file).grid(row=0, column=0)
+        ttk.Button(attribute_actions, text="Datei wählen", command=self.choose_attribute_source_file).grid(row=0, column=0)
         ttk.Button(attribute_actions, text="Neu laden", command=self._reload_attribute_catalog).grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(self.deepl_content_frame, text="Schluesselwerte XLSX").grid(row=16, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(self.deepl_content_frame, text="Schlüsselwerte XLSX").grid(row=16, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_key_value_source_path_var).grid(
             row=16, column=1, sticky="ew", pady=6
         )
         key_value_actions = ttk.Frame(self.deepl_content_frame)
         key_value_actions.grid(row=16, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(key_value_actions, text="Datei waehlen", command=self.choose_attribute_key_value_source_file).grid(row=0, column=0)
+        ttk.Button(key_value_actions, text="Datei wählen", command=self.choose_attribute_key_value_source_file).grid(row=0, column=0)
         ttk.Button(key_value_actions, text="Neu laden", command=self._reload_attribute_key_value_catalog).grid(row=0, column=1, padx=(8, 0))
         ttk.Label(
             self.deepl_content_frame,
-            text="Die Attributliste liefert TecDoc Kriterien, Formate und Bezeichnungen; Schluesselwerte liefern die moeglichen Auswahlwerte.",
+            text="Die Attributliste liefert TecDoc Kriterien, Formate und Bezeichnungen; Schlüsselwerte liefern die möglichen Auswahlwerte.",
             foreground="#5E6472",
             wraplength=1000,
         ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -8932,13 +9100,13 @@ if ($copied) {{
         ttk.Entry(self.deepl_content_frame, textvariable=self.vehicle_source_path_var).grid(row=20, column=1, sticky="ew", pady=6)
         vehicle_actions = ttk.Frame(self.deepl_content_frame)
         vehicle_actions.grid(row=20, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(vehicle_actions, text="Datei waehlen", command=self.choose_vehicle_source_file).grid(row=0, column=0)
+        ttk.Button(vehicle_actions, text="Datei wählen", command=self.choose_vehicle_source_file).grid(row=0, column=0)
         ttk.Button(vehicle_actions, text="Neu laden", command=self._reload_vehicle_catalog).grid(row=0, column=1, padx=(8, 0))
         ttk.Label(
             self.deepl_content_frame,
             text=(
-                "KTyp-Stammdaten (Motorcode -> KTyp-Nummer). Wird im Tab 'Fahrzeuge' verwendet, um ueber Motorcodes "
-                "die KTyp-Nummern (TopMotive/TecDoc) zu finden. Datei bei Bedarf aktualisieren und 'Neu laden' druecken."
+                "KTyp-Stammdaten (Motorcode -> KTyp-Nummer). Wird im Tab 'Fahrzeuge' verwendet, um über Motorcodes "
+                "die KTyp-Nummern (TopMotive/TecDoc) zu finden. Datei bei Bedarf aktualisieren und 'Neu laden' drücken."
             ),
             foreground="#5E6472",
             wraplength=1000,
@@ -8951,13 +9119,13 @@ if ($copied) {{
         ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_mapping_source_path_var).grid(row=23, column=1, sticky="ew", pady=6)
         mapping_actions = ttk.Frame(self.deepl_content_frame)
         mapping_actions.grid(row=23, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(mapping_actions, text="Datei waehlen", command=self.choose_attribute_mapping_source_file).grid(row=0, column=0)
+        ttk.Button(mapping_actions, text="Datei wählen", command=self.choose_attribute_mapping_source_file).grid(row=0, column=0)
         ttk.Button(mapping_actions, text="Neu laden", command=self._reload_attribute_mapping).grid(row=0, column=1, padx=(8, 0))
         ttk.Label(
             self.deepl_content_frame,
             text=(
-                "Zuordnung von Text-Labels (z.B. 'Gewicht') zu TecDoc Kriterien IDs fuer 'Attribute aus Text vorschlagen'. "
-                "Manuell zugewiesene Labels koennen aus dem Vorschlagsdialog automatisch ergaenzt werden."
+                "Zuordnung von Text-Labels (z.B. 'Gewicht') zu TecDoc Kriterien IDs für 'Attribute aus Text vorschlagen'. "
+                "Manuell zugewiesene Labels können aus dem Vorschlagsdialog automatisch ergänzt werden."
             ),
             foreground="#5E6472",
             wraplength=1000,
@@ -8984,7 +9152,7 @@ if ($copied) {{
         ttk.Button(browser_header, textvariable=self.article_browser_toggle_var, command=self._toggle_article_browser_section).grid(
             row=0, column=1, padx=(12, 8)
         )
-        ttk.Button(browser_header, text="Ausgewaehlten Artikel laden", command=self.load_selected_article_from_browser).grid(
+        ttk.Button(browser_header, text="Ausgewählten Artikel laden", command=self.load_selected_article_from_browser).grid(
             row=0, column=2, padx=(0, 8)
         )
         ttk.Button(browser_header, text="Liste aktualisieren", command=self.refresh_preview).grid(row=0, column=3)
@@ -9040,7 +9208,7 @@ if ($copied) {{
 
         self.article_browser_context_menu = tk.Menu(browser_frame, tearoff=0)
         self.article_browser_context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_articles_from_browser)
-        self.article_browser_context_menu.add_command(label="Zeilen loeschen", command=self.delete_selected_articles_from_browser)
+        self.article_browser_context_menu.add_command(label="Zeilen löschen", command=self.delete_selected_articles_from_browser)
 
         browser_scrollbar = ttk.Scrollbar(browser_table_frame, orient="vertical", command=self.article_browser_tree.yview)
         browser_scrollbar.grid(row=0, column=1, sticky="ns")
@@ -9054,7 +9222,7 @@ if ($copied) {{
 
         ttk.Label(
             detail_frame,
-            text="Die Detailansicht zeigt alle Daten, die aktuell in den Export-Excel-Dateien fuer den markierten Artikel vorhanden sind.",
+            text="Die Detailansicht zeigt alle Daten, die aktuell in den Export-Excel-Dateien für den markierten Artikel vorhanden sind.",
             foreground="#5E6472",
             wraplength=380,
         ).grid(row=0, column=0, sticky="w", pady=(0, 10))
@@ -9104,7 +9272,7 @@ if ($copied) {{
         header.columnconfigure(0, weight=1)
         ttk.Label(
             header,
-            text="Mehrere GenArten koennen pro Artikel gesetzt und gemeinsam exportiert werden.",
+            text="Mehrere GenArten können pro Artikel gesetzt und gemeinsam exportiert werden.",
             foreground="#5E6472",
             wraplength=920,
         ).grid(row=0, column=0, sticky="w")
@@ -9126,7 +9294,7 @@ if ($copied) {{
             on_missing_selection=self._handle_missing_genart_selection,
             min_width=520,
         )
-        ttk.Button(input_row, text="Hinzufuegen", command=self.add_current_genart_selection).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=6)
+        ttk.Button(input_row, text="Hinzufügen", command=self.add_current_genart_selection).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=6)
         ttk.Button(input_row, text="Suchen...", command=self._open_genart_search_dialog).grid(row=0, column=3, sticky="w", padx=(8, 0), pady=6)
 
         hint_row = ttk.Frame(genart_frame)
@@ -9181,7 +9349,7 @@ if ($copied) {{
         ).grid(row=0, column=0)
         ttk.Label(
             attribute_actions,
-            text="Liest technische Angaben aus Kurzbezeichnung und Text und schlaegt passende Attribute vor.",
+            text="Liest technische Angaben aus Kurzbezeichnung und Text und schlägt passende Attribute vor.",
             foreground="#5E6472",
         ).grid(row=0, column=1, padx=(10, 0))
 
@@ -9232,7 +9400,7 @@ if ($copied) {{
             self.image_tab,
             title="Bilder",
             path_label="Bild-URL",
-            path_dialog_title="Bilddateien auswaehlen",
+            path_dialog_title="Bilddateien auswählen",
             default_art="5",
             default_sprache="255",
             browse_filetypes=[("Bilddateien", "*.png *.jpg *.jpeg *.webp *.tif *.tiff"), ("Alle Dateien", "*.*")],
@@ -9245,7 +9413,7 @@ if ($copied) {{
             self.document_tab,
             title="Dokumente",
             path_label="Dokument-URL",
-            path_dialog_title="Dokumente auswaehlen",
+            path_dialog_title="Dokumente auswählen",
             default_art="17",
             default_sprache="255",
             browse_filetypes=[("PDF Dateien", "*.pdf"), ("Alle Dateien", "*.*")],
@@ -9275,14 +9443,14 @@ if ($copied) {{
         self.web_frame.grid(row=1, column=0, sticky="nsew")
 
     def choose_import_dir(self) -> None:
-        selected = filedialog.askdirectory(title="Importordner waehlen", initialdir=self.import_dir_var.get())
+        selected = filedialog.askdirectory(title="Importordner wählen", initialdir=self.import_dir_var.get())
         if selected:
             self.import_dir_var.set(selected)
             self._load_known_ids()
             self.refresh_preview()
 
     def choose_output_dir(self) -> None:
-        selected = filedialog.askdirectory(title="Ausgabeordner waehlen", initialdir=self.output_dir_var.get())
+        selected = filedialog.askdirectory(title="Ausgabeordner wählen", initialdir=self.output_dir_var.get())
         if selected:
             self.output_dir_var.set(selected)
             self.status_var.set(f"Ausgabeordner gesetzt: {selected}")
@@ -9292,7 +9460,7 @@ if ($copied) {{
     def choose_product_list_file(self) -> None:
         initial_dir = str(Path(self.product_list_path_var.get()).parent) if self.product_list_path_var.get().strip() else str(Path.cwd())
         selected = filedialog.askopenfilename(
-            title="Produktliste CSV/XLSX waehlen",
+            title="Produktliste CSV/XLSX wählen",
             initialdir=initial_dir,
             filetypes=[("Importlisten", "*.csv *.xlsx"), ("CSV Dateien", "*.csv"), ("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
         )
@@ -9307,7 +9475,7 @@ if ($copied) {{
             else str(DEFAULT_GENART_SOURCE.parent)
         )
         selected = filedialog.askopenfilename(
-            title="GenArt XLSX waehlen",
+            title="GenArt XLSX wählen",
             initialdir=initial_dir,
             filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
         )
@@ -9325,7 +9493,7 @@ if ($copied) {{
             else str(DEFAULT_ATTRIBUTE_SOURCE.parent)
         )
         selected = filedialog.askopenfilename(
-            title="Attribut XLSX waehlen",
+            title="Attribut XLSX wählen",
             initialdir=initial_dir,
             filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
         )
@@ -9343,7 +9511,7 @@ if ($copied) {{
             else str(DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE.parent)
         )
         selected = filedialog.askopenfilename(
-            title="Schluesselwert XLSX waehlen",
+            title="Schlüsselwert XLSX wählen",
             initialdir=initial_dir,
             filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
         )
@@ -9361,7 +9529,7 @@ if ($copied) {{
             else str(DEFAULT_VEHICLE_SOURCE.parent)
         )
         selected = filedialog.askopenfilename(
-            title="KTyp XLSX waehlen",
+            title="KTyp XLSX wählen",
             initialdir=initial_dir,
             filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
         )
@@ -9379,7 +9547,7 @@ if ($copied) {{
             else str(DEFAULT_ATTRIBUTE_MAPPING_SOURCE.parent)
         )
         selected = filedialog.askopenfilename(
-            title="Attribut-Zuordnung XLSX waehlen",
+            title="Attribut-Zuordnung XLSX wählen",
             initialdir=initial_dir,
             filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
         )
@@ -9410,7 +9578,7 @@ if ($copied) {{
             return
         self.attribute_mapping_count_var.set(f"{len(self.attribute_mapping)} Zuordnungen geladen")
         if not initial:
-            self.status_var.set(f"Attribut-Zuordnung geladen: {len(self.attribute_mapping)} Eintraege")
+            self.status_var.set(f"Attribut-Zuordnung geladen: {len(self.attribute_mapping)} Einträge")
 
     def _open_attribute_suggestion_dialog(self, auto: bool = False) -> None:
         text = "\n".join(
@@ -9420,11 +9588,11 @@ if ($copied) {{
         )
         if not text.strip():
             if not auto:
-                messagebox.showinfo(APP_TITLE, "Kein deutscher Text vorhanden, aus dem Attribute gelesen werden koennten.")
+                messagebox.showinfo(APP_TITLE, "Kein deutscher Text vorhanden, aus dem Attribute gelesen werden könnten.")
             return
         if not self.attribute_options_by_id:
             if not auto:
-                messagebox.showwarning(APP_TITLE, "Es ist keine Attributliste geladen (Datenstaemme im Projekt-Tab).")
+                messagebox.showwarning(APP_TITLE, "Es ist keine Attributliste geladen (Datenstämme im Projekt-Tab).")
             return
         suggestions, unmatched = build_attribute_suggestions_from_text(
             text,
@@ -9461,7 +9629,7 @@ if ($copied) {{
             if new_rows:
                 self.attribute_frame.set_rows(existing + new_rows)
                 added = len(new_rows)
-                self._write_live_section("attributes", status_message=f"{added} Attribut(e) aus Text uebernommen")
+                self._write_live_section("attributes", status_message=f"{added} Attribut(e) aus Text übernommen")
 
         if learned:
             source_text = self.attribute_mapping_source_path_var.get().strip() or str(DEFAULT_ATTRIBUTE_MAPPING_SOURCE)
@@ -9480,18 +9648,18 @@ if ($copied) {{
                     self.attribute_mapping_source_path_var.set(str(source_path))
                     self.attribute_mapping_count_var.set(f"{len(self.attribute_mapping)} Zuordnungen geladen")
                     self.status_var.set(
-                        f"{added} Attribut(e) uebernommen, {len(entries)} Zuordnung(en) gemerkt."
+                        f"{added} Attribut(e) übernommen, {len(entries)} Zuordnung(en) gemerkt."
                     )
                 except Exception as exc:  # pragma: no cover - defensive UI feedback
                     messagebox.showwarning(APP_TITLE, f"Zuordnung konnte nicht gespeichert werden:\n{exc}")
         elif added == 0:
-            self.status_var.set("Keine neuen Attribute uebernommen.")
+            self.status_var.set("Keine neuen Attribute übernommen.")
 
     def _apply_vehicle_catalog(self, catalog: VehicleCatalog) -> None:
         self.vehicle_catalog = catalog
         if hasattr(self, "vehicle_link_frame"):
             self.vehicle_link_frame.set_vehicle_catalog(catalog)
-        self.vehicle_count_var.set(f"{catalog.count} KTyp-Datensaetze geladen")
+        self.vehicle_count_var.set(f"{catalog.count} KTyp-Datensätze geladen")
 
     def _load_vehicle_catalog(self, initial: bool = False) -> None:
         source_text = self.vehicle_source_path_var.get().strip()
@@ -9529,7 +9697,7 @@ if ($copied) {{
                 self._apply_vehicle_catalog(catalog)
                 self.article_browser_cache_signature = None
                 if not initial:
-                    self.status_var.set(f"KTyp-Stammdaten geladen: {catalog.count} Datensaetze")
+                    self.status_var.set(f"KTyp-Stammdaten geladen: {catalog.count} Datensätze")
 
             self.root.after(0, finish)
 
@@ -9542,7 +9710,7 @@ if ($copied) {{
             else str(DEFAULT_COMPETITOR_SOURCE.parent)
         )
         selected = filedialog.askopenfilename(
-            title="KHer CSV waehlen",
+            title="KHer CSV wählen",
             initialdir=initial_dir,
             filetypes=[("CSV Dateien", "*.csv"), ("Alle Dateien", "*.*")],
         )
@@ -9598,12 +9766,12 @@ if ($copied) {{
             )
         else:
             self.genart_suggestion_var.set(
-                "GenArt-Katalog geladen. Du kannst im Feld tippen oder ueber 'Suchen...' gezielt filtern."
+                "GenArt-Katalog geladen. Du kannst im Feld tippen oder über 'Suchen...' gezielt filtern."
             )
         if self.genart_display_var.get().strip():
             self._normalize_genart_selection()
         if not initial:
-            self.status_var.set(f"GenArt-Katalog geladen: {count} Eintraege")
+            self.status_var.set(f"GenArt-Katalog geladen: {count} Einträge")
 
     def _load_competitor_catalog(self, initial: bool = False) -> None:
         source_path = Path(self.competitor_source_path_var.get().strip()) if self.competitor_source_path_var.get().strip() else None
@@ -9651,7 +9819,7 @@ if ($copied) {{
         self.article_browser_cache_signature = None
         if not initial:
             self.status_var.set(
-                f"KHer-CSV geladen: {len(manufacturer_options)} Hersteller, {len(competitor_options)} Mitbewerber fuer Vergleichsnummern"
+                f"KHer-CSV geladen: {len(manufacturer_options)} Hersteller, {len(competitor_options)} Mitbewerber für Vergleichsnummern"
             )
             self.refresh_preview()
 
@@ -9687,7 +9855,7 @@ if ($copied) {{
             self.attribute_frame.set_attribute_catalog(options)
         self.article_browser_cache_signature = None
         if not initial:
-            self.status_var.set(f"Attributkatalog geladen: {len(options)} Eintraege")
+            self.status_var.set(f"Attributkatalog geladen: {len(options)} Einträge")
             self.refresh_preview()
 
     def _load_attribute_key_value_catalog(self, initial: bool = False) -> None:
@@ -9699,11 +9867,11 @@ if ($copied) {{
         if source_path is None or not path_exists_safe(source_path):
             self.attribute_key_value_options = []
             self.attribute_key_values_by_group = {}
-            self.attribute_key_value_count_var.set("0 Schluesselwerte geladen")
+            self.attribute_key_value_count_var.set("0 Schlüsselwerte geladen")
             if hasattr(self, "attribute_frame"):
                 self.attribute_frame.set_attribute_key_value_catalog({})
             if not initial and source_path is not None:
-                self.status_var.set(f"Schluesselwertdatei nicht gefunden: {source_path}")
+                self.status_var.set(f"Schlüsselwertdatei nicht gefunden: {source_path}")
             return
 
         try:
@@ -9711,7 +9879,7 @@ if ($copied) {{
         except ValueError as exc:
             self.attribute_key_value_options = []
             self.attribute_key_values_by_group = {}
-            self.attribute_key_value_count_var.set("0 Schluesselwerte geladen")
+            self.attribute_key_value_count_var.set("0 Schlüsselwerte geladen")
             if hasattr(self, "attribute_frame"):
                 self.attribute_frame.set_attribute_key_value_catalog({})
             if not initial:
@@ -9722,13 +9890,13 @@ if ($copied) {{
         self.attribute_key_value_options = options
         self.attribute_key_values_by_group = build_attribute_key_value_group_index(options)
         self.attribute_key_value_count_var.set(
-            f"{len(options)} Schluesselwerte in {len(self.attribute_key_values_by_group)} Gruppen geladen"
+            f"{len(options)} Schlüsselwerte in {len(self.attribute_key_values_by_group)} Gruppen geladen"
         )
         if hasattr(self, "attribute_frame"):
             self.attribute_frame.set_attribute_key_value_catalog(self.attribute_key_values_by_group)
         self.article_browser_cache_signature = None
         if not initial:
-            self.status_var.set(f"Schluesselwertkatalog geladen: {len(options)} Eintraege")
+            self.status_var.set(f"Schlüsselwertkatalog geladen: {len(options)} Einträge")
             self.refresh_preview()
 
     def _refresh_genart_combobox_values(self) -> None:
@@ -9827,7 +9995,7 @@ if ($copied) {{
             return False
 
         self._set_selected_genart_selections([*self.selected_genart_selections, canonical], focus_last=True)
-        self.genart_suggestion_var.set(suggestion_message or f"GenArt hinzugefuegt: {canonical.display_label()}")
+        self.genart_suggestion_var.set(suggestion_message or f"GenArt hinzugefügt: {canonical.display_label()}")
         if write_live:
             self._write_live_section("genart")
         return True
@@ -9837,7 +10005,7 @@ if ($copied) {{
             self._load_genart_catalog()
         selection = self._resolve_current_genart_selection(prefer_first_suggestion=True)
         if selection is None:
-            self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
+            self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste wählen oder Vorschlag nutzen.")
             return
         self._add_genart_selection(selection)
 
@@ -9846,7 +10014,7 @@ if ($copied) {{
         self.add_current_genart_selection()
 
     def _handle_missing_genart_selection(self) -> None:
-        self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
+        self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste wählen oder Vorschlag nutzen.")
 
     def _remove_selected_genarts_event(self, _event: tk.Event[tk.Misc]) -> str:
         self.remove_selected_genarts()
@@ -9880,7 +10048,7 @@ if ($copied) {{
             return
         self._set_selected_genart_selections([])
         self.genart_display_var.set("")
-        self.genart_suggestion_var.set("Keine GenArt fuer diesen Artikel gesetzt.")
+        self.genart_suggestion_var.set("Keine GenArt für diesen Artikel gesetzt.")
         self._write_live_section("genart")
 
     def _open_genart_search_dialog_event(self, _event: tk.Event[tk.Misc]) -> str:
@@ -9902,7 +10070,7 @@ if ($copied) {{
 
         self._add_genart_selection(
             GenArtSelection(id=selected_option.id, bezeichnung=selected_option.bezeichnung),
-            suggestion_message=f"GenArt hinzugefuegt: {selected_option.display_label()}",
+            suggestion_message=f"GenArt hinzugefügt: {selected_option.display_label()}",
         )
 
     def _on_genart_focus_in(self, _event: tk.Event[tk.Misc]) -> None:
@@ -9918,7 +10086,7 @@ if ($copied) {{
         if selection is not None:
             self._add_genart_selection(selection)
         else:
-            self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
+            self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste wählen oder Vorschlag nutzen.")
         return "break"
 
     def _normalize_genart_selection(self) -> bool:
@@ -9933,7 +10101,7 @@ if ($copied) {{
 
         parsed_selection = parse_genart_selection_label(current_value)
         if parsed_selection is None or (self.genart_registry.options and "|" not in current_value):
-            self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste waehlen oder Vorschlag nutzen.")
+            self.genart_suggestion_var.set("GenArt nicht erkannt. Bitte aus der Liste wählen oder Vorschlag nutzen.")
             return False
         self.genart_display_var.set(self._canonicalize_genart_selection(parsed_selection).display_label())
         return True
@@ -10329,7 +10497,7 @@ if ($copied) {{
             elif section == "attributes":
                 self._write_attribute_live(bundle, output_root)
             elif section == "search_terms":
-                # Suchwoerter liegen mit in der Attribute-Datei.
+                # Suchwörter liegen mit in der Attribute-Datei.
                 self._write_attribute_live(bundle, output_root)
             elif section == "images":
                 self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
@@ -10429,7 +10597,7 @@ if ($copied) {{
             "web_links": self.batch_web_var.get(),
         }
         if not any(options.values()):
-            raise ValueError("Bitte fuer den Listenimport mindestens eine Datenart auswaehlen.")
+            raise ValueError("Bitte für den Listenimport mindestens eine Datenart auswählen.")
         return options
 
     def _build_translation_set(
@@ -10533,7 +10701,7 @@ if ($copied) {{
             self.oe_frame.set_rows([])
             self.comparison_frame.set_rows([])
             self.vehicle_link_frame.set_rows([])
-            self.genart_suggestion_var.set("GenArt bitte ueber das Suchfeld oder 'Suchen...' auswaehlen.")
+            self.genart_suggestion_var.set("GenArt bitte über das Suchfeld oder 'Suchen...' auswählen.")
 
         if translate_after_load and self.auto_translate_after_scrape_var.get() and self.deepl_api_key_var.get().strip():
             self._translate_loaded_texts()
@@ -10541,7 +10709,7 @@ if ($copied) {{
         self.refresh_preview()
         if write_live:
             self._write_live_database(status_message=f"Live gespeichert: {normalize_article_number(result.article_number)}")
-        # Nach dem Laden automatisch Attributvorschlaege aus dem Text anbieten.
+        # Nach dem Laden automatisch Attributvorschläge aus dem Text anbieten.
         self.root.after(200, lambda: self._open_attribute_suggestion_dialog(auto=True))
 
     def _translate_loaded_texts(self) -> None:
@@ -10600,7 +10768,7 @@ if ($copied) {{
     def import_products_from_file(self) -> None:
         source_path = Path(self.product_list_path_var.get().strip())
         if not source_path:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Produktliste als CSV oder XLSX auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Produktliste als CSV oder XLSX auswählen.")
             return
         if not source_path.exists():
             messagebox.showwarning(APP_TITLE, f"Produktliste nicht gefunden:\n{source_path}")
@@ -10699,7 +10867,7 @@ if ($copied) {{
     def _translate_frame_from_german(self, frame: SingleLineTranslationFrame | MultiLineTranslationFrame, label: str) -> None:
         german_text = frame.get_german_text()
         if not german_text:
-            raise ValueError(f"Bitte zuerst den deutschen Text fuer {label} eingeben.")
+            raise ValueError(f"Bitte zuerst den deutschen Text für {label} eingeben.")
 
         client = self._build_deepl_client()
 
@@ -10711,13 +10879,13 @@ if ($copied) {{
             frame.apply_translations(translations)
             self.refresh_preview()
             self._write_live_database(status_message=f"Live gespeichert: {normalize_article_number(self.article_number_var.get())}")
-            self.status_var.set(f"{label} mit DeepL aus Deutsch uebersetzt.")
+            self.status_var.set(f"{label} mit DeepL aus Deutsch übersetzt.")
 
         self._run_background_task(
-            f"{label} wird mit DeepL uebersetzt ...",
+            f"{label} wird mit DeepL übersetzt ...",
             worker,
             on_success,
-            f"{label} Uebersetzung fehlgeschlagen",
+            f"{label} Übersetzung fehlgeschlagen",
         )
 
     def translate_short_texts(self) -> None:
@@ -10756,13 +10924,13 @@ if ($copied) {{
                 self.long_text_frame.apply_translations(long_translations)
             self.refresh_preview()
             self._write_live_database(status_message=f"Live gespeichert: {normalize_article_number(self.article_number_var.get())}")
-            self.status_var.set("Kurzbezeichnung und Text mit DeepL aus Deutsch uebersetzt.")
+            self.status_var.set("Kurzbezeichnung und Text mit DeepL aus Deutsch übersetzt.")
 
         self._run_background_task(
-            "Kurzbezeichnung und Text werden mit DeepL uebersetzt ...",
+            "Kurzbezeichnung und Text werden mit DeepL übersetzt ...",
             worker,
             on_success,
-            "DeepL Uebersetzung fehlgeschlagen",
+            "DeepL Übersetzung fehlgeschlagen",
         )
 
     def _load_known_ids(self, initial: bool = False) -> None:
@@ -10828,13 +10996,13 @@ if ($copied) {{
             )
             self.long_text_frame.set_value(
                 TranslationSet(
-                    de="- Demo-Produkt fuer die GUI\n- Zeigt den Ablauf fuer neue Artikel\n- Exportiert die benoetigten Excel-Dateien",
+                    de="- Demo-Produkt für die GUI\n- Zeigt den Ablauf für neue Artikel\n- Exportiert die benötigten Excel-Dateien",
                     en="- Demo product for the GUI\n- Shows the workflow for new articles\n- Exports the required Excel files",
                     cz="- Demo produkt pro GUI\n- Ukazuje postup pro nove polozky\n- Exportuje potrebne Excel soubory",
                     fr="- Produit de demonstration pour l'interface\n- Montre le flux pour les nouveaux articles\n- Exporte les fichiers Excel necessaires",
                     it="- Prodotto demo per la GUI\n- Mostra il flusso per nuovi articoli\n- Esporta i file Excel necessari",
                     nl="- Demo-product voor de GUI\n- Toont de workflow voor nieuwe artikelen\n- Exporteert de benodigde Excel-bestanden",
-                    uni="- Demo-Produkt fuer die GUI\n- Zeigt den Ablauf fuer neue Artikel\n- Exportiert die benoetigten Excel-Dateien",
+                    uni="- Demo-Produkt für die GUI\n- Zeigt den Ablauf für neue Artikel\n- Exportiert die benötigten Excel-Dateien",
                 ),
                 auto_uni=True,
             )
@@ -10927,7 +11095,7 @@ if ($copied) {{
         if snapshot is None:
             self.article_browser_detail.insert(
                 "1.0",
-                "Waehle einen Artikel im Verzeichnis aus, um alle vorhandenen Exportdaten anzuzeigen.\n\n"
+                "Wähle einen Artikel im Verzeichnis aus, um alle vorhandenen Exportdaten anzuzeigen.\n\n"
                 "Mit Doppelklick oder dem Button kannst du den Artikel anschliessend in die Bearbeitungsmaske laden.",
             )
         else:
@@ -10942,8 +11110,8 @@ if ($copied) {{
             "Mehrere Artikel markiert.\n\n"
             f"Anzahl: {len(article_numbers)}\n"
             "Aktionen:\n"
-            "- Rechtsklick fuer Kopieren oder Loeschen\n"
-            "- Doppelklick oder 'Ausgewaehlten Artikel laden' ist fuer einen einzelnen Artikel gedacht\n\n"
+            "- Rechtsklick für Kopieren oder Löschen\n"
+            "- Doppelklick oder 'Ausgewählten Artikel laden' ist für einen einzelnen Artikel gedacht\n\n"
             "Markierte Artikel:\n"
             + "\n".join(article_numbers),
         )
@@ -10962,7 +11130,7 @@ if ($copied) {{
                 f"Gespeicherte GenArten: {summarize_genart_selections(snapshot.genart_selections, empty_label='-', limit=3)}"
             )
         else:
-            self.genart_suggestion_var.set("Keine GenArt fuer diesen Artikel gespeichert.")
+            self.genart_suggestion_var.set("Keine GenArt für diesen Artikel gespeichert.")
         self.short_text_frame.set_value(snapshot.short_texts, auto_uni=snapshot.short_auto_uni)
         self.long_text_frame.set_value(snapshot.long_texts, auto_uni=snapshot.long_auto_uni)
         self.attribute_frame.set_rows(snapshot.attribute_rows)
@@ -10983,15 +11151,15 @@ if ($copied) {{
     def load_selected_article_from_browser(self) -> None:
         selection = self.article_browser_tree.selection()
         if not selection:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Artikel im Verzeichnis auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Artikel im Verzeichnis auswählen.")
             return
         if len(selection) > 1:
-            messagebox.showwarning(APP_TITLE, "Bitte zum Laden genau einen Artikel im Verzeichnis auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zum Laden genau einen Artikel im Verzeichnis auswählen.")
             return
 
         snapshot = self.article_browser_records.get(selection[0])
         if snapshot is None:
-            messagebox.showwarning(APP_TITLE, "Der ausgewaehlte Artikel konnte nicht geladen werden.")
+            messagebox.showwarning(APP_TITLE, "Der ausgewählte Artikel konnte nicht geladen werden.")
             return
 
         self._apply_article_snapshot(snapshot)
@@ -11023,7 +11191,7 @@ if ($copied) {{
         if self.article_browser_context_menu is None:
             return
         self.article_browser_context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
-        self.article_browser_context_menu.entryconfigure("Zeilen loeschen", state="normal" if has_selection else "disabled")
+        self.article_browser_context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
         self.article_browser_context_menu.tk_popup(event.x_root, event.y_root)
         self.article_browser_context_menu.grab_release()
 
@@ -11043,7 +11211,7 @@ if ($copied) {{
     def delete_selected_articles_from_browser(self) -> None:
         selection = list(self.article_browser_tree.selection())
         if not selection:
-            messagebox.showwarning(APP_TITLE, "Bitte zuerst mindestens einen Artikel im Verzeichnis auswaehlen.")
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst mindestens einen Artikel im Verzeichnis auswählen.")
             return
 
         article_numbers = [normalize_article_number(item_id) for item_id in selection if normalize_article_number(item_id)]
@@ -11055,7 +11223,7 @@ if ($copied) {{
             article_preview += f"\n... und {len(article_numbers) - 8} weitere"
         confirmed = messagebox.askyesno(
             APP_TITLE,
-            "Sollen die markierten Artikel wirklich aus allen Output-Dateien geloescht werden?\n\n" + article_preview,
+            "Sollen die markierten Artikel wirklich aus allen Output-Dateien gelöscht werden?\n\n" + article_preview,
         )
         if not confirmed:
             return
@@ -11078,15 +11246,15 @@ if ($copied) {{
             ]:
                 remove_article_rows_from_workbook(output_root / file_spec[0], file_spec[1], headers, set(article_numbers))
         except Exception as exc:  # pragma: no cover - defensive UI feedback
-            messagebox.showerror(APP_TITLE, f"Artikel konnten nicht geloescht werden:\n{exc}")
-            self.status_var.set(f"Loeschen fehlgeschlagen: {exc}")
+            messagebox.showerror(APP_TITLE, f"Artikel konnten nicht gelöscht werden:\n{exc}")
+            self.status_var.set(f"Löschen fehlgeschlagen: {exc}")
             return
 
         for article_number in article_numbers:
             self.article_browser_records.pop(article_number, None)
         self._load_known_ids(initial=True)
         self._refresh_article_browser()
-        self.status_var.set(f"{len(article_numbers)} Artikel aus den Output-Dateien geloescht.")
+        self.status_var.set(f"{len(article_numbers)} Artikel aus den Output-Dateien gelöscht.")
 
     def collect_bundle(self) -> ExportBundle:
         article_number = normalize_article_number(self.article_number_var.get())
