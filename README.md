@@ -35,6 +35,7 @@ Alternativ unter Windows:
 - Vergleichsnummern mit Mitbewerber-ID pro Artikel pflegen
 - Mitbewerber aus `KHer.csv` nachschlagen und direkt in Vergleichsnummern uebernehmen
 - Fahrzeugverknuepfungen pro Artikel ueber Motorcodes pflegen
+- Gefuehrter Modus (Wizard): fuehrt Schritt fuer Schritt durch alle Eingaben bis zum Export
   - ueber einen oder mehrere Motorcodes werden die passenden KTyp-Nummern (TopMotive und TecDoc) automatisch aus den KTyp-Stammdaten (`KTyp.xlsx`) ergaenzt
   - waehrend der Eingabe werden Motorcode-Vorschlaege inklusive `meintest du`-Naehe angezeigt
   - der Fahrzeugtyp ist per Dropdown waehlbar (Standard `PKW = 2`)
@@ -118,6 +119,16 @@ Unterstuetzte Spalten sind flexibel. Mindestens eine der beiden Gruppen muss vor
 - Produkt-URL: `Kunzer Produkt-URL`, `Kunzer URL`, `Produkt-URL`, `URL`, `Link`
 
 CSV-Dateien duerfen mit `;`, `,`, Tab oder `|` getrennt sein. XLSX-Dateien werden aus dem ersten Tabellenblatt gelesen. Neue Artikel werden im festen Importpfad angehaengt; existiert die Artikelnummer bereits, werden nur deren alte Zeilen ersetzt.
+
+## Gefuehrter Modus (Wizard)
+
+Der Button `Gefuehrter Modus` oben rechts startet eine Schrittleiste, die nacheinander durch alle Tabs fuehrt: Artikelnummer, Kurzbezeichnung, Produkttext, GenArt, Attribute, Suchwoerter, OE-Nummern, Vergleichsnummern, Fahrzeuge, Bilder, Dokumente und Links. Zum Schluss zeigt eine Zusammenfassung alle Zaehler und `Exportieren & Fertigstellen` schreibt die Importdateien.
+
+- Pflichtschritte (Artikelnummer, deutsche Kurzbezeichnung, deutscher Produkttext, mindestens eine GenArt, Hersteller je OE-Nummer) lassen erst weiter, wenn sie gueltig sind; die Fehlermeldung erscheint direkt in der Leiste
+- Optionale Schritte koennen mit `Weiter` uebersprungen werden
+- `Zurueck` und `Beenden` sind jederzeit moeglich; alle Eingaben landen in den normalen Tabs und bleiben erhalten
+
+Damit koennen auch neue Kolleginnen und Kollegen Artikel vollstaendig erfassen, ohne die Reihenfolge oder Pflichtfelder zu kennen.
 
 ## Fahrzeugverknuepfungen
 

@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.11"
+APP_VERSION = "0.1.12"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -7654,6 +7654,12 @@ class ApolloImportApp:
         self.article_browser_compact_mode: bool | None = None
         self._project_layout_after_id: str | None = None
         self._article_browser_layout_after_id: str | None = None
+        self.wizard_active = False
+        self.wizard_step_index = 0
+        self.wizard_steps: list[tuple[str, str, tk.Misc, str]] = []
+        self.wizard_step_var = tk.StringVar()
+        self.wizard_instruction_var = tk.StringVar()
+        self.wizard_error_var = tk.StringVar()
 
         self._configure_style()
         self._configure_window_icon()
@@ -7843,7 +7849,7 @@ class ApolloImportApp:
         shell = ttk.Frame(self.root, padding=18)
         shell.pack(fill="both", expand=True)
         shell.columnconfigure(0, weight=1)
-        shell.rowconfigure(1, weight=1)
+        shell.rowconfigure(2, weight=1)
 
         header = ttk.Frame(shell)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
@@ -7855,9 +7861,14 @@ class ApolloImportApp:
             text="Prototyp für die Erfassung eines Artikels und den Export der zugehörigen Importdateien.",
             foreground="#5E6472",
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(header, text="Geführter Modus", style="Accent.TButton", command=self.start_wizard).grid(
+            row=0, column=1, rowspan=2, sticky="e", padx=(12, 0)
+        )
+
+        self._build_wizard_bar(shell)
 
         self.main_notebook = ttk.Notebook(shell)
-        self.main_notebook.grid(row=1, column=0, sticky="nsew")
+        self.main_notebook.grid(row=2, column=0, sticky="nsew")
 
         self.project_tab = ttk.Frame(self.main_notebook, padding=18)
         self.short_tab = ttk.Frame(self.main_notebook, padding=18)
@@ -7893,8 +7904,205 @@ class ApolloImportApp:
         self._build_reference_tabs()
         self._build_media_tabs()
 
+        self.wizard_steps = [
+            (
+                "artikel",
+                "Artikel anlegen",
+                self.project_tab,
+                "Artikelnummer eingeben. Optional: Kunzer-Produkt-URL eintragen und 'Aus Kunzer laden' klicken – "
+                "das füllt Texte, Bilder und Dokumente automatisch.",
+            ),
+            (
+                "kurz",
+                "Kurzbezeichnung",
+                self.short_tab,
+                "Deutsche Kurzbezeichnung eingeben. Weitere Sprachen sind optional – 'Übersetzen' füllt sie per DeepL.",
+            ),
+            (
+                "lang",
+                "Produkttext",
+                self.long_tab,
+                "Deutschen Produkttext eingeben oder prüfen (bei Kunzer-Abruf bereits gefüllt).",
+            ),
+            (
+                "genart",
+                "GenArt zuordnen",
+                self.genart_tab,
+                "Mindestens eine GenArt über das Suchfeld oder 'Suchen…' auswählen.",
+            ),
+            (
+                "attribute",
+                "Attribute (optional)",
+                self.attribute_tab,
+                "Technische Attribute pflegen. Tipp: 'Aus Text vorschlagen' liest Werte automatisch aus dem Produkttext.",
+            ),
+            (
+                "suchwoerter",
+                "Suchwörter (optional)",
+                self.search_term_tab,
+                "Suchbegriffe hinterlegen, unter denen der Artikel gefunden werden soll (max. 20 Zeichen pro Wort).",
+            ),
+            (
+                "oe",
+                "OE-Nummern (optional)",
+                self.oe_tab,
+                "OE-Nummern mit Hersteller erfassen. Ohne Hersteller kann nicht exportiert werden.",
+            ),
+            (
+                "vergleich",
+                "Vergleichsnummern (optional)",
+                self.comparison_tab,
+                "Vergleichsnummern von Mitbewerbern erfassen.",
+            ),
+            (
+                "fahrzeuge",
+                "Fahrzeuge (optional)",
+                self.vehicle_tab,
+                "Motorcode(s) eingeben (mehrere mit Semikolon trennen) und 'Fahrzeuge hinzufügen' klicken.",
+            ),
+            (
+                "bilder",
+                "Bilder (optional)",
+                self.image_tab,
+                "Bildpfade oder -links prüfen bzw. ergänzen.",
+            ),
+            (
+                "dokumente",
+                "Dokumente (optional)",
+                self.document_tab,
+                "Dokumente (z. B. PDF-Datenblätter) prüfen bzw. ergänzen.",
+            ),
+            (
+                "links",
+                "Videos & Links (optional)",
+                self.links_tab,
+                "Video- und Web-Links prüfen bzw. ergänzen.",
+            ),
+            (
+                "fertig",
+                "Zusammenfassung & Export",
+                self.project_tab,
+                "",
+            ),
+        ]
+
         status_bar = ttk.Label(shell, textvariable=self.status_var, anchor="w", foreground="#5E6472")
-        status_bar.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        status_bar.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+
+    def _build_wizard_bar(self, shell: ttk.Frame) -> None:
+        self.wizard_frame = ttk.LabelFrame(shell, text="Geführter Modus", padding=(14, 10))
+        self.wizard_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        self.wizard_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            self.wizard_frame,
+            textvariable=self.wizard_step_var,
+            font=(f"{UI_FONT_FAMILY} Semibold", 11),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            self.wizard_frame,
+            textvariable=self.wizard_instruction_var,
+            foreground=UI_TEXT_MUTED,
+            wraplength=940,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(
+            self.wizard_frame,
+            textvariable=self.wizard_error_var,
+            foreground="#C2410C",
+            wraplength=940,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(2, 0))
+
+        wizard_buttons = ttk.Frame(self.wizard_frame)
+        wizard_buttons.grid(row=0, column=1, rowspan=3, sticky="ne", padx=(12, 0))
+        self.wizard_back_button = ttk.Button(wizard_buttons, text="Zurück", command=self._wizard_back)
+        self.wizard_back_button.grid(row=0, column=0, padx=(0, 8))
+        self.wizard_next_button = ttk.Button(wizard_buttons, text="Weiter", style="Accent.TButton", command=self._wizard_next)
+        self.wizard_next_button.grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(wizard_buttons, text="Beenden", command=self._end_wizard).grid(row=0, column=2)
+
+        self.wizard_frame.grid_remove()
+
+    def start_wizard(self) -> None:
+        self.wizard_active = True
+        self.wizard_step_index = 0
+        self.wizard_frame.grid()
+        self._wizard_show_step()
+        self.status_var.set("Geführter Modus gestartet.")
+
+    def _end_wizard(self, status_message: str | None = None) -> None:
+        self.wizard_active = False
+        self.wizard_frame.grid_remove()
+        self.status_var.set(status_message or "Geführter Modus beendet.")
+
+    def _wizard_show_step(self) -> None:
+        key, title, tab, instruction = self.wizard_steps[self.wizard_step_index]
+        try:
+            self.main_notebook.select(tab)
+        except tk.TclError:  # pragma: no cover - defensive
+            pass
+        self.wizard_step_var.set(f"Schritt {self.wizard_step_index + 1} von {len(self.wizard_steps)}: {title}")
+        if key == "fertig":
+            instruction = self._wizard_summary_text()
+        self.wizard_instruction_var.set(instruction)
+        self.wizard_error_var.set("")
+        self.wizard_back_button.state(["disabled"] if self.wizard_step_index == 0 else ["!disabled"])
+        self.wizard_next_button.configure(text="Exportieren & Fertigstellen" if key == "fertig" else "Weiter")
+
+    def _wizard_summary_text(self) -> str:
+        article = normalize_article_number(self.article_number_var.get()) or "-"
+        counts = [
+            f"Artikel: {article}",
+            f"GenArts: {len(self._get_selected_genart_selections())}",
+            f"Attribute: {len(self.attribute_frame.get_rows())}",
+            f"Suchwörter: {len(self.search_term_frame.get_terms())}",
+            f"OE-Nummern: {len(self.oe_frame.get_rows())}",
+            f"Vergleichsnummern: {len(self.comparison_frame.get_rows())}",
+            f"Fahrzeuge: {len(self.vehicle_link_frame.get_rows())}",
+            f"Bilder: {len(self.image_frame.get_rows())}",
+            f"Dokumente: {len(self.document_frame.get_rows())}",
+        ]
+        return "Alles geprüft? 'Exportieren & Fertigstellen' schreibt die Importdateien.\n" + "  ·  ".join(counts)
+
+    def _wizard_validation_error(self, key: str) -> str:
+        if key == "artikel" and not normalize_article_number(self.article_number_var.get()):
+            return "Bitte zuerst eine Artikelnummer eingeben."
+        if key == "kurz" and not self.short_text_frame.get_value().de.strip():
+            return "Bitte die deutsche Kurzbezeichnung eingeben."
+        if key == "lang" and not self.long_text_frame.get_value().de.strip():
+            return "Bitte den deutschen Produkttext eingeben."
+        if key == "genart" and not self._get_selected_genart_selections():
+            return "Bitte mindestens eine GenArt auswählen."
+        if key == "oe":
+            missing = [row.value for row in self.oe_frame.get_rows() if row.value.strip() and not row.manufacturer_id.strip()]
+            if missing:
+                shown = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
+                return f"Bitte für diese OE-Nummern einen Hersteller wählen: {shown}"
+        if key == "fertig":
+            for required_key in ("artikel", "kurz", "lang", "genart", "oe"):
+                error = self._wizard_validation_error(required_key)
+                if error:
+                    return error
+        return ""
+
+    def _wizard_next(self) -> None:
+        key = self.wizard_steps[self.wizard_step_index][0]
+        error = self._wizard_validation_error(key)
+        if error:
+            self.wizard_error_var.set(error)
+            return
+        if key == "fertig":
+            if self.export_current_bundle():
+                self._end_wizard("Geführter Modus abgeschlossen – Export erstellt.")
+            return
+        self.wizard_step_index += 1
+        self._wizard_show_step()
+
+    def _wizard_back(self) -> None:
+        if self.wizard_step_index > 0:
+            self.wizard_step_index -= 1
+            self._wizard_show_step()
 
     def _set_background_task_state(self, running: bool, status_message: str | None = None) -> None:
         self.background_task_running = running
@@ -11337,20 +11545,20 @@ if ($copied) {{
             self._ensure_ids_for_article(current_article)
         self._refresh_article_browser()
 
-    def export_current_bundle(self) -> None:
+    def export_current_bundle(self) -> bool:
         try:
             bundle = self.collect_bundle()
             output_root = self._resolve_output_root()
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
-            return
+            return False
 
         try:
             export_dir = export_bundle(bundle, output_root, use_timestamp_subdir=not self.fixed_export_path_var.get())
         except Exception as exc:  # pragma: no cover - defensive user feedback
             messagebox.showerror(APP_TITLE, f"Export fehlgeschlagen:\n{exc}")
             self.status_var.set(f"Export fehlgeschlagen: {exc}")
-            return
+            return False
 
         self.refresh_preview()
         if self.fixed_export_path_var.get():
@@ -11359,6 +11567,7 @@ if ($copied) {{
         else:
             self.status_var.set(f"Export erstellt: {export_dir}")
             messagebox.showinfo(APP_TITLE, f"Export erfolgreich erstellt:\n{export_dir}")
+        return True
 
 
 def main() -> None:
