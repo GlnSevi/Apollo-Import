@@ -36,6 +36,7 @@ Alternativ unter Windows:
 - Mitbewerber aus `KHer.csv` nachschlagen und direkt in Vergleichsnummern uebernehmen
 - Fahrzeugverknuepfungen pro Artikel ueber Motorcodes pflegen
 - Gefuehrter Modus (Wizard): fuehrt Schritt fuer Schritt durch alle Eingaben bis zum Export
+- Tabs nach Befuellung gruppiert: erst die automatisch befuellten (Kunzer-Abruf, Praefix ⚙), dann die manuell zu pflegenden (Praefix ✎)
   - ueber einen oder mehrere Motorcodes werden die passenden KTyp-Nummern (TopMotive und TecDoc) automatisch aus den KTyp-Stammdaten (`KTyp.xlsx`) ergaenzt
   - waehrend der Eingabe werden Motorcode-Vorschlaege inklusive `meintest du`-Naehe angezeigt
   - der Fahrzeugtyp ist per Dropdown waehlbar (Standard `PKW = 2`)
@@ -47,7 +48,7 @@ Alternativ unter Windows:
 - GenArt manuell ueber die Suche auswaehlen
   - mit direkter Suche ueber das GenArt-Feld oder den Button `Suchen...`
 - Produktdaten direkt von `kunzer.de` laden
-  - per Artikelnummer oder Produkt-URL
+  - per Artikelnummer
   - inklusive Titel, Web-Link, Bildern und Dokumenten
   - optional mit automatischer DeepL-Uebersetzung
   - mit Hintergrundladen, damit die GUI waehrenddessen fluessiger bleibt

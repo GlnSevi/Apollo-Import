@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.12"
+APP_VERSION = "0.1.13"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -7861,6 +7861,11 @@ class ApolloImportApp:
             text="Prototyp für die Erfassung eines Artikels und den Export der zugehörigen Importdateien.",
             foreground="#5E6472",
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            header,
+            text="⚙ = wird beim Kunzer-Abruf automatisch befüllt   ·   ✎ = manuell pflegen",
+            foreground="#5E6472",
+        ).grid(row=2, column=0, sticky="w", pady=(2, 0))
         ttk.Button(header, text="Geführter Modus", style="Accent.TButton", command=self.start_wizard).grid(
             row=0, column=1, rowspan=2, sticky="e", padx=(12, 0)
         )
@@ -7883,18 +7888,19 @@ class ApolloImportApp:
         self.document_tab = ttk.Frame(self.main_notebook, padding=18)
         self.links_tab = ttk.Frame(self.main_notebook, padding=18)
 
+        # Gruppierung: ⚙ = wird beim Kunzer-Abruf automatisch befuellt, ✎ = manuell pflegen.
         self.main_notebook.add(self.project_tab, text="Projekt")
-        self.main_notebook.add(self.short_tab, text="Kurzbezeichnung")
-        self.main_notebook.add(self.long_tab, text="Text")
-        self.main_notebook.add(self.genart_tab, text="GenArten")
-        self.main_notebook.add(self.attribute_tab, text="Attribute")
-        self.main_notebook.add(self.search_term_tab, text="Suchwörter")
-        self.main_notebook.add(self.oe_tab, text="OE-Nummern")
-        self.main_notebook.add(self.comparison_tab, text="Vergleichsnummern")
-        self.main_notebook.add(self.vehicle_tab, text="Fahrzeuge")
-        self.main_notebook.add(self.image_tab, text="Bilder")
-        self.main_notebook.add(self.document_tab, text="Dokumente")
-        self.main_notebook.add(self.links_tab, text="Links")
+        self.main_notebook.add(self.short_tab, text="⚙ Kurzbezeichnung")
+        self.main_notebook.add(self.long_tab, text="⚙ Text")
+        self.main_notebook.add(self.image_tab, text="⚙ Bilder")
+        self.main_notebook.add(self.document_tab, text="⚙ Dokumente")
+        self.main_notebook.add(self.links_tab, text="⚙ Links")
+        self.main_notebook.add(self.genart_tab, text="✎ GenArten")
+        self.main_notebook.add(self.attribute_tab, text="✎ Attribute")
+        self.main_notebook.add(self.search_term_tab, text="✎ Suchwörter")
+        self.main_notebook.add(self.oe_tab, text="✎ OE-Nummern")
+        self.main_notebook.add(self.comparison_tab, text="✎ Vergleichsnummern")
+        self.main_notebook.add(self.vehicle_tab, text="✎ Fahrzeuge")
 
         self._build_project_tab()
         self._build_short_tab()
@@ -7909,7 +7915,7 @@ class ApolloImportApp:
                 "artikel",
                 "Artikel anlegen",
                 self.project_tab,
-                "Artikelnummer eingeben. Optional: Kunzer-Produkt-URL eintragen und 'Aus Kunzer laden' klicken – "
+                "Artikelnummer eingeben. Optional: 'Aus Kunzer per Artikelnummer laden' klicken – "
                 "das füllt Texte, Bilder und Dokumente automatisch.",
             ),
             (
@@ -9172,30 +9178,19 @@ if ($copied) {{
             foreground="#5E6472",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        ttk.Label(self.article_content_frame, text="Kunzer Produkt-URL").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
-        kunzer_url_entry = ttk.Entry(self.article_content_frame, textvariable=self.kunzer_product_url_var)
-        kunzer_url_entry.grid(row=2, column=1, sticky="ew", pady=6)
-        kunzer_url_entry.bind("<FocusOut>", self._on_live_field_focus_out)
-
         kunzer_row = ttk.Frame(self.article_content_frame)
-        kunzer_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        kunzer_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Button(kunzer_row, text="Aus Kunzer per Artikelnummer laden", command=self.load_from_kunzer_article_number).grid(
-            row=0, column=0, padx=(0, 8)
+            row=0, column=0
         )
-        ttk.Button(kunzer_row, text="Aus Kunzer per URL laden", command=self.load_from_kunzer_url).grid(row=0, column=1)
 
         options_row = ttk.Frame(self.article_content_frame)
-        options_row.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        options_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
             options_row,
             text="Nach dem Laden automatisch mit DeepL übersetzen",
             variable=self.auto_translate_after_scrape_var,
         ).grid(row=0, column=0)
-
-        button_row = ttk.Frame(self.article_content_frame)
-        button_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Button(button_row, text="Beispiel laden", command=self.load_demo_data).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(button_row, text="Artikelliste aktualisieren", command=self.refresh_preview).grid(row=0, column=1)
 
         self.export_frame = ttk.LabelFrame(project_parent, text="Export", padding=14)
         export_frame = self.export_frame
@@ -10805,9 +10800,6 @@ if ($copied) {{
         self._ensure_ids_for_article(article_number)
         self._write_live_database()
 
-    def _on_live_field_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
-        self._write_live_database()
-
     def _resolve_ids_for_article(self, article_number: str) -> tuple[str, str]:
         article_key = normalize_article_number(article_number)
         if not article_key:
@@ -11016,9 +11008,6 @@ if ($copied) {{
 
     def load_from_kunzer_article_number(self) -> None:
         self._load_from_kunzer(self.article_number_var.get())
-
-    def load_from_kunzer_url(self) -> None:
-        self._load_from_kunzer(self.kunzer_product_url_var.get())
 
     def import_products_from_file(self) -> None:
         source_path = Path(self.product_list_path_var.get().strip())
@@ -11230,91 +11219,6 @@ if ($copied) {{
         else:
             sources = ", ".join(str(path) for path in loaded_from)
             self.status_var.set(f"IDs erfolgreich geladen aus: {sources}")
-
-    def load_demo_data(self) -> None:
-        with self._suspend_live_write():
-            self.article_number_var.set("WK DEMO-1000")
-            self._ensure_ids_for_article(self.article_number_var.get())
-            self._set_selected_genart_selections([])
-            self.genart_display_var.set("")
-            self.short_text_frame.set_value(
-                TranslationSet(
-                    de="Hydraulischer Demo-Heber 10 t",
-                    en="Hydraulic demo jack 10 t",
-                    cz="Hydraulicky demo zvedak 10 t",
-                    fr="Cric hydraulique de demonstration 10 t",
-                    it="Martinetto idraulico demo 10 t",
-                    nl="Hydraulische demo krik 10 t",
-                    uni="Hydraulischer Demo-Heber 10 t",
-                ),
-                auto_uni=True,
-            )
-            self.long_text_frame.set_value(
-                TranslationSet(
-                    de="- Demo-Produkt für die GUI\n- Zeigt den Ablauf für neue Artikel\n- Exportiert die benötigten Excel-Dateien",
-                    en="- Demo product for the GUI\n- Shows the workflow for new articles\n- Exports the required Excel files",
-                    cz="- Demo produkt pro GUI\n- Ukazuje postup pro nove polozky\n- Exportuje potrebne Excel soubory",
-                    fr="- Produit de demonstration pour l'interface\n- Montre le flux pour les nouveaux articles\n- Exporte les fichiers Excel necessaires",
-                    it="- Prodotto demo per la GUI\n- Mostra il flusso per nuovi articoli\n- Esporta i file Excel necessari",
-                    nl="- Demo-product voor de GUI\n- Toont de workflow voor nieuwe artikelen\n- Exporteert de benodigde Excel-bestanden",
-                    uni="- Demo-Produkt für die GUI\n- Zeigt den Ablauf für neue Artikel\n- Exportiert die benötigten Excel-Dateien",
-                ),
-                auto_uni=True,
-            )
-            self.image_frame.set_rows(
-                [
-                    MediaRow(r"S:\Apollo\WK DEMO-1000\wk-demo-1000-komplettansicht.png", art="5", sprache="255"),
-                    MediaRow(r"S:\Apollo\WK DEMO-1000\wk-demo-1000-frontansicht.png", art="5", sprache="255"),
-                ]
-            )
-            self.document_frame.set_rows(
-                [
-                    MediaRow(r"S:\dsp3\Web\WK DEMO-1000\WK DEMO-1000 Produktinfo.pdf", art="17", sprache="255"),
-                    MediaRow(r"S:\dsp3\Web\WK DEMO-1000\WK DEMO-1000 Bedienungsanleitung.pdf", art="14", sprache="255"),
-                ]
-            )
-            self.video_frame.set_rows([MediaRow("https://youtube.com/shorts/demo-video-1000")])
-            self.web_frame.set_rows([MediaRow("https://www.kunzer.de/shop/p/WK%20DEMO-1000")])
-            self.attribute_frame.set_rows(
-                [
-                    AttributeRow(criteria_id="121", label="ABE-Nr", value_format="Alphanumerisch", max_length=20, value="ABE-2026-1000"),
-                    AttributeRow(criteria_id="9204", label="3PMSF", value_format="Flag (Ja / Nein)", value="Ja"),
-                    AttributeRow(criteria_id="1546", label="Abbildung ähnlich", value_format="Kein Wert", value=""),
-                ]
-            )
-            self.oe_frame.set_rows(
-                [
-                    OeNumberRow(value="0001234567", manufacturer_id="5", manufacturer_code="AUDI", manufacturer_name="AUDI"),
-                    OeNumberRow(value="8K0 698 151", manufacturer_id="5", manufacturer_code="AUDI", manufacturer_name="AUDI"),
-                ]
-            )
-            self.comparison_frame.set_rows(
-                [
-                    ComparisonNumberRow(competitor_id="530", competitor_code="BOSCH", competitor_name="BOSCH", reference_number="1 987 302 777"),
-                    ComparisonNumberRow(competitor_id="521", competitor_code="VALEO", competitor_name="VALEO", reference_number="574385"),
-                ]
-            )
-            self.vehicle_link_frame.set_rows(
-                [
-                    VehicleLinkRow(
-                        vehicle_type_id="2",
-                        vehicle_type_label="PKW",
-                        motorcode="K9K",
-                        ktyp_topmotive="21468",
-                        ktyp_tecdoc="5840",
-                        manufacturer="Renault",
-                        model="Clio 4 (BH)",
-                        description="1.5 dCi",
-                        year_from="11.2012",
-                        year_to="",
-                        power="66 kW / 90 PS",
-                    ),
-                ]
-            )
-            self.search_term_frame.set_terms(["Wagenheber", "Rangierheber 10t"])
-        self.status_var.set("Beispieldaten geladen.")
-        self.refresh_preview()
-        self._write_live_database(status_message="Live gespeichert: WK DEMO-1000")
 
     def _refresh_article_browser(self) -> None:
         records: dict[str, StoredArticleSnapshot] = {}
