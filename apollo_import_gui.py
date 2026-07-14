@@ -7623,12 +7623,11 @@ class ApolloImportApp:
         self.attribute_key_value_count_var = tk.StringVar(value="0 Schlüsselwerte geladen")
         self.vehicle_count_var = tk.StringVar(value="0 KTyp-Datensätze geladen")
         self.attribute_mapping_count_var = tk.StringVar(value="0 Zuordnungen geladen")
-        self.article_section_collapsed = False
-        self.api_section_collapsed = False
         self.article_browser_collapsed = False
-        self.article_section_toggle_var = tk.StringVar()
-        self.api_section_toggle_var = tk.StringVar()
         self.article_browser_toggle_var = tk.StringVar()
+        self.settings_dialog: tk.Toplevel | None = None
+        self.settings_notebook: ttk.Notebook | None = None
+        self._settings_tab_canvases: list[tuple[str, tk.Canvas]] = []
         self.current_id_article_number = ""
         self.article_browser_records: dict[str, StoredArticleSnapshot] = {}
         self.selected_genart_selections: list[GenArtSelection] = []
@@ -7866,9 +7865,12 @@ class ApolloImportApp:
             text="⚙ = wird beim Kunzer-Abruf automatisch befüllt   ·   ✎ = manuell pflegen",
             foreground="#5E6472",
         ).grid(row=2, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(header, text="Geführter Modus", style="Accent.TButton", command=self.start_wizard).grid(
-            row=0, column=1, rowspan=2, sticky="e", padx=(12, 0)
+        header_actions = ttk.Frame(header)
+        header_actions.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
+        ttk.Button(header_actions, text="Geführter Modus", style="Accent.TButton", command=self.start_wizard).grid(
+            row=0, column=0, padx=(0, 8)
         )
+        ttk.Button(header_actions, text="⚙ Einstellungen", command=self.open_settings_dialog).grid(row=0, column=1)
 
         self._build_wizard_bar(shell)
 
@@ -8397,7 +8399,6 @@ class ApolloImportApp:
                 "deepl_base_url": self.deepl_base_url_var.get(),
             },
             "options": {
-                "auto_translate_after_scrape": self.auto_translate_after_scrape_var.get(),
                 "fixed_export_path": self.fixed_export_path_var.get(),
                 "batch_short_text": self.batch_short_text_var.get(),
                 "batch_long_text": self.batch_long_text_var.get(),
@@ -8500,8 +8501,6 @@ class ApolloImportApp:
                 },
             },
             "ui": {
-                "article_section_collapsed": self.article_section_collapsed,
-                "api_section_collapsed": self.api_section_collapsed,
                 "article_browser_collapsed": self.article_browser_collapsed,
                 "image_preview_visible": getattr(self.image_frame, "preview_visible", True),
                 "document_preview_visible": getattr(self.document_frame, "preview_visible", True),
@@ -8560,7 +8559,6 @@ class ApolloImportApp:
 
             options = payload.get("options")
             if isinstance(options, dict):
-                self.auto_translate_after_scrape_var.set(bool(options.get("auto_translate_after_scrape", self.auto_translate_after_scrape_var.get())))
                 self.fixed_export_path_var.set(bool(options.get("fixed_export_path", self.fixed_export_path_var.get())))
                 self.batch_short_text_var.set(bool(options.get("batch_short_text", self.batch_short_text_var.get())))
                 self.batch_long_text_var.set(bool(options.get("batch_long_text", self.batch_long_text_var.get())))
@@ -8694,8 +8692,6 @@ class ApolloImportApp:
 
             ui = payload.get("ui")
             if isinstance(ui, dict):
-                self.article_section_collapsed = bool(ui.get("article_section_collapsed", self.article_section_collapsed))
-                self.api_section_collapsed = bool(ui.get("api_section_collapsed", self.api_section_collapsed))
                 self.article_browser_collapsed = bool(ui.get("article_browser_collapsed", self.article_browser_collapsed))
                 self.image_frame.set_preview_visible(bool(ui.get("image_preview_visible", getattr(self.image_frame, "preview_visible", True))))
                 self.document_frame.set_preview_visible(bool(ui.get("document_preview_visible", getattr(self.document_frame, "preview_visible", True))))
@@ -8710,8 +8706,6 @@ class ApolloImportApp:
             if isinstance(browser_state, dict):
                 self.pending_article_browser_selection = normalize_article_number(str(browser_state.get("selected_article", "")))
 
-        self._apply_article_section_visibility()
-        self._apply_api_section_visibility()
         self._apply_article_browser_visibility()
         self._schedule_project_tab_layout()
 
@@ -8941,27 +8935,297 @@ if ($copied) {{
         )
         self.root.after(200, self.root.destroy)
 
-    def _toggle_api_section(self) -> None:
-        self.api_section_collapsed = not self.api_section_collapsed
-        self._apply_api_section_visibility()
+    def open_settings_dialog(self, initial_tab: int = 0) -> None:
+        if self.settings_dialog is not None and self.settings_dialog.winfo_exists():
+            self.settings_dialog.deiconify()
+            self.settings_dialog.lift()
+            self.settings_dialog.focus_set()
+            return
 
-    def _toggle_article_section(self) -> None:
-        self.article_section_collapsed = not self.article_section_collapsed
-        self._apply_article_section_visibility()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Einstellungen")
+        dialog.transient(self.root)
+        dialog.geometry("1080x680")
+        dialog.minsize(880, 540)
+        dialog.configure(background=UI_BACKGROUND)
+        dialog.protocol("WM_DELETE_WINDOW", self._close_settings_dialog)
+        self.settings_dialog = dialog
+        self._settings_tab_canvases = []
 
-    def _apply_article_section_visibility(self) -> None:
-        self.article_section_toggle_var.set("Einblenden" if self.article_section_collapsed else "Einklappen")
-        if self.article_section_collapsed:
-            self.article_content_frame.grid_remove()
+        container = ttk.Frame(dialog, padding=14)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(container)
+        notebook.grid(row=0, column=0, sticky="nsew")
+        self.settings_notebook = notebook
+
+        folders_tab = self._make_settings_scroll_tab(notebook, "Ordner")
+        export_tab = self._make_settings_scroll_tab(notebook, "Export")
+        api_tab = self._make_settings_scroll_tab(notebook, "API & Datenstämme")
+
+        self._build_settings_folders_section(folders_tab)
+        self._build_settings_export_section(export_tab)
+        self._build_settings_api_section(api_tab)
+
+        button_row = ttk.Frame(container)
+        button_row.grid(row=1, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(button_row, text="Schließen", command=self._close_settings_dialog).grid(row=0, column=0)
+
+        if not getattr(self, "_settings_mousewheel_bound", False):
+            self.root.bind_all("<MouseWheel>", self._handle_settings_mousewheel, add="+")
+            self.root.bind_all("<Button-4>", self._handle_settings_mousewheel, add="+")
+            self.root.bind_all("<Button-5>", self._handle_settings_mousewheel, add="+")
+            self._settings_mousewheel_bound = True
+
+        try:
+            notebook.select(initial_tab)
+        except tk.TclError:  # pragma: no cover - defensive
+            pass
+        dialog.focus_set()
+
+    def _close_settings_dialog(self) -> None:
+        if self.settings_dialog is not None:
+            try:
+                self.settings_dialog.destroy()
+            except tk.TclError:  # pragma: no cover - defensive
+                pass
+        self.settings_dialog = None
+        self.settings_notebook = None
+        self._settings_tab_canvases = []
+
+    def _make_settings_scroll_tab(self, notebook: ttk.Notebook, title: str) -> ttk.Frame:
+        tab = ttk.Frame(notebook)
+        notebook.add(tab, text=title)
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(tab, background=UI_BACKGROUND, borderwidth=0, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        content = ttk.Frame(canvas, padding=18)
+        window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind(
+            "<Configure>",
+            lambda _event, canvas=canvas: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event, canvas=canvas, window=window: canvas.itemconfigure(window, width=event.width),
+        )
+        self._settings_tab_canvases.append((str(tab), canvas))
+        return content
+
+    def _handle_settings_mousewheel(self, event: "tk.Event[tk.Misc]") -> str | None:
+        dialog = self.settings_dialog
+        if dialog is None or not dialog.winfo_exists():
+            return None
+        widget_path = str(event.widget)
+        if not widget_path.startswith(str(dialog)):
+            return None
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
         else:
-            self.article_content_frame.grid()
+            delta = -1 if event.delta > 0 else 1
+        for tab_path, canvas in self._settings_tab_canvases:
+            if widget_path.startswith(tab_path):
+                canvas.yview_scroll(delta, "units")
+                return "break"
+        return None
 
-    def _apply_api_section_visibility(self) -> None:
-        self.api_section_toggle_var.set("Einblenden" if self.api_section_collapsed else "Einklappen")
-        if self.api_section_collapsed:
-            self.deepl_content_frame.grid_remove()
-        else:
-            self.deepl_content_frame.grid()
+    def _build_settings_folders_section(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(1, weight=1)
+
+        ttk.Label(parent, text="Ordner", font=("Segoe UI Semibold", 10)).grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 4)
+        )
+
+        ttk.Label(parent, text="Importordner").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.import_dir_var).grid(row=1, column=1, sticky="ew", pady=6)
+        ttk.Button(parent, text="Wählen", command=self.choose_import_dir).grid(row=1, column=2, padx=(8, 0), pady=6)
+        ttk.Button(parent, text="IDs laden", command=self._load_known_ids).grid(row=1, column=3, padx=(8, 0), pady=6)
+
+        ttk.Label(parent, text="Ausgabeordner / Importpfad").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.output_dir_var).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Button(parent, text="Wählen", command=self.choose_output_dir).grid(row=2, column=2, padx=(8, 0), pady=6)
+        ttk.Label(parent, textvariable=self.known_id_count_var, foreground="#5E6472").grid(
+            row=2, column=3, sticky="w", padx=(8, 0), pady=6
+        )
+
+        ttk.Separator(parent, orient="horizontal").grid(row=3, column=0, columnspan=4, sticky="ew", pady=(14, 12))
+
+        ttk.Label(parent, text="App-Update", font=("Segoe UI Semibold", 10)).grid(
+            row=4, column=0, columnspan=4, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(parent, textvariable=self.update_status_var, foreground="#5E6472").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=6
+        )
+        update_actions = ttk.Frame(parent)
+        update_actions.grid(row=5, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=6)
+        ttk.Button(update_actions, text="Nach Updates suchen", command=self._check_for_github_updates).grid(row=0, column=0)
+        ttk.Button(update_actions, text="Releases", command=self._open_github_releases_page).grid(row=0, column=1, padx=(8, 0))
+
+    def _build_settings_export_section(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            parent,
+            text="Du kannst die zehn Exportdateien entweder in einen neuen Zeitstempel-Unterordner schreiben oder immer direkt im Ausgabeordner aktualisieren.",
+            wraplength=760,
+            foreground="#5E6472",
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Checkbutton(
+            parent,
+            text="Immer direkt in den Ausgabeordner schreiben (fester Importpfad)",
+            variable=self.fixed_export_path_var,
+        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
+
+        ttk.Label(
+            parent,
+            text="Wenn aktiv, bleiben die Dateien bestehen: neue Artikel werden angehängt und bestehende Zeilen derselben Artikelnummer ersetzt.",
+            wraplength=760,
+            foreground="#5E6472",
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+        ttk.Label(
+            parent,
+            text="Der Massenimport schreibt unabhängig von dieser Einstellung immer direkt in den festen Output-Pfad.",
+            wraplength=760,
+            foreground="#5E6472",
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+    def _build_settings_api_section(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(1, weight=1)
+
+        ttk.Label(parent, text="DeepL", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
+        ttk.Label(parent, text="API Key").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.deepl_api_key_var, show="*", width=60).grid(row=1, column=1, sticky="ew", pady=6)
+
+        ttk.Label(parent, text="Base URL").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.deepl_base_url_var).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Label(
+            parent,
+            text="Pro: https://api.deepl.com  |  Free: https://api-free.deepl.com",
+            foreground="#5E6472",
+        ).grid(row=2, column=2, sticky="w", padx=(10, 0), pady=6)
+
+        deepl_actions = ttk.Frame(parent)
+        deepl_actions.grid(row=3, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(deepl_actions, text="Kurzbezeichnung übersetzen", command=self.translate_short_texts).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(deepl_actions, text="Text übersetzen", command=self.translate_long_texts).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(deepl_actions, text="Alles übersetzen", command=self.translate_all_texts).grid(row=0, column=2)
+
+        ttk.Label(
+            parent,
+            text="Die Übersetzung läuft jeweils aus dem deutschen Feld in EN, CZ, FR, IT und NL. UNI bleibt an Deutsch gekoppelt.",
+            foreground="#5E6472",
+            wraplength=760,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        ttk.Separator(parent, orient="horizontal").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(14, 12))
+
+        ttk.Label(parent, text="Datenstämme", font=("Segoe UI Semibold", 10)).grid(
+            row=9, column=0, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(parent, text="GenArt XLSX").grid(row=10, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.genart_source_path_var).grid(row=10, column=1, sticky="ew", pady=6)
+        genart_actions = ttk.Frame(parent)
+        genart_actions.grid(row=10, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(genart_actions, text="Datei wählen", command=self.choose_genart_source_file).grid(row=0, column=0)
+        ttk.Button(genart_actions, text="Neu laden", command=self._reload_genart_catalog).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(parent, textvariable=self.genart_count_var, foreground="#5E6472").grid(
+            row=11, column=1, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(parent, text="KHer CSV").grid(row=12, column=0, sticky="w", padx=(0, 10), pady=6)
+        kher_actions = ttk.Frame(parent)
+        kher_actions.grid(row=12, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(kher_actions, text="Datei wählen", command=self.choose_competitor_source_file).grid(row=0, column=0)
+        ttk.Button(kher_actions, text="Neu laden", command=self._reload_competitor_catalog).grid(row=0, column=1, padx=(8, 0))
+        ttk.Entry(parent, textvariable=self.competitor_source_path_var).grid(row=12, column=1, sticky="ew", pady=6)
+        ttk.Label(
+            parent,
+            text="Diese Datei wird für OE-Nummern und Vergleichsnummern verwendet. OE nutzt alle Hersteller, Vergleichsnummern nur Einträge mit VGL-Flag.",
+            foreground="#5E6472",
+            wraplength=760,
+        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(parent, textvariable=self.competitor_count_var, foreground="#5E6472").grid(
+            row=14, column=1, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(parent, text="Attribute XLSX").grid(row=15, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.attribute_source_path_var).grid(row=15, column=1, sticky="ew", pady=6)
+        attribute_actions = ttk.Frame(parent)
+        attribute_actions.grid(row=15, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(attribute_actions, text="Datei wählen", command=self.choose_attribute_source_file).grid(row=0, column=0)
+        ttk.Button(attribute_actions, text="Neu laden", command=self._reload_attribute_catalog).grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Label(parent, text="Schlüsselwerte XLSX").grid(row=16, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.attribute_key_value_source_path_var).grid(
+            row=16, column=1, sticky="ew", pady=6
+        )
+        key_value_actions = ttk.Frame(parent)
+        key_value_actions.grid(row=16, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(key_value_actions, text="Datei wählen", command=self.choose_attribute_key_value_source_file).grid(row=0, column=0)
+        ttk.Button(key_value_actions, text="Neu laden", command=self._reload_attribute_key_value_catalog).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            parent,
+            text="Die Attributliste liefert TecDoc Kriterien, Formate und Bezeichnungen; Schlüsselwerte liefern die möglichen Auswahlwerte.",
+            foreground="#5E6472",
+            wraplength=760,
+        ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(parent, textvariable=self.attribute_count_var, foreground="#5E6472").grid(
+            row=18, column=1, columnspan=2, sticky="w"
+        )
+        ttk.Label(parent, textvariable=self.attribute_key_value_count_var, foreground="#5E6472").grid(
+            row=19, column=1, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(parent, text="KTyp XLSX").grid(row=20, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.vehicle_source_path_var).grid(row=20, column=1, sticky="ew", pady=6)
+        vehicle_actions = ttk.Frame(parent)
+        vehicle_actions.grid(row=20, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(vehicle_actions, text="Datei wählen", command=self.choose_vehicle_source_file).grid(row=0, column=0)
+        ttk.Button(vehicle_actions, text="Neu laden", command=self._reload_vehicle_catalog).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            parent,
+            text=(
+                "KTyp-Stammdaten (Motorcode -> KTyp-Nummer). Wird im Tab 'Fahrzeuge' verwendet, um über Motorcodes "
+                "die KTyp-Nummern (TopMotive/TecDoc) zu finden. Datei bei Bedarf aktualisieren und 'Neu laden' drücken."
+            ),
+            foreground="#5E6472",
+            wraplength=760,
+        ).grid(row=21, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(parent, textvariable=self.vehicle_count_var, foreground="#5E6472").grid(
+            row=22, column=1, columnspan=2, sticky="w"
+        )
+
+        ttk.Label(parent, text="Attribut-Zuordnung XLSX").grid(row=23, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.attribute_mapping_source_path_var).grid(row=23, column=1, sticky="ew", pady=6)
+        mapping_actions = ttk.Frame(parent)
+        mapping_actions.grid(row=23, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(mapping_actions, text="Datei wählen", command=self.choose_attribute_mapping_source_file).grid(row=0, column=0)
+        ttk.Button(mapping_actions, text="Neu laden", command=self._reload_attribute_mapping).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            parent,
+            text=(
+                "Zuordnung von Text-Labels (z.B. 'Gewicht') zu TecDoc Kriterien IDs für 'Attribute aus Text vorschlagen'. "
+                "Manuell zugewiesene Labels können aus dem Vorschlagsdialog automatisch ergänzt werden."
+            ),
+            foreground="#5E6472",
+            wraplength=760,
+        ).grid(row=24, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(parent, textvariable=self.attribute_mapping_count_var, foreground="#5E6472").grid(
+            row=25, column=1, columnspan=2, sticky="w"
+        )
 
     def _toggle_article_browser_section(self) -> None:
         self.article_browser_collapsed = not self.article_browser_collapsed
@@ -9041,25 +9305,24 @@ if ($copied) {{
         layout_changed = self.project_tab_compact_mode is None or self.project_tab_compact_mode != compact
         self.project_tab_compact_mode = compact
 
-        project_parent.columnconfigure(0, weight=1)
-        project_parent.columnconfigure(1, weight=1 if not compact else 0)
+        project_parent.columnconfigure(0, weight=1, uniform="project_cols")
+        project_parent.columnconfigure(1, weight=1 if not compact else 0, uniform="project_cols")
         for row_index in range(0, 6):
             project_parent.rowconfigure(row_index, weight=0)
 
         if layout_changed:
-            self.file_frame.grid_configure(row=0, column=0, columnspan=2, sticky="ew")
             if compact:
-                self.article_frame.grid_configure(row=1, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
-                self.export_frame.grid_configure(row=2, column=0, columnspan=2, rowspan=1, sticky="ew", padx=(0, 0), pady=(14, 0))
-                self.deepl_frame.grid_configure(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(14, 0))
-                self.browser_frame.grid_configure(row=4, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
-                project_parent.rowconfigure(4, weight=1)
-            else:
-                self.article_frame.grid_configure(row=1, column=0, columnspan=1, rowspan=1, sticky="new", padx=(0, 9), pady=(14, 0))
-                self.export_frame.grid_configure(row=1, column=1, columnspan=1, rowspan=2, sticky="nsew", padx=(9, 0), pady=(14, 0))
-                self.deepl_frame.grid_configure(row=2, column=0, columnspan=1, sticky="ew", padx=(0, 9), pady=(14, 0))
+                self.single_import_frame.grid_configure(row=0, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(0, 0))
+                self.batch_import_frame.grid_configure(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(14, 0))
+                self.scope_frame.grid_configure(row=2, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(14, 0))
                 self.browser_frame.grid_configure(row=3, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
                 project_parent.rowconfigure(3, weight=1)
+            else:
+                self.single_import_frame.grid_configure(row=0, column=0, columnspan=1, sticky="nsew", padx=(0, 9), pady=(0, 0))
+                self.batch_import_frame.grid_configure(row=0, column=1, columnspan=1, sticky="nsew", padx=(9, 0), pady=(0, 0))
+                self.scope_frame.grid_configure(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(14, 0))
+                self.browser_frame.grid_configure(row=2, column=0, columnspan=2, sticky="nsew", padx=(0, 0), pady=(14, 0))
+                project_parent.rowconfigure(2, weight=1)
 
         self._handle_project_scroll_content_configure()
         self._schedule_article_browser_layout()
@@ -9115,278 +9378,94 @@ if ($copied) {{
         self._bind_project_mousewheel()
 
         project_parent = self.project_content_frame
-        project_parent.columnconfigure(0, weight=1)
-        project_parent.columnconfigure(1, weight=1)
-        project_parent.rowconfigure(3, weight=1)
+        project_parent.columnconfigure(0, weight=1, uniform="project_cols")
+        project_parent.columnconfigure(1, weight=1, uniform="project_cols")
+        project_parent.rowconfigure(2, weight=1)
 
-        self.file_frame = ttk.LabelFrame(project_parent, text="Ordner", padding=14)
-        file_frame = self.file_frame
-        file_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
-        file_frame.columnconfigure(1, weight=1)
+        self.single_import_frame = ttk.LabelFrame(project_parent, text="Einzelimport", padding=14)
+        single_frame = self.single_import_frame
+        single_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 9))
+        single_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(file_frame, text="Importordner").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(file_frame, textvariable=self.import_dir_var).grid(row=0, column=1, sticky="ew", pady=6)
-        ttk.Button(file_frame, text="Wählen", command=self.choose_import_dir).grid(row=0, column=2, padx=(8, 0), pady=6)
-        ttk.Button(file_frame, text="IDs laden", command=self._load_known_ids).grid(row=0, column=3, padx=(8, 0), pady=6)
+        ttk.Label(
+            single_frame,
+            text="Einen Artikel erfassen und optional direkt aus Kunzer befüllen.",
+            foreground="#5E6472",
+            wraplength=500,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-        ttk.Label(file_frame, text="Ausgabeordner / Importpfad").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(file_frame, textvariable=self.output_dir_var).grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Button(file_frame, text="Wählen", command=self.choose_output_dir).grid(row=1, column=2, padx=(8, 0), pady=6)
-        ttk.Label(file_frame, textvariable=self.known_id_count_var, foreground="#5E6472").grid(row=1, column=3, sticky="w", padx=(8, 0), pady=6)
-
-        ttk.Label(file_frame, text="Produktliste CSV/XLSX").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(file_frame, textvariable=self.product_list_path_var).grid(row=2, column=1, sticky="ew", pady=6)
-        ttk.Button(file_frame, text="Datei wählen", command=self.choose_product_list_file).grid(row=2, column=2, padx=(8, 0), pady=6)
-        ttk.Button(file_frame, text="Liste importieren", command=self.import_products_from_file).grid(row=2, column=3, padx=(8, 0), pady=6)
-
-        ttk.Label(file_frame, text="App-Update").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
-        update_row = ttk.Frame(file_frame)
-        update_row.grid(row=3, column=1, columnspan=3, sticky="ew", pady=6)
-        update_row.columnconfigure(0, weight=1)
-        ttk.Label(update_row, textvariable=self.update_status_var, foreground="#5E6472").grid(row=0, column=0, sticky="w")
-        ttk.Button(update_row, text="Nach Updates suchen", command=self._check_for_github_updates).grid(
-            row=0, column=1, padx=(8, 0)
-        )
-        ttk.Button(update_row, text="Releases", command=self._open_github_releases_page).grid(row=0, column=2, padx=(8, 0))
-
-        self.article_frame = ttk.LabelFrame(project_parent, text="Artikel", padding=14)
-        article_frame = self.article_frame
-        article_frame.grid(row=1, column=0, sticky="new", pady=(14, 0), padx=(0, 9))
-        article_frame.columnconfigure(0, weight=1)
-
-        article_header = ttk.Frame(article_frame)
-        article_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        article_header.columnconfigure(0, weight=1)
-        ttk.Label(article_header, text="Artikelstammdaten und Kunzer-Abruf", foreground="#5E6472").grid(row=0, column=0, sticky="w")
-        ttk.Button(article_header, textvariable=self.article_section_toggle_var, command=self._toggle_article_section).grid(
-            row=0, column=1, padx=(8, 0)
-        )
-
-        self.article_content_frame = ttk.Frame(article_frame)
-        self.article_content_frame.grid(row=1, column=0, sticky="ew")
-        self.article_content_frame.columnconfigure(1, weight=1)
-        self.article_content_frame.columnconfigure(2, weight=0)
-
-        ttk.Label(self.article_content_frame, text="Artikelnummer").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
-        article_entry = ttk.Entry(self.article_content_frame, textvariable=self.article_number_var)
-        article_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Label(single_frame, text="Artikelnummer").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        article_entry = ttk.Entry(single_frame, textvariable=self.article_number_var)
+        article_entry.grid(row=1, column=1, sticky="ew", pady=6)
         article_entry.bind("<FocusOut>", self._on_article_entry_focus_out)
 
         ttk.Label(
-            self.article_content_frame,
+            single_frame,
             text="Kurz- und Text-ID werden automatisch im Hintergrund vergeben.",
             foreground="#5E6472",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        kunzer_row = ttk.Frame(self.article_content_frame)
-        kunzer_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Button(kunzer_row, text="Aus Kunzer per Artikelnummer laden", command=self.load_from_kunzer_article_number).grid(
-            row=0, column=0
+        ttk.Button(single_frame, text="Artikel anlegen", style="Accent.TButton", command=self.load_from_kunzer_article_number).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(10, 0)
         )
 
-        options_row = ttk.Frame(self.article_content_frame)
-        options_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(
-            options_row,
-            text="Nach dem Laden automatisch mit DeepL übersetzen",
-            variable=self.auto_translate_after_scrape_var,
-        ).grid(row=0, column=0)
-
-        self.export_frame = ttk.LabelFrame(project_parent, text="Export", padding=14)
-        export_frame = self.export_frame
-        export_frame.grid(row=1, column=1, rowspan=2, sticky="nsew", pady=(14, 0), padx=(9, 0))
-        export_frame.columnconfigure(0, weight=1)
+        self.batch_import_frame = ttk.LabelFrame(project_parent, text="Massenimport", padding=14)
+        batch_import_frame = self.batch_import_frame
+        batch_import_frame.grid(row=0, column=1, sticky="nsew", padx=(9, 0))
+        batch_import_frame.columnconfigure(1, weight=1)
 
         ttk.Label(
-            export_frame,
-            text="Du kannst die zehn Exportdateien entweder in einen neuen Zeitstempel-Unterordner schreiben oder immer direkt im Ausgabeordner aktualisieren.",
-            wraplength=500,
+            batch_import_frame,
+            text="Produktliste als CSV/XLSX laden: alle Artikel werden von Kunzer abgerufen und direkt in die Output-Dateien geschrieben.",
             foreground="#5E6472",
-        ).grid(row=0, column=0, sticky="w")
-
-        ttk.Checkbutton(
-            export_frame,
-            text="Immer direkt in den Ausgabeordner schreiben (fester Importpfad)",
-            variable=self.fixed_export_path_var,
-        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
+            wraplength=500,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
         ttk.Label(
-            export_frame,
-            text="Wenn aktiv, bleiben die Dateien bestehen: neue Artikel werden angehängt und bestehende Zeilen derselben Artikelnummer ersetzt.",
-            wraplength=500,
+            batch_import_frame,
+            text="Erwartete Spalte in der Kopfzeile: „Artikelnummer“ (auch ArtNr, Produktnummer, SKU) oder „Produkt-URL“ (auch URL, Link, Produktlink). Eine der beiden Spalten genügt.",
             foreground="#5E6472",
-        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+            wraplength=500,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        ttk.Button(export_frame, text="Export erstellen", style="Accent.TButton", command=self.export_current_bundle).grid(
-            row=3, column=0, sticky="w", pady=(14, 0)
+        ttk.Label(batch_import_frame, text="Produktliste CSV/XLSX").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(batch_import_frame, textvariable=self.product_list_path_var).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Button(batch_import_frame, text="Datei wählen", command=self.choose_product_list_file).grid(row=2, column=2, padx=(8, 0), pady=6)
+
+        ttk.Button(batch_import_frame, text="Liste importieren", command=self.import_products_from_file).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(10, 0)
         )
 
-        batch_frame = ttk.LabelFrame(export_frame, text="Listenimport", padding=10)
-        batch_frame.grid(row=4, column=0, sticky="ew", pady=(14, 0))
         ttk.Label(
-            batch_frame,
-            text="Wähle, welche Daten bei CSV/XLSX-Listen von Kunzer gescraped und direkt in die Output-Dateien geschrieben werden sollen.",
-            wraplength=470,
+            batch_import_frame,
+            text="Der Massenimport übersetzt ausgewählte Texte automatisch und schreibt immer direkt in den festen Output-Pfad.",
+            foreground="#5E6472",
+            wraplength=500,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        self.scope_frame = ttk.LabelFrame(project_parent, text="Abrufumfang", padding=14)
+        scope_frame = self.scope_frame
+        scope_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        scope_frame.columnconfigure(0, weight=1)
+        scope_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            scope_frame,
+            text="Diese Auswahl gilt für Einzelimport und Massenimport: nur angehakte Daten werden von Kunzer geholt.",
+            wraplength=500,
             foreground="#5E6472",
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
-        ttk.Checkbutton(batch_frame, text="Kurzbezeichnung", variable=self.batch_short_text_var).grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(batch_frame, text="Text", variable=self.batch_long_text_var).grid(row=1, column=1, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(batch_frame, text="Bilder", variable=self.batch_image_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(batch_frame, text="Dokumente", variable=self.batch_document_var).grid(row=2, column=1, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(batch_frame, text="Videos", variable=self.batch_video_var).grid(row=3, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(batch_frame, text="Web Links", variable=self.batch_web_var).grid(row=3, column=1, sticky="w", pady=(6, 0))
-
-        ttk.Label(
-            batch_frame,
-            text="Der Listenimport übersetzt ausgewählte Texte automatisch und schreibt immer direkt in den festen Output-Pfad.",
-            wraplength=470,
-            foreground="#5E6472",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
-
-        self.deepl_frame = ttk.LabelFrame(project_parent, text="API & Einstellungen", padding=14)
-        deepl_frame = self.deepl_frame
-        deepl_frame.grid(row=2, column=0, sticky="ew", pady=(14, 0), padx=(0, 9))
-        deepl_frame.columnconfigure(0, weight=1)
-
-        deepl_header = ttk.Frame(deepl_frame)
-        deepl_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        deepl_header.columnconfigure(0, weight=1)
-        ttk.Label(deepl_header, text="DeepL und Datenstamm-Einstellungen", foreground="#5E6472").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Button(deepl_header, textvariable=self.api_section_toggle_var, command=self._toggle_api_section).grid(row=0, column=1, padx=(8, 0))
-
-        self.deepl_content_frame = ttk.Frame(deepl_frame)
-        self.deepl_content_frame.grid(row=1, column=0, sticky="ew")
-        self.deepl_content_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(self.deepl_content_frame, text="DeepL", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=(0, 4))
-
-        ttk.Label(self.deepl_content_frame, text="API Key").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(self.deepl_content_frame, textvariable=self.deepl_api_key_var, show="*", width=60).grid(row=1, column=1, sticky="ew", pady=6)
-
-        ttk.Label(self.deepl_content_frame, text="Base URL").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(self.deepl_content_frame, textvariable=self.deepl_base_url_var).grid(row=2, column=1, sticky="ew", pady=6)
-        ttk.Label(
-            self.deepl_content_frame,
-            text="Pro: https://api.deepl.com  |  Free: https://api-free.deepl.com",
-            foreground="#5E6472",
-        ).grid(row=2, column=2, sticky="w", padx=(10, 0), pady=6)
-
-        deepl_actions = ttk.Frame(self.deepl_content_frame)
-        deepl_actions.grid(row=3, column=1, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Button(deepl_actions, text="Kurzbezeichnung übersetzen", command=self.translate_short_texts).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(deepl_actions, text="Text übersetzen", command=self.translate_long_texts).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(deepl_actions, text="Alles übersetzen", command=self.translate_all_texts).grid(row=0, column=2)
-
-        ttk.Label(
-            self.deepl_content_frame,
-            text="Die Übersetzung läuft jeweils aus dem deutschen Feld in EN, CZ, FR, IT und NL. UNI bleibt an Deutsch gekoppelt.",
-            foreground="#5E6472",
-            wraplength=1000,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
-
-        ttk.Separator(self.deepl_content_frame, orient="horizontal").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(14, 12))
-
-        ttk.Label(self.deepl_content_frame, text="Datenstämme", font=("Segoe UI Semibold", 10)).grid(
-            row=9, column=0, sticky="w", pady=(0, 4)
-        )
-        ttk.Label(self.deepl_content_frame, text="GenArt XLSX").grid(row=10, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(self.deepl_content_frame, textvariable=self.genart_source_path_var).grid(row=10, column=1, sticky="ew", pady=6)
-        genart_actions = ttk.Frame(self.deepl_content_frame)
-        genart_actions.grid(row=10, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(genart_actions, text="Datei wählen", command=self.choose_genart_source_file).grid(row=0, column=0)
-        ttk.Button(genart_actions, text="Neu laden", command=self._reload_genart_catalog).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(self.deepl_content_frame, textvariable=self.genart_count_var, foreground="#5E6472").grid(
-            row=11, column=1, columnspan=2, sticky="w"
-        )
-
-        ttk.Label(self.deepl_content_frame, text="KHer CSV").grid(row=12, column=0, sticky="w", padx=(0, 10), pady=6)
-        kher_actions = ttk.Frame(self.deepl_content_frame)
-        kher_actions.grid(row=12, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(kher_actions, text="Datei wählen", command=self.choose_competitor_source_file).grid(row=0, column=0)
-        ttk.Button(kher_actions, text="Neu laden", command=self._reload_competitor_catalog).grid(row=0, column=1, padx=(8, 0))
-        ttk.Entry(self.deepl_content_frame, textvariable=self.competitor_source_path_var).grid(row=12, column=1, sticky="ew", pady=6)
-        ttk.Label(
-            self.deepl_content_frame,
-            text="Diese Datei wird für OE-Nummern und Vergleichsnummern verwendet. OE nutzt alle Hersteller, Vergleichsnummern nur Einträge mit VGL-Flag.",
-            foreground="#5E6472",
-            wraplength=1000,
-        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(self.deepl_content_frame, textvariable=self.competitor_count_var, foreground="#5E6472").grid(
-            row=14, column=1, columnspan=2, sticky="w"
-        )
-
-        ttk.Label(self.deepl_content_frame, text="Attribute XLSX").grid(row=15, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_source_path_var).grid(row=15, column=1, sticky="ew", pady=6)
-        attribute_actions = ttk.Frame(self.deepl_content_frame)
-        attribute_actions.grid(row=15, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(attribute_actions, text="Datei wählen", command=self.choose_attribute_source_file).grid(row=0, column=0)
-        ttk.Button(attribute_actions, text="Neu laden", command=self._reload_attribute_catalog).grid(row=0, column=1, padx=(8, 0))
-
-        ttk.Label(self.deepl_content_frame, text="Schlüsselwerte XLSX").grid(row=16, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_key_value_source_path_var).grid(
-            row=16, column=1, sticky="ew", pady=6
-        )
-        key_value_actions = ttk.Frame(self.deepl_content_frame)
-        key_value_actions.grid(row=16, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(key_value_actions, text="Datei wählen", command=self.choose_attribute_key_value_source_file).grid(row=0, column=0)
-        ttk.Button(key_value_actions, text="Neu laden", command=self._reload_attribute_key_value_catalog).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(
-            self.deepl_content_frame,
-            text="Die Attributliste liefert TecDoc Kriterien, Formate und Bezeichnungen; Schlüsselwerte liefern die möglichen Auswahlwerte.",
-            foreground="#5E6472",
-            wraplength=1000,
-        ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(self.deepl_content_frame, textvariable=self.attribute_count_var, foreground="#5E6472").grid(
-            row=18, column=1, columnspan=2, sticky="w"
-        )
-        ttk.Label(self.deepl_content_frame, textvariable=self.attribute_key_value_count_var, foreground="#5E6472").grid(
-            row=19, column=1, columnspan=2, sticky="w"
-        )
-
-        ttk.Label(self.deepl_content_frame, text="KTyp XLSX").grid(row=20, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(self.deepl_content_frame, textvariable=self.vehicle_source_path_var).grid(row=20, column=1, sticky="ew", pady=6)
-        vehicle_actions = ttk.Frame(self.deepl_content_frame)
-        vehicle_actions.grid(row=20, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(vehicle_actions, text="Datei wählen", command=self.choose_vehicle_source_file).grid(row=0, column=0)
-        ttk.Button(vehicle_actions, text="Neu laden", command=self._reload_vehicle_catalog).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(
-            self.deepl_content_frame,
-            text=(
-                "KTyp-Stammdaten (Motorcode -> KTyp-Nummer). Wird im Tab 'Fahrzeuge' verwendet, um über Motorcodes "
-                "die KTyp-Nummern (TopMotive/TecDoc) zu finden. Datei bei Bedarf aktualisieren und 'Neu laden' drücken."
-            ),
-            foreground="#5E6472",
-            wraplength=1000,
-        ).grid(row=21, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(self.deepl_content_frame, textvariable=self.vehicle_count_var, foreground="#5E6472").grid(
-            row=22, column=1, columnspan=2, sticky="w"
-        )
-
-        ttk.Label(self.deepl_content_frame, text="Attribut-Zuordnung XLSX").grid(row=23, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(self.deepl_content_frame, textvariable=self.attribute_mapping_source_path_var).grid(row=23, column=1, sticky="ew", pady=6)
-        mapping_actions = ttk.Frame(self.deepl_content_frame)
-        mapping_actions.grid(row=23, column=2, sticky="w", padx=(10, 0), pady=6)
-        ttk.Button(mapping_actions, text="Datei wählen", command=self.choose_attribute_mapping_source_file).grid(row=0, column=0)
-        ttk.Button(mapping_actions, text="Neu laden", command=self._reload_attribute_mapping).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(
-            self.deepl_content_frame,
-            text=(
-                "Zuordnung von Text-Labels (z.B. 'Gewicht') zu TecDoc Kriterien IDs für 'Attribute aus Text vorschlagen'. "
-                "Manuell zugewiesene Labels können aus dem Vorschlagsdialog automatisch ergänzt werden."
-            ),
-            foreground="#5E6472",
-            wraplength=1000,
-        ).grid(row=24, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(self.deepl_content_frame, textvariable=self.attribute_mapping_count_var, foreground="#5E6472").grid(
-            row=25, column=1, columnspan=2, sticky="w"
-        )
+        ttk.Checkbutton(scope_frame, text="Kurzbezeichnung", variable=self.batch_short_text_var).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(scope_frame, text="Text", variable=self.batch_long_text_var).grid(row=1, column=1, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(scope_frame, text="Bilder", variable=self.batch_image_var).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(scope_frame, text="Dokumente", variable=self.batch_document_var).grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(scope_frame, text="Videos", variable=self.batch_video_var).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(scope_frame, text="Web Links", variable=self.batch_web_var).grid(row=3, column=1, sticky="w", pady=(6, 0))
 
         self.browser_frame = ttk.LabelFrame(project_parent, text="Artikelverzeichnis", padding=14)
         browser_frame = self.browser_frame
-        browser_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(14, 0))
+        browser_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(14, 0))
         browser_frame.columnconfigure(0, weight=1)
         browser_frame.rowconfigure(1, weight=1)
 
@@ -9482,8 +9561,6 @@ if ($copied) {{
         self.article_browser_detail.configure(state="disabled")
         self.project_tab.bind("<Configure>", self._handle_project_tab_resize)
         self.browser_content_frame.bind("<Configure>", self._handle_article_browser_resize)
-        self._apply_article_section_visibility()
-        self._apply_api_section_visibility()
         self._apply_article_browser_visibility()
         self._schedule_project_tab_layout()
 
@@ -10834,7 +10911,7 @@ if ($copied) {{
         self.current_id_article_number = article_key
         return short_id, long_id
 
-    def _get_batch_scrape_options(self) -> dict[str, bool]:
+    def _get_scrape_options(self) -> dict[str, bool]:
         options = {
             "short_text": self.batch_short_text_var.get(),
             "long_text": self.batch_long_text_var.get(),
@@ -10844,7 +10921,7 @@ if ($copied) {{
             "web_links": self.batch_web_var.get(),
         }
         if not any(options.values()):
-            raise ValueError("Bitte für den Listenimport mindestens eine Datenart auswählen.")
+            raise ValueError("Bitte im Abrufumfang mindestens eine Datenart auswählen.")
         return options
 
     def _build_translation_set(
@@ -10907,7 +10984,16 @@ if ($copied) {{
         write_live: bool = True,
         short_translations: dict[str, str] | None = None,
         long_translations: dict[str, str] | None = None,
+        options: dict[str, bool] | None = None,
     ) -> None:
+        scrape_options = options or {
+            "short_text": True,
+            "long_text": True,
+            "images": True,
+            "documents": True,
+            "videos": True,
+            "web_links": True,
+        }
         with self._suspend_live_write():
             if not self.article_number_var.get().strip():
                 self.article_number_var.set(result.article_number)
@@ -10916,28 +11002,35 @@ if ($copied) {{
             self._ensure_ids_for_article(self.article_number_var.get())
             self.kunzer_product_url_var.set(result.product_url)
 
+            short_text_de = result.short_text_de if scrape_options["short_text"] else ""
+            long_text_de = result.long_text_de if scrape_options["long_text"] else ""
             self.short_text_frame.set_value(
-                TranslationSet(de=result.short_text_de, uni=result.short_text_de),
+                TranslationSet(de=short_text_de, uni=short_text_de),
                 auto_uni=True,
             )
             self.long_text_frame.set_value(
-                TranslationSet(de=result.long_text_de, uni=result.long_text_de),
+                TranslationSet(de=long_text_de, uni=long_text_de),
                 auto_uni=True,
             )
             self._set_selected_genart_selections([])
             self.genart_display_var.set("")
-            if short_translations:
+            if short_translations and scrape_options["short_text"]:
                 self.short_text_frame.apply_translations(short_translations)
-            if long_translations:
+            if long_translations and scrape_options["long_text"]:
                 self.long_text_frame.apply_translations(long_translations)
 
-            image_rows = [MediaRow(link, art="5", sprache="255") for link in result.image_links]
-            document_rows = [
-                MediaRow(link, art=infer_document_art(link), sprache="255")
-                for link in result.document_links
-            ]
-            video_rows = [MediaRow(link) for link in result.video_links]
-            web_rows = [MediaRow(result.product_url)]
+            image_rows = (
+                [MediaRow(link, art="5", sprache="255") for link in result.image_links]
+                if scrape_options["images"]
+                else []
+            )
+            document_rows = (
+                [MediaRow(link, art=infer_document_art(link), sprache="255") for link in result.document_links]
+                if scrape_options["documents"]
+                else []
+            )
+            video_rows = [MediaRow(link) for link in result.video_links] if scrape_options["videos"] else []
+            web_rows = [MediaRow(result.product_url)] if scrape_options["web_links"] else []
 
             self.image_frame.set_rows(image_rows)
             self.document_frame.set_rows(document_rows)
@@ -10972,8 +11065,18 @@ if ($copied) {{
             messagebox.showwarning(APP_TITLE, "Bitte eine Artikelnummer oder Kunzer Produkt-URL eingeben.")
             return
 
+        try:
+            options = self._get_scrape_options()
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+
         deepl_client: DeepLClient | None = None
-        if self.auto_translate_after_scrape_var.get() and self.deepl_api_key_var.get().strip():
+        if (
+            self.auto_translate_after_scrape_var.get()
+            and self.deepl_api_key_var.get().strip()
+            and (options["short_text"] or options["long_text"])
+        ):
             try:
                 deepl_client = self._build_deepl_client()
             except ValueError as exc:
@@ -10984,8 +11087,8 @@ if ($copied) {{
             result = self.kunzer_scraper.scrape_product(identifier)
             if deepl_client is None:
                 return result, None, None
-            short_translations = deepl_client.translate_from_german(result.short_text_de)
-            long_translations = deepl_client.translate_from_german(result.long_text_de)
+            short_translations = deepl_client.translate_from_german(result.short_text_de) if options["short_text"] else None
+            long_translations = deepl_client.translate_from_german(result.long_text_de) if options["long_text"] else None
             return result, short_translations, long_translations
 
         def on_success(payload: object) -> None:
@@ -10996,6 +11099,7 @@ if ($copied) {{
                 write_live=True,
                 short_translations=short_translations,
                 long_translations=long_translations,
+                options=options,
             )
             self.status_var.set(f"Kunzer-Daten geladen: {result.article_number}")
 
@@ -11020,7 +11124,7 @@ if ($copied) {{
 
         try:
             output_root = self._resolve_output_root()
-            options = self._get_batch_scrape_options()
+            options = self._get_scrape_options()
             items = read_product_import_items(source_path)
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
@@ -11046,7 +11150,7 @@ if ($copied) {{
         for index, item in enumerate(items, start=1):
             identifier = item.product_url or item.article_number
             try:
-                self.status_var.set(f"Listenimport {index}/{total}: {identifier}")
+                self.status_var.set(f"Massenimport {index}/{total}: {identifier}")
                 self.root.update_idletasks()
                 result = self.kunzer_scraper.scrape_product(identifier)
                 bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
@@ -11088,16 +11192,16 @@ if ($copied) {{
             preview = "\n".join(error_messages[:8])
             if len(error_messages) > 8:
                 preview += f"\n... und {len(error_messages) - 8} weitere"
-            self.status_var.set(f"Listenimport abgeschlossen mit Fehlern: {success_count}/{total} erfolgreich")
+            self.status_var.set(f"Massenimport abgeschlossen mit Fehlern: {success_count}/{total} erfolgreich")
             messagebox.showwarning(
                 APP_TITLE,
-                f"Listenimport abgeschlossen und direkt in den Output-Pfad geschrieben: {success_count} von {total} Produkten erfolgreich.\n\nFehler:\n{preview}",
+                f"Massenimport abgeschlossen und direkt in den Output-Pfad geschrieben: {success_count} von {total} Produkten erfolgreich.\n\nFehler:\n{preview}",
             )
         else:
-            self.status_var.set(f"Listenimport abgeschlossen: {success_count}/{total} Produkte erfolgreich")
+            self.status_var.set(f"Massenimport abgeschlossen: {success_count}/{total} Produkte erfolgreich")
             messagebox.showinfo(
                 APP_TITLE,
-                f"Listenimport erfolgreich abgeschlossen:\n{success_count} Produkte importiert und direkt in den Output-Pfad geschrieben.",
+                f"Massenimport erfolgreich abgeschlossen:\n{success_count} Produkte importiert und direkt in den Output-Pfad geschrieben.",
             )
 
     def _build_deepl_client(self) -> DeepLClient:
