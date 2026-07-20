@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher, get_close_matches
 from html import unescape
-import hashlib
 import io
 import json
 import os
@@ -52,7 +51,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.15"
+APP_VERSION = "0.1.16"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -348,6 +347,12 @@ ATTACHMENT_FORMAT_TYPE_BY_EXTENSION = {
 # heruntergeladen und pro Artikel unter Medien/<Artikelnummer>/ abgelegt.
 MEDIA_SUBFOLDER = "Medien"
 MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 30
+# Apollo-Vorgabe: Bildbezeichnung max. 20 Zeichen (inkl. Endung). Dateien
+# heißen deshalb <Artikelnummer>_1.jpg, _2.png, ... (Dokumente _D1.pdf, ...).
+MEDIA_FILENAME_MAX_LENGTH = 20
+# Merkt sich pro Artikelordner, welche Datei von welcher URL stammt, damit
+# unveränderte Dateien wiederverwendet und getauschte URLs erkannt werden.
+MEDIA_INDEX_FILENAME = ".medienindex.json"
 # Formate, die TecDoc als lokale Datei nicht kennt und die deshalb beim
 # Download nach PNG konvertiert werden (Kunzer liefert u. a. .webp/.tif).
 CONVERTIBLE_IMAGE_EXTENSIONS = {".webp", ".tif", ".tiff", ".bmp"}
@@ -2401,43 +2406,104 @@ def convert_image_bytes_to_png(data: bytes) -> bytes:
         return buffer.getvalue()
 
 
-def download_media_to_folder(url: str, target_dir: Path, force: bool = False) -> Path:
+def load_media_index(folder: Path) -> dict[str, str]:
+    path = folder / MEDIA_INDEX_FILENAME
+    if not path_exists_safe(path):
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(name): str(url) for name, url in data.items()}
+
+
+def save_media_index(folder: Path, index: dict[str, str]) -> None:
+    if not folder.is_dir():
+        return
+    try:
+        (folder / MEDIA_INDEX_FILENAME).write_text(
+            json.dumps(index, ensure_ascii=True, sort_keys=True, indent=0),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def build_media_stem(article_number: str, kind_tag: str, number: int) -> str:
+    """Dateiname-Stamm <Artikelnummer>_<Tag><Nr>, max. 20 Zeichen inkl. Endung."""
+    numbering = f"_{kind_tag}{number}"
+    suffix_length = 4  # .jpg/.png/.gif/.pdf
+    base = safe_media_filename(article_number)
+    max_base_length = MEDIA_FILENAME_MAX_LENGTH - suffix_length - len(numbering)
+    return f"{base[:max_base_length]}{numbering}"
+
+
+def _allocate_media_stem(target_dir: Path, article_number: str, kind_tag: str) -> str:
+    for number in range(1, 1000):
+        stem = build_media_stem(article_number, kind_tag, number)
+        if not any(path_exists_safe(target_dir / f"{stem}{suffix}") for suffix in ATTACHMENT_FORMAT_TYPE_BY_EXTENSION):
+            return stem
+    raise ValueError("Keine freie Bildnummer mehr verfügbar (mehr als 999 Dateien).")
+
+
+def download_media_to_folder(
+    url: str,
+    target_dir: Path,
+    article_number: str,
+    kind_tag: str,
+    index: dict[str, str],
+    force: bool = False,
+) -> Path:
     """Lädt einen Deeplink herunter und liefert den lokalen Dateipfad zurück.
 
-    Der Dateiname enthält einen kurzen Hash der URL, damit gleichnamige Dateien
-    verschiedener Links nicht kollidieren und eine bereits heruntergeladene
-    Datei beim erneuten Export (Live-Speichern) wiederverwendet werden kann.
-    Mit force=True wird immer neu heruntergeladen (Monats-Aktualisierung:
-    erkennt auch unter gleicher URL ausgetauschte Inhalte).
+    Die Zuordnung Datei→URL steht im Medienindex: bereits geladene Dateien
+    werden wiederverwendet (Live-Speichern), neue URLs bekommen die nächste
+    freie Nummer, damit es keine Dopplungen gibt. Mit force=True wird immer
+    neu heruntergeladen (Monats-Aktualisierung: erkennt auch unter gleicher
+    URL ausgetauschte Inhalte).
     """
-    parsed = urlparse(url.strip())
-    raw_name = Path(unquote(parsed.path)).name
-    stem = safe_media_filename(Path(raw_name).stem)
-    url_suffix = Path(raw_name).suffix.lower()
-    digest = hashlib.sha1(url.strip().encode("utf-8")).hexdigest()[:8]
-    base_name = f"{stem}_{digest}"
-
+    url_key = url.strip()
     target_dir = target_dir.resolve()
-    if not force:
-        for known_suffix in ATTACHMENT_FORMAT_TYPE_BY_EXTENSION:
-            existing = target_dir / f"{base_name}{known_suffix}"
-            if path_exists_safe(existing) and existing.stat().st_size > 0:
-                return existing
+
+    existing_name = next((name for name, stored_url in index.items() if stored_url == url_key), None)
+    if existing_name is not None and not force:
+        existing_path = target_dir / existing_name
+        if path_exists_safe(existing_path) and existing_path.stat().st_size > 0:
+            return existing_path
 
     data = fetch_preview_bytes_from_url(url, timeout_seconds=MEDIA_DOWNLOAD_TIMEOUT_SECONDS)
     if not data:
         raise ValueError("Der Server hat eine leere Datei geliefert.")
 
+    url_suffix = Path(unquote(urlparse(url_key).path)).suffix.lower()
     suffix = sniff_media_extension(data) or url_suffix
     if suffix in CONVERTIBLE_IMAGE_EXTENSIONS:
         data = convert_image_bytes_to_png(data)
         suffix = ".png"
+    if suffix == ".jpeg":
+        suffix = ".jpg"
     if suffix not in ATTACHMENT_FORMAT_TYPE_BY_EXTENSION:
         raise ValueError(f"Nicht unterstütztes Dateiformat '{suffix or 'unbekannt'}'.")
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / f"{base_name}{suffix}"
+    stem = Path(existing_name).stem if existing_name is not None else _allocate_media_stem(target_dir, article_number, kind_tag)
+    target_path = target_dir / f"{stem}{suffix}"
     target_path.write_bytes(data)
+
+    # Gleicher Stamm mit anderer Endung (z. B. vorher .png, jetzt .jpg) wird ersetzt.
+    for other_suffix in ATTACHMENT_FORMAT_TYPE_BY_EXTENSION:
+        if other_suffix == suffix:
+            continue
+        sibling = target_dir / f"{stem}{other_suffix}"
+        if path_exists_safe(sibling):
+            try:
+                sibling.unlink()
+            except OSError:
+                pass
+        index.pop(sibling.name, None)
+    index[target_path.name] = url_key
     return target_path
 
 
@@ -2446,6 +2512,7 @@ def materialize_media_rows(
     rows: list[MediaRow],
     export_dir: Path,
     kind_label: str,
+    kind_tag: str = "",
     force_download: bool = False,
 ) -> list[MediaRow]:
     """Ersetzt Deeplinks durch lokal heruntergeladene Dateien.
@@ -2454,18 +2521,25 @@ def materialize_media_rows(
     werden Bilder und Dokumente pro Artikel unter Medien/<Artikelnummer>/
     abgelegt und der lokale Pfad in die Exportdateien geschrieben.
     """
-    target_dir = export_dir / MEDIA_SUBFOLDER / safe_folder_name(article_number)
+    target_dir = (export_dir / MEDIA_SUBFOLDER / safe_folder_name(article_number)).resolve()
+    index = load_media_index(target_dir)
     materialized: list[MediaRow] = []
-    for row in rows:
-        link = row.path_or_link.strip()
-        if urlparse(link).scheme not in {"http", "https"}:
-            materialized.append(row)
-            continue
-        try:
-            local_path = download_media_to_folder(link, target_dir, force=force_download)
-        except Exception as exc:
-            raise ValueError(f"{kind_label}-Download fehlgeschlagen ({link}): {exc}") from exc
-        materialized.append(MediaRow(path_or_link=str(local_path), art=row.art, sprache=row.sprache))
+    downloaded = False
+    try:
+        for row in rows:
+            link = row.path_or_link.strip()
+            if urlparse(link).scheme not in {"http", "https"}:
+                materialized.append(row)
+                continue
+            try:
+                local_path = download_media_to_folder(link, target_dir, article_number, kind_tag, index, force=force_download)
+            except Exception as exc:
+                raise ValueError(f"{kind_label}-Download fehlgeschlagen ({link}): {exc}") from exc
+            downloaded = True
+            materialized.append(MediaRow(path_or_link=str(local_path), art=row.art, sprache=row.sprache))
+    finally:
+        if downloaded:
+            save_media_index(target_dir, index)
     return materialized
 
 
@@ -2496,7 +2570,7 @@ def cleanup_article_media_folder(export_dir: Path, article_number: str) -> int:
 
     removed = 0
     for entry in folder.iterdir():
-        if not entry.is_file() or entry.resolve() in referenced:
+        if not entry.is_file() or entry.name == MEDIA_INDEX_FILENAME or entry.resolve() in referenced:
             continue
         try:
             entry.unlink()
@@ -2504,10 +2578,16 @@ def cleanup_article_media_folder(export_dir: Path, article_number: str) -> int:
         except OSError:
             # Datei evtl. gerade geöffnet (z. B. Vorschau) – beim nächsten Lauf erneut versuchen.
             continue
-    try:
-        next(folder.iterdir())
-    except StopIteration:
+
+    index = load_media_index(folder)
+    pruned_index = {name: url for name, url in index.items() if path_exists_safe(folder / name)}
+    if pruned_index != index:
+        save_media_index(folder, pruned_index)
+
+    remaining = [entry for entry in folder.iterdir() if entry.name != MEDIA_INDEX_FILENAME]
+    if not remaining:
         try:
+            (folder / MEDIA_INDEX_FILENAME).unlink(missing_ok=True)
             folder.rmdir()
         except OSError:
             pass
@@ -3540,9 +3620,9 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
     export_dir.mkdir(parents=True, exist_ok=True)
 
     if bundle.include_images:
-        bundle.image_rows = materialize_media_rows(bundle.article_number, bundle.image_rows, export_dir, "Bild", force_download=refresh_media)
+        bundle.image_rows = materialize_media_rows(bundle.article_number, bundle.image_rows, export_dir, "Bild", kind_tag="", force_download=refresh_media)
     if bundle.include_documents:
-        bundle.document_rows = materialize_media_rows(bundle.article_number, bundle.document_rows, export_dir, "Dokument", force_download=refresh_media)
+        bundle.document_rows = materialize_media_rows(bundle.article_number, bundle.document_rows, export_dir, "Dokument", kind_tag="D", force_download=refresh_media)
 
     short_row = append_written_at(build_short_text_export_row(bundle), written_at)
     long_row = append_written_at(build_long_text_export_row(bundle), written_at)
@@ -11093,10 +11173,10 @@ if ($copied) {{
                 # Suchwörter liegen mit in der Attribute-Datei.
                 self._write_attribute_live(bundle, output_root)
             elif section == "images":
-                bundle.image_rows = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild")
+                bundle.image_rows = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild", kind_tag="")
                 self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
             elif section == "documents":
-                bundle.document_rows = materialize_media_rows(bundle.article_number, bundle.document_rows, output_root, "Dokument")
+                bundle.document_rows = materialize_media_rows(bundle.article_number, bundle.document_rows, output_root, "Dokument", kind_tag="D")
                 self._write_media_section_live(bundle, output_root, DOCUMENT_FILE, DOCUMENT_HEADERS, build_document_export_rows(bundle))
             elif section == "videos":
                 self._write_media_section_live(bundle, output_root, VIDEO_FILE, VIDEO_HEADERS, build_video_export_rows(bundle))
