@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.16"
+APP_VERSION = "0.1.17"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -11293,7 +11293,6 @@ if ($copied) {{
         options: dict[str, bool] | None = None,
     ) -> ExportBundle:
         article_number = normalize_article_number(result.article_number)
-        short_module_id, long_module_id = self._resolve_ids_for_article(article_number)
         scrape_options = options or {
             "short_text": True,
             "long_text": True,
@@ -11302,6 +11301,17 @@ if ($copied) {{
             "videos": True,
             "web_links": True,
         }
+        # Vorhandene IDs immer übernehmen, aber NEUE IDs nur vergeben, wenn die
+        # jeweilige Textart im Abrufumfang angehakt ist – sonst bekämen Artikel
+        # bei einer reinen Medien-Aktualisierung Text-IDs zugewiesen.
+        short_module_id, long_module_id = self.id_registry.get_ids_for_article(article_number)
+        if article_number:
+            if scrape_options["short_text"] and not short_module_id:
+                short_module_id = self.id_registry.generate_unique()
+            if scrape_options["long_text"] and not long_module_id:
+                long_module_id = self.id_registry.generate_unique()
+            if short_module_id or long_module_id:
+                self.id_registry.remember_article_ids(article_number, short_module_id, long_module_id)
         short_texts = self._build_translation_set(result.short_text_de, client, sanitize_short_text=True) if scrape_options["short_text"] else TranslationSet()
         long_texts = self._build_translation_set(result.long_text_de, client) if scrape_options["long_text"] else TranslationSet()
         image_rows = [MediaRow(link, art="5", sprache="255") for link in result.image_links] if scrape_options["images"] else []
@@ -11722,7 +11732,9 @@ if ($copied) {{
                 with self._suspend_live_write():
                     self._apply_article_snapshot(snapshot)
 
-        self.refresh_preview()
+        # Bewusst kein refresh_preview(): das würde für den geladenen Artikel
+        # sofort Text-IDs generieren, auch wenn Texte nicht im Abrufumfang waren.
+        self._refresh_article_browser()
         run_label = self.batch_run_label
         if cancelled:
             self.batch_progress_var.set(f"Abgebrochen: {processed}/{total} Artikel verarbeitet, {success_count} erfolgreich")
