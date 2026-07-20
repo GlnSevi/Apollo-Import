@@ -6,10 +6,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher, get_close_matches
 from html import unescape
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import queue
 import random
 import re
 import ssl
@@ -17,6 +19,7 @@ import string
 import subprocess
 import tempfile
 import threading
+import time
 import sys
 import tkinter as tk
 import unicodedata
@@ -49,7 +52,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.14"
+APP_VERSION = "0.1.15"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -340,6 +343,14 @@ ATTACHMENT_FORMAT_TYPE_BY_EXTENSION = {
     ".pdf": "2",
     ".gif": "7",
 }
+
+# Bilder und Dokumente werden nicht mehr als Deeplink exportiert, sondern
+# heruntergeladen und pro Artikel unter Medien/<Artikelnummer>/ abgelegt.
+MEDIA_SUBFOLDER = "Medien"
+MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 30
+# Formate, die TecDoc als lokale Datei nicht kennt und die deshalb beim
+# Download nach PNG konvertiert werden (Kunzer liefert u. a. .webp/.tif).
+CONVERTIBLE_IMAGE_EXTENSIONS = {".webp", ".tif", ".tiff", ".bmp"}
 
 GENART_FAMILY_TERMS = {
     "light": frozenset(
@@ -723,6 +734,11 @@ class ExportBundle:
     include_documents: bool = True
     include_videos: bool = True
     include_web_links: bool = True
+    # False beim Massenimport: der Kunzer-Abruf liefert keine GenArts, OE-Nummern,
+    # Vergleichsnummern, Attribute oder Fahrzeugverknüpfungen. Diese Dateien dürfen
+    # dann beim Upsert nicht angefasst werden, sonst löscht ein erneuter Import
+    # (z. B. monatliche Aktualisierung) die manuell gepflegten Zeilen des Artikels.
+    include_curated_data: bool = True
 
     def __post_init__(self) -> None:
         self.sync_genart_fields()
@@ -2346,6 +2362,158 @@ def infer_attachment_format_type_id(path_or_link: str) -> str:
     return ""
 
 
+def safe_media_filename(raw_name: str) -> str:
+    """ASCII-sicherer Dateiname (Kontrakt: Export-Dateinamen ohne Umlaute)."""
+    value = raw_name.strip()
+    for source, target in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("Ä", "Ae"), ("Ö", "Oe"), ("Ü", "Ue"), ("ß", "ss")):
+        value = value.replace(source, target)
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    value = re.sub(r'[<>:"/\\|?*\s]+', "_", value).strip("._")
+    return value[:60] or "datei"
+
+
+def sniff_media_extension(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data.startswith(b"%PDF"):
+        return ".pdf"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tif"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    return ""
+
+
+def convert_image_bytes_to_png(data: bytes) -> bytes:
+    if Image is None:
+        raise ValueError("Pillow wird benötigt, um dieses Bildformat nach PNG zu konvertieren (pip install pillow).")
+    with Image.open(io.BytesIO(data)) as source:
+        if source.mode in {"CMYK", "YCbCr"}:
+            source = source.convert("RGB")
+        buffer = io.BytesIO()
+        source.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+def download_media_to_folder(url: str, target_dir: Path, force: bool = False) -> Path:
+    """Lädt einen Deeplink herunter und liefert den lokalen Dateipfad zurück.
+
+    Der Dateiname enthält einen kurzen Hash der URL, damit gleichnamige Dateien
+    verschiedener Links nicht kollidieren und eine bereits heruntergeladene
+    Datei beim erneuten Export (Live-Speichern) wiederverwendet werden kann.
+    Mit force=True wird immer neu heruntergeladen (Monats-Aktualisierung:
+    erkennt auch unter gleicher URL ausgetauschte Inhalte).
+    """
+    parsed = urlparse(url.strip())
+    raw_name = Path(unquote(parsed.path)).name
+    stem = safe_media_filename(Path(raw_name).stem)
+    url_suffix = Path(raw_name).suffix.lower()
+    digest = hashlib.sha1(url.strip().encode("utf-8")).hexdigest()[:8]
+    base_name = f"{stem}_{digest}"
+
+    target_dir = target_dir.resolve()
+    if not force:
+        for known_suffix in ATTACHMENT_FORMAT_TYPE_BY_EXTENSION:
+            existing = target_dir / f"{base_name}{known_suffix}"
+            if path_exists_safe(existing) and existing.stat().st_size > 0:
+                return existing
+
+    data = fetch_preview_bytes_from_url(url, timeout_seconds=MEDIA_DOWNLOAD_TIMEOUT_SECONDS)
+    if not data:
+        raise ValueError("Der Server hat eine leere Datei geliefert.")
+
+    suffix = sniff_media_extension(data) or url_suffix
+    if suffix in CONVERTIBLE_IMAGE_EXTENSIONS:
+        data = convert_image_bytes_to_png(data)
+        suffix = ".png"
+    if suffix not in ATTACHMENT_FORMAT_TYPE_BY_EXTENSION:
+        raise ValueError(f"Nicht unterstütztes Dateiformat '{suffix or 'unbekannt'}'.")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / f"{base_name}{suffix}"
+    target_path.write_bytes(data)
+    return target_path
+
+
+def materialize_media_rows(
+    article_number: str,
+    rows: list[MediaRow],
+    export_dir: Path,
+    kind_label: str,
+    force_download: bool = False,
+) -> list[MediaRow]:
+    """Ersetzt Deeplinks durch lokal heruntergeladene Dateien.
+
+    Händler-Systeme können die Kunzer-Deeplinks nicht mehr anzeigen, deshalb
+    werden Bilder und Dokumente pro Artikel unter Medien/<Artikelnummer>/
+    abgelegt und der lokale Pfad in die Exportdateien geschrieben.
+    """
+    target_dir = export_dir / MEDIA_SUBFOLDER / safe_folder_name(article_number)
+    materialized: list[MediaRow] = []
+    for row in rows:
+        link = row.path_or_link.strip()
+        if urlparse(link).scheme not in {"http", "https"}:
+            materialized.append(row)
+            continue
+        try:
+            local_path = download_media_to_folder(link, target_dir, force=force_download)
+        except Exception as exc:
+            raise ValueError(f"{kind_label}-Download fehlgeschlagen ({link}): {exc}") from exc
+        materialized.append(MediaRow(path_or_link=str(local_path), art=row.art, sprache=row.sprache))
+    return materialized
+
+
+def cleanup_article_media_folder(export_dir: Path, article_number: str) -> int:
+    """Entfernt nicht mehr referenzierte Dateien aus Medien/<Artikelnummer>/.
+
+    Referenz sind die fertig geschriebenen Bilder.xlsx und Dokumente.xlsx —
+    damit bleiben auch Dateien erhalten, deren Datenart im aktuellen Lauf
+    nicht abgerufen wurde (z. B. Dokumente bei einem reinen Bilder-Refresh).
+    Gibt die Anzahl der gelöschten Dateien zurück.
+    """
+    folder = (export_dir / MEDIA_SUBFOLDER / safe_folder_name(article_number)).resolve()
+    if not folder.is_dir():
+        return 0
+
+    referenced: set[Path] = set()
+    for file_spec, headers in ((IMAGE_FILE, IMAGE_HEADERS), (DOCUMENT_FILE, DOCUMENT_HEADERS)):
+        for row in read_workbook_rows(export_dir / file_spec[0], file_spec[1], len(headers)):
+            path_value = row[1].strip()
+            if not path_value or urlparse(path_value).scheme in {"http", "https"}:
+                continue
+            try:
+                candidate = Path(path_value).resolve()
+            except OSError:
+                continue
+            if candidate.parent == folder:
+                referenced.add(candidate)
+
+    removed = 0
+    for entry in folder.iterdir():
+        if not entry.is_file() or entry.resolve() in referenced:
+            continue
+        try:
+            entry.unlink()
+            removed += 1
+        except OSError:
+            # Datei evtl. gerade geöffnet (z. B. Vorschau) – beim nächsten Lauf erneut versuchen.
+            continue
+    try:
+        next(folder.iterdir())
+    except StopIteration:
+        try:
+            folder.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
 class IdRegistry:
     def __init__(self) -> None:
         self.used_ids: set[str] = set()
@@ -3362,7 +3530,7 @@ def append_written_at(row: list[str], written_at: str) -> list[str]:
     return [*row, written_at]
 
 
-def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir: bool) -> Path:
+def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir: bool, refresh_media: bool = False) -> Path:
     written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if use_timestamp_subdir:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3370,6 +3538,11 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
     else:
         export_dir = output_root
     export_dir.mkdir(parents=True, exist_ok=True)
+
+    if bundle.include_images:
+        bundle.image_rows = materialize_media_rows(bundle.article_number, bundle.image_rows, export_dir, "Bild", force_download=refresh_media)
+    if bundle.include_documents:
+        bundle.document_rows = materialize_media_rows(bundle.article_number, bundle.document_rows, export_dir, "Dokument", force_download=refresh_media)
 
     short_row = append_written_at(build_short_text_export_row(bundle), written_at)
     long_row = append_written_at(build_long_text_export_row(bundle), written_at)
@@ -3433,41 +3606,42 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
                 [long_row],
                 replace_article_keys=article_keys,
             )
-        write_workbook_with_upsert(
-            export_dir / GENART_FILE[0],
-            GENART_FILE[1],
-            GENART_HEADERS,
-            genart_rows,
-            replace_article_keys=article_keys,
-        )
-        write_workbook_with_upsert(
-            export_dir / OE_FILE[0],
-            OE_FILE[1],
-            OE_HEADERS,
-            oe_rows,
-            replace_article_keys=article_keys,
-        )
-        write_workbook_with_upsert(
-            export_dir / COMPARISON_FILE[0],
-            COMPARISON_FILE[1],
-            COMPARISON_HEADERS,
-            comparison_rows,
-            replace_article_keys=article_keys,
-        )
-        write_workbook_with_upsert(
-            export_dir / VEHICLE_LINK_FILE[0],
-            VEHICLE_LINK_FILE[1],
-            VEHICLE_LINK_HEADERS,
-            vehicle_link_rows,
-            replace_article_keys=article_keys,
-        )
-        write_workbook_with_upsert(
-            export_dir / ATTRIBUTE_FILE[0],
-            ATTRIBUTE_FILE[1],
-            ATTRIBUTE_HEADERS,
-            attribute_rows,
-            replace_article_keys=article_keys,
-        )
+        if bundle.include_curated_data:
+            write_workbook_with_upsert(
+                export_dir / GENART_FILE[0],
+                GENART_FILE[1],
+                GENART_HEADERS,
+                genart_rows,
+                replace_article_keys=article_keys,
+            )
+            write_workbook_with_upsert(
+                export_dir / OE_FILE[0],
+                OE_FILE[1],
+                OE_HEADERS,
+                oe_rows,
+                replace_article_keys=article_keys,
+            )
+            write_workbook_with_upsert(
+                export_dir / COMPARISON_FILE[0],
+                COMPARISON_FILE[1],
+                COMPARISON_HEADERS,
+                comparison_rows,
+                replace_article_keys=article_keys,
+            )
+            write_workbook_with_upsert(
+                export_dir / VEHICLE_LINK_FILE[0],
+                VEHICLE_LINK_FILE[1],
+                VEHICLE_LINK_HEADERS,
+                vehicle_link_rows,
+                replace_article_keys=article_keys,
+            )
+            write_workbook_with_upsert(
+                export_dir / ATTRIBUTE_FILE[0],
+                ATTRIBUTE_FILE[1],
+                ATTRIBUTE_HEADERS,
+                attribute_rows,
+                replace_article_keys=article_keys,
+            )
         if bundle.include_images:
             write_workbook_with_upsert(
                 export_dir / IMAGE_FILE[0],
@@ -3500,6 +3674,9 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
                 web_rows,
                 replace_article_keys=article_keys,
             )
+
+    if refresh_media:
+        cleanup_article_media_folder(export_dir, bundle.article_number)
 
     return export_dir
 
@@ -7611,6 +7788,12 @@ class ApolloImportApp:
         self.batch_document_var = tk.BooleanVar(value=True)
         self.batch_video_var = tk.BooleanVar(value=True)
         self.batch_web_var = tk.BooleanVar(value=True)
+        self.batch_progress_var = tk.StringVar()
+        self.batch_refresh_media_var = tk.BooleanVar(value=False)
+        self.batch_cancel_event = threading.Event()
+        self.batch_import_running = False
+        self.batch_run_label = "Massenimport"
+        self.last_batch_updated_articles: list[str] = []
         self.article_number_var = tk.StringVar()
         self.short_module_id_var = tk.StringVar()
         self.long_module_id_var = tk.StringVar()
@@ -9432,16 +9615,50 @@ if ($copied) {{
         ttk.Entry(batch_import_frame, textvariable=self.product_list_path_var).grid(row=2, column=1, sticky="ew", pady=6)
         ttk.Button(batch_import_frame, text="Datei wählen", command=self.choose_product_list_file).grid(row=2, column=2, padx=(8, 0), pady=6)
 
-        ttk.Button(batch_import_frame, text="Liste importieren", command=self.import_products_from_file).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(10, 0)
+        ttk.Checkbutton(
+            batch_import_frame,
+            text="Medien neu herunterladen (Monats-Aktualisierung: ersetzt vorhandene Dateien, entfernt veraltete)",
+            variable=self.batch_refresh_media_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        batch_button_row = ttk.Frame(batch_import_frame)
+        batch_button_row.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.batch_import_button = ttk.Button(batch_button_row, text="Liste importieren", command=self.import_products_from_file)
+        self.batch_import_button.grid(row=0, column=0, sticky="w")
+        self.batch_update_button = ttk.Button(
+            batch_button_row,
+            text="Artikelliste aktualisieren",
+            command=self.update_all_articles_from_browser,
         )
+        self.batch_update_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.batch_cancel_button = ttk.Button(batch_button_row, text="Abbrechen", command=self.cancel_batch_import, state="disabled")
+        self.batch_cancel_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.batch_delete_list_button = ttk.Button(
+            batch_button_row,
+            text="Apollo-Löschliste speichern",
+            command=self.save_apollo_delete_list,
+            state="disabled",
+        )
+        self.batch_delete_list_button.grid(row=0, column=3, sticky="w", padx=(8, 0))
+
+        self.batch_progress_bar = ttk.Progressbar(batch_import_frame, mode="determinate")
+        self.batch_progress_bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self.batch_progress_label = ttk.Label(
+            batch_import_frame,
+            textvariable=self.batch_progress_var,
+            foreground="#5E6472",
+            wraplength=500,
+        )
+        self.batch_progress_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.batch_progress_bar.grid_remove()
+        self.batch_progress_label.grid_remove()
 
         ttk.Label(
             batch_import_frame,
-            text="Der Massenimport übersetzt ausgewählte Texte automatisch und schreibt immer direkt in den festen Output-Pfad.",
+            text="Der Massenimport läuft im Hintergrund: das Programm bleibt bedienbar, übersetzt ausgewählte Texte automatisch und schreibt immer direkt in den festen Output-Pfad. GenArts, OE-Nummern, Vergleichsnummern, Attribute und Fahrzeugverknüpfungen werden dabei nie überschrieben. „Artikelliste aktualisieren“ verarbeitet alle Artikel der Artikelliste, ganz ohne Produktlisten-Datei.",
             foreground="#5E6472",
             wraplength=500,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         self.scope_frame = ttk.LabelFrame(project_parent, text="Abrufumfang", padding=14)
         scope_frame = self.scope_frame
@@ -10609,6 +10826,55 @@ if ($copied) {{
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
 
+    def _upsert_article_browser_from_batch_bundle(self, bundle: ExportBundle, output_root: Path) -> None:
+        """Aktualisiert den Artikel in der Artikelliste nach einem Batch-Export.
+
+        Es werden nur die im Abrufumfang angehakten Datenarten ersetzt; alles
+        andere (nicht abgerufene Texte/Medien sowie die gepflegten GenArts,
+        OE-Nummern, Attribute usw.) bleibt aus dem vorhandenen Eintrag erhalten.
+        """
+        existing_snapshot = self.article_browser_records.get(bundle.article_number)
+        snapshot = self._copy_snapshot(existing_snapshot) if existing_snapshot is not None else StoredArticleSnapshot(
+            article_number=bundle.article_number,
+            source_label="Output",
+            source_folder=output_root,
+        )
+        snapshot.article_number = bundle.article_number
+        snapshot.source_label = "Output"
+        snapshot.source_folder = output_root
+        if bundle.short_module_id:
+            snapshot.short_module_id = bundle.short_module_id
+        if bundle.long_module_id:
+            snapshot.long_module_id = bundle.long_module_id
+        if bundle.include_short_text:
+            snapshot.short_texts = TranslationSet(**vars(bundle.short_texts))
+            snapshot.short_auto_uni = bundle.short_auto_uni
+        if bundle.include_long_text:
+            snapshot.long_texts = TranslationSet(**vars(bundle.long_texts))
+            snapshot.long_auto_uni = bundle.long_auto_uni
+        if bundle.include_images:
+            snapshot.image_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.image_rows]
+        if bundle.include_documents:
+            snapshot.document_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.document_rows]
+        if bundle.include_videos:
+            snapshot.video_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.video_rows]
+        if bundle.include_web_links:
+            snapshot.web_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.web_rows]
+        if bundle.include_curated_data:
+            snapshot.genart_selections = [GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in bundle.genart_selections]
+            snapshot.genart_id = bundle.genart_id
+            snapshot.genart_bezeichnung = bundle.genart_bezeichnung
+            snapshot.sync_genart_fields()
+            snapshot.oe_number_rows = list(bundle.oe_number_rows)
+            snapshot.comparison_number_rows = list(bundle.comparison_number_rows)
+            snapshot.vehicle_link_rows = list(bundle.vehicle_link_rows)
+            snapshot.attribute_rows = list(bundle.attribute_rows)
+            snapshot.search_terms = list(bundle.search_terms)
+        self.article_browser_records[bundle.article_number] = snapshot
+        self.article_browser_cache_dir = str(output_root)
+        self.article_browser_cache_signature = None
+        self._render_article_browser(bundle.article_number)
+
     def _upsert_article_browser_section(self, section: str, bundle: ExportBundle, output_root: Path) -> None:
         existing_snapshot = self.article_browser_records.get(bundle.article_number)
         snapshot = self._copy_snapshot(existing_snapshot) if existing_snapshot is not None else StoredArticleSnapshot(
@@ -10827,8 +11093,10 @@ if ($copied) {{
                 # Suchwörter liegen mit in der Attribute-Datei.
                 self._write_attribute_live(bundle, output_root)
             elif section == "images":
+                bundle.image_rows = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild")
                 self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
             elif section == "documents":
+                bundle.document_rows = materialize_media_rows(bundle.article_number, bundle.document_rows, output_root, "Dokument")
                 self._write_media_section_live(bundle, output_root, DOCUMENT_FILE, DOCUMENT_HEADERS, build_document_export_rows(bundle))
             elif section == "videos":
                 self._write_media_section_live(bundle, output_root, VIDEO_FILE, VIDEO_HEADERS, build_video_export_rows(bundle))
@@ -10975,6 +11243,7 @@ if ($copied) {{
             include_documents=scrape_options["documents"],
             include_videos=scrape_options["videos"],
             include_web_links=scrape_options["web_links"],
+            include_curated_data=False,
         )
 
     def _apply_kunzer_result(
@@ -11121,11 +11390,60 @@ if ($copied) {{
         if not source_path.exists():
             messagebox.showwarning(APP_TITLE, f"Produktliste nicht gefunden:\n{source_path}")
             return
+        if self.background_task_running or self.batch_import_running:
+            self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
+            return
+
+        try:
+            items = read_product_import_items(source_path)
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+
+        self._start_batch_import(items, run_label="Massenimport")
+
+    def update_all_articles_from_browser(self) -> None:
+        """Aktualisiert alle Artikel, die aktuell in der Artikelliste stehen."""
+        if self.background_task_running or self.batch_import_running:
+            self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
+            return
+
+        # Liste vorher mit dem Output-Ordner abgleichen, damit wirklich alle
+        # gespeicherten Artikel erfasst werden.
+        self._refresh_article_browser()
+        article_numbers = sorted(self.article_browser_records)
+        if not article_numbers:
+            messagebox.showwarning(APP_TITLE, "Die Artikelliste ist leer – es gibt nichts zu aktualisieren.")
+            return
+
+        items: list[CsvImportItem] = []
+        for article_number in article_numbers:
+            snapshot = self.article_browser_records[article_number]
+            product_url = ""
+            for row in snapshot.web_rows:
+                link = row.path_or_link.strip()
+                if link.lower().startswith(("http://", "https://")) and "kunzer.de" in link.lower():
+                    product_url = link
+                    break
+            items.append(CsvImportItem(article_number=article_number, product_url=product_url))
+
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"{len(items)} Artikel aus der Artikelliste jetzt von Kunzer aktualisieren?\n\n"
+            "Es gilt der eingestellte Abrufumfang; nicht angehakte Datenarten und gepflegte Daten bleiben unverändert.",
+        ):
+            return
+
+        self._start_batch_import(items, run_label="Aktualisierung")
+
+    def _start_batch_import(self, items: list[CsvImportItem], run_label: str) -> None:
+        if self.background_task_running or self.batch_import_running:
+            self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
+            return
 
         try:
             output_root = self._resolve_output_root()
             options = self._get_scrape_options()
-            items = read_product_import_items(source_path)
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
             return
@@ -11141,67 +11459,214 @@ if ($copied) {{
         if output_root.exists():
             self.id_registry.load_from_folder(output_root, clear_existing=False)
 
-        success_count = 0
-        error_messages: list[str] = []
-        last_result: KunzerScrapeResult | None = None
-        last_bundle: ExportBundle | None = None
         total = len(items)
+        refresh_media = self.batch_refresh_media_var.get()
+        self.batch_run_label = run_label
+        self.batch_cancel_event = threading.Event()
+        cancel_event = self.batch_cancel_event
+        self._set_batch_ui_running(True, total)
+        # Bewusst kein _set_background_task_state: der Warte-Cursor bleibt aus,
+        # damit die App während des Batches normal bedienbar wirkt. Das Flag
+        # verhindert trotzdem parallele Einzel-Imports.
+        self.background_task_running = True
+        self.status_var.set(f"{run_label} gestartet: {total} Artikel werden im Hintergrund abgerufen ...")
+        # Während des Batches darf das Live-Speichern nicht parallel in
+        # dieselben Output-Dateien schreiben.
+        self.live_write_suspended = True
 
-        for index, item in enumerate(items, start=1):
-            identifier = item.product_url or item.article_number
+        # Der Worker-Thread darf Tkinter nicht direkt anfassen (auch after()
+        # ist aus Fremd-Threads nicht zuverlässig). Er meldet Fortschritt über
+        # eine Queue, die ein Poller auf dem Main-Thread abarbeitet.
+        progress_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+
+        def worker() -> None:
+            summary: dict[str, object] = {
+                "success_count": 0,
+                "error_messages": [],
+                "last_result": None,
+                "last_bundle": None,
+                "total": total,
+                "processed": 0,
+                "cancelled": False,
+                "updated_articles": [],
+            }
+            started_at = time.monotonic()
+
+            def post(done: int, detail: str) -> None:
+                progress_queue.put(("progress", (done, total, detail, time.monotonic() - started_at)))
+
             try:
-                self.status_var.set(f"Massenimport {index}/{total}: {identifier}")
-                self.root.update_idletasks()
-                result = self.kunzer_scraper.scrape_product(identifier)
-                bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
-                export_bundle(bundle, output_root, use_timestamp_subdir=False)
-                success_count += 1
-                last_result = result
-                last_bundle = bundle
-            except Exception as exc:  # pragma: no cover - user facing batch feedback
-                error_messages.append(f"{identifier}: {exc}")
+                for index, item in enumerate(items, start=1):
+                    if cancel_event.is_set():
+                        break
+                    identifier = item.product_url or item.article_number
+                    post(index - 1, f"{identifier}: Kunzer-Abruf ...")
+                    try:
+                        result = self.kunzer_scraper.scrape_product(identifier)
+                        post(index - 1, f"{identifier}: Übersetzung, Medien-Download & Export ...")
+                        bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
+                        export_bundle(bundle, output_root, use_timestamp_subdir=False, refresh_media=refresh_media)
+                        summary["success_count"] = int(summary["success_count"]) + 1
+                        summary["last_result"] = result
+                        summary["last_bundle"] = bundle
+                        summary["updated_articles"].append(bundle.article_number)
+                        progress_queue.put(("article", bundle))
+                    except Exception as exc:  # pragma: no cover - user facing batch feedback
+                        summary["error_messages"].append(f"{identifier}: {exc}")
+                    summary["processed"] = index
+                    post(index, "")
+            except Exception as exc:  # pragma: no cover - defensive: Fehler pro Artikel werden oben gefangen
+                summary["error_messages"].append(f"Massenimport unerwartet beendet: {exc}")
+            summary["cancelled"] = cancel_event.is_set()
+            progress_queue.put(("finish", summary))
 
-        if last_result and last_bundle:
-            self._apply_kunzer_result(last_result, translate_after_load=False, write_live=False)
-            self.short_module_id_var.set(last_bundle.short_module_id)
-            self.long_module_id_var.set(last_bundle.long_module_id)
-            if last_bundle.include_short_text:
-                self.short_text_frame.set_value(last_bundle.short_texts, auto_uni=True)
+        def poll_queue() -> None:
+            while True:
+                try:
+                    kind, payload = progress_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "progress":
+                    done, item_total, detail, elapsed = payload  # type: ignore[misc]
+                    self._apply_batch_progress(done, item_total, detail, elapsed)
+                elif kind == "article":
+                    self._upsert_article_browser_from_batch_bundle(payload, output_root)  # type: ignore[arg-type]
+                else:
+                    self._finish_batch_import(payload)  # type: ignore[arg-type]
+                    return
+            self.root.after(150, poll_queue)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(150, poll_queue)
+
+    def cancel_batch_import(self) -> None:
+        if not self.batch_import_running:
+            return
+        self.batch_cancel_event.set()
+        self.batch_cancel_button.configure(state="disabled")
+        self.batch_progress_var.set(f"{self.batch_run_label} wird nach dem aktuellen Artikel abgebrochen ...")
+        self.status_var.set(f"{self.batch_run_label} wird abgebrochen ...")
+
+    def save_apollo_delete_list(self) -> None:
+        """Speichert die Artikelnummern des letzten Laufs (Spalte A) als Löschliste für Apollo."""
+        articles = list(self.last_batch_updated_articles)
+        if not articles:
+            messagebox.showwarning(APP_TITLE, "Es liegt noch keine Aktualisierung aus diesem Programmlauf vor.")
+            return
+
+        default_name = f"Apollo-Loeschliste_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+        target = filedialog.asksaveasfilename(
+            title="Apollo-Löschliste speichern",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel Dateien", "*.xlsx"), ("CSV Dateien", "*.csv")],
+        )
+        if not target:
+            return
+
+        target_path = Path(target)
+        try:
+            if target_path.suffix.lower() == ".csv":
+                with target_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                    writer = csv.writer(handle, delimiter=";")
+                    writer.writerow(["Artikelnummer"])
+                    for article_number in articles:
+                        writer.writerow([article_number])
             else:
-                self.short_text_frame.set_value(TranslationSet(), auto_uni=True)
-            if last_bundle.include_long_text:
-                self.long_text_frame.set_value(last_bundle.long_texts, auto_uni=True)
+                write_workbook(target_path, "Loeschliste", ["Artikelnummer"], [[article_number] for article_number in articles])
+        except OSError as exc:
+            messagebox.showwarning(APP_TITLE, f"Löschliste konnte nicht gespeichert werden:\n{exc}")
+            return
+
+        self.status_var.set(f"Apollo-Löschliste gespeichert: {len(articles)} Artikel – {target_path}")
+        messagebox.showinfo(
+            APP_TITLE,
+            f"Löschliste mit {len(articles)} Artikelnummern gespeichert:\n{target_path}\n\nSpalte A enthält die Artikelnummern der aktualisierten Artikel.",
+        )
+
+    def _set_batch_ui_running(self, running: bool, total: int = 0) -> None:
+        self.batch_import_running = running
+        if running:
+            self.batch_import_button.configure(state="disabled")
+            self.batch_update_button.configure(state="disabled")
+            self.batch_cancel_button.configure(state="normal")
+            self.batch_delete_list_button.configure(state="disabled")
+            self.batch_progress_bar.configure(maximum=max(total, 1), value=0)
+            self.batch_progress_var.set(f"0/{total} Artikel verarbeitet")
+            self.batch_progress_bar.grid()
+            self.batch_progress_label.grid()
+        else:
+            self.batch_import_button.configure(state="normal")
+            self.batch_update_button.configure(state="normal")
+            self.batch_cancel_button.configure(state="disabled")
+
+    def _apply_batch_progress(self, done: int, total: int, detail: str, elapsed: float) -> None:
+        if not self.batch_import_running:
+            return
+        self.batch_progress_bar.configure(value=done)
+        text = f"{done}/{total} Artikel verarbeitet"
+        if done and done < total:
+            remaining_seconds = int(elapsed / done * (total - done))
+            if remaining_seconds >= 90:
+                text += f" – Restzeit ca. {remaining_seconds // 60} min"
             else:
-                self.long_text_frame.set_value(TranslationSet(), auto_uni=True)
-            self.attribute_frame.set_rows(last_bundle.attribute_rows)
-            self.search_term_frame.set_terms(last_bundle.search_terms)
-            self.oe_frame.set_rows(last_bundle.oe_number_rows)
-            self.comparison_frame.set_rows(last_bundle.comparison_number_rows)
-            self.vehicle_link_frame.set_rows(last_bundle.vehicle_link_rows)
-            if not last_bundle.include_images:
-                self.image_frame.set_rows([])
-            if not last_bundle.include_documents:
-                self.document_frame.set_rows([])
-            if not last_bundle.include_videos:
-                self.video_frame.set_rows([])
-            if not last_bundle.include_web_links:
-                self.web_frame.set_rows([])
+                text += f" – Restzeit ca. {max(remaining_seconds, 5)} s"
+        if detail:
+            text += f"\n{detail}"
+        if self.batch_cancel_event.is_set():
+            text = f"{done}/{total} Artikel verarbeitet – Abbruch nach aktuellem Artikel ..."
+        self.batch_progress_var.set(text)
+        self.status_var.set(f"{self.batch_run_label} läuft im Hintergrund: {done}/{total}" + (f" – {detail}" if detail else ""))
+
+    def _finish_batch_import(self, summary: dict[str, object]) -> None:
+        self.live_write_suspended = False
+        self._set_batch_ui_running(False)
+        self.background_task_running = False
+
+        success_count = summary["success_count"]
+        error_messages = summary["error_messages"]
+        last_bundle = summary["last_bundle"]
+        total = summary["total"]
+        processed = summary["processed"]
+        cancelled = summary["cancelled"]
+
+        self.last_batch_updated_articles = list(summary.get("updated_articles") or [])
+        self.batch_delete_list_button.configure(state="normal" if self.last_batch_updated_articles else "disabled")
+
+        if last_bundle:
+            # Den zusammengeführten Eintrag aus der Artikelliste laden (nicht das
+            # rohe Scrape-Ergebnis): so zeigt der Editor auch die nicht abgerufenen
+            # Datenarten und die gepflegten Daten des Artikels korrekt an.
+            snapshot = self.article_browser_records.get(last_bundle.article_number)
+            if snapshot is not None:
+                with self._suspend_live_write():
+                    self._apply_article_snapshot(snapshot)
 
         self.refresh_preview()
-        if error_messages:
+        run_label = self.batch_run_label
+        if cancelled:
+            self.batch_progress_var.set(f"Abgebrochen: {processed}/{total} Artikel verarbeitet, {success_count} erfolgreich")
+            self.status_var.set(f"{run_label} abgebrochen: {success_count} von {processed} verarbeiteten Artikeln erfolgreich")
+            messagebox.showinfo(
+                APP_TITLE,
+                f"{run_label} abgebrochen.\n\nVerarbeitet: {processed} von {total}\nErfolgreich geschrieben: {success_count}",
+            )
+        elif error_messages:
             preview = "\n".join(error_messages[:8])
             if len(error_messages) > 8:
                 preview += f"\n... und {len(error_messages) - 8} weitere"
-            self.status_var.set(f"Massenimport abgeschlossen mit Fehlern: {success_count}/{total} erfolgreich")
+            self.batch_progress_var.set(f"Fertig mit Fehlern: {success_count}/{total} Artikel erfolgreich")
+            self.status_var.set(f"{run_label} abgeschlossen mit Fehlern: {success_count}/{total} erfolgreich")
             messagebox.showwarning(
                 APP_TITLE,
-                f"Massenimport abgeschlossen und direkt in den Output-Pfad geschrieben: {success_count} von {total} Produkten erfolgreich.\n\nFehler:\n{preview}",
+                f"{run_label} abgeschlossen und direkt in den Output-Pfad geschrieben: {success_count} von {total} Produkten erfolgreich.\n\nFehler:\n{preview}",
             )
         else:
-            self.status_var.set(f"Massenimport abgeschlossen: {success_count}/{total} Produkte erfolgreich")
+            self.batch_progress_var.set(f"Fertig: {success_count}/{total} Artikel erfolgreich verarbeitet")
+            self.status_var.set(f"{run_label} abgeschlossen: {success_count}/{total} Produkte erfolgreich")
             messagebox.showinfo(
                 APP_TITLE,
-                f"Massenimport erfolgreich abgeschlossen:\n{success_count} Produkte importiert und direkt in den Output-Pfad geschrieben.",
+                f"{run_label} erfolgreich abgeschlossen:\n{success_count} Produkte verarbeitet und direkt in den Output-Pfad geschrieben.",
             )
 
     def _build_deepl_client(self) -> DeepLClient:
