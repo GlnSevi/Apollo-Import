@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.18"
+APP_VERSION = "0.1.19"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -236,6 +236,13 @@ VEHICLE_LINK_FILE = ("Fahrzeugverknuepfungen.xlsx", "Sheet1")
 # Output-Ordner. Spalte A = Artikelnummer, damit die Datei direkt wieder als
 # Produktliste geladen werden kann.
 BATCH_ERROR_LIST_FILENAME = "Massenimport-Fehler.xlsx"
+# Übersprungene tote Medien-Links (Server liefert die Datei dauerhaft nicht).
+# Eigene Datei, damit die Fehlerliste nur echte, wiederholbare Fehler enthält.
+BATCH_WARNING_LIST_FILENAME = "Massenimport-Warnungen.xlsx"
+# Diese HTTP-Fehler bedeuten: Datei existiert auf dem Server nicht (mehr).
+# Erneute Versuche sind zwecklos – das Medium wird mit Warnung übersprungen.
+# Timeouts/5xx gelten weiter als vorübergehend und lassen den Artikel fehlschlagen.
+MEDIA_PERMANENT_HTTP_ERRORS = {400, 401, 403, 404, 410}
 
 IMAGE_HEADERS = ["Artikelnummer", "BILDPFAD", "Art", "Sprache", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
 DOCUMENT_HEADERS = ["Artikelnummer", "Pfad zum Dokument", "Sprache", "Art", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
@@ -2410,6 +2417,10 @@ def convert_image_bytes_to_png(data: bytes) -> bytes:
         return buffer.getvalue()
 
 
+class MediaUnavailableError(ValueError):
+    """Medium ist dauerhaft nicht abrufbar (toter Link auf dem Server)."""
+
+
 def load_media_index(folder: Path) -> dict[str, str]:
     path = folder / MEDIA_INDEX_FILENAME
     if not path_exists_safe(path):
@@ -2477,7 +2488,12 @@ def download_media_to_folder(
         if path_exists_safe(existing_path) and existing_path.stat().st_size > 0:
             return existing_path
 
-    data = fetch_preview_bytes_from_url(url, timeout_seconds=MEDIA_DOWNLOAD_TIMEOUT_SECONDS)
+    try:
+        data = fetch_preview_bytes_from_url(url, timeout_seconds=MEDIA_DOWNLOAD_TIMEOUT_SECONDS)
+    except urllib_error.HTTPError as exc:
+        if exc.code in MEDIA_PERMANENT_HTTP_ERRORS:
+            raise MediaUnavailableError(f"HTTP {exc.code} – Datei auf dem Server nicht (mehr) vorhanden") from exc
+        raise
     if not data:
         raise ValueError("Der Server hat eine leere Datei geliefert.")
 
@@ -2518,16 +2534,21 @@ def materialize_media_rows(
     kind_label: str,
     kind_tag: str = "",
     force_download: bool = False,
-) -> list[MediaRow]:
+) -> tuple[list[MediaRow], list[str]]:
     """Ersetzt Deeplinks durch lokal heruntergeladene Dateien.
 
     Händler-Systeme können die Kunzer-Deeplinks nicht mehr anzeigen, deshalb
     werden Bilder und Dokumente pro Artikel unter Medien/<Artikelnummer>/
     abgelegt und der lokale Pfad in die Exportdateien geschrieben.
+
+    Dauerhaft tote Links (Server liefert 400/404/...) blockieren den Artikel
+    nicht mehr: das Medium wird übersprungen und als Warnung zurückgegeben.
+    Vorübergehende Fehler (Timeout, 5xx) werfen weiterhin einen ValueError.
     """
     target_dir = (export_dir / MEDIA_SUBFOLDER / safe_folder_name(article_number)).resolve()
     index = load_media_index(target_dir)
     materialized: list[MediaRow] = []
+    skipped: list[str] = []
     downloaded = False
     try:
         for row in rows:
@@ -2537,6 +2558,9 @@ def materialize_media_rows(
                 continue
             try:
                 local_path = download_media_to_folder(link, target_dir, article_number, kind_tag, index, force=force_download)
+            except MediaUnavailableError as exc:
+                skipped.append(f"{kind_label} übersprungen: {link} ({exc})")
+                continue
             except Exception as exc:
                 raise ValueError(f"{kind_label}-Download fehlgeschlagen ({link}): {exc}") from exc
             downloaded = True
@@ -2544,7 +2568,7 @@ def materialize_media_rows(
     finally:
         if downloaded:
             save_media_index(target_dir, index)
-    return materialized
+    return materialized, skipped
 
 
 def cleanup_article_media_folder(export_dir: Path, article_number: str) -> int:
@@ -3614,7 +3638,13 @@ def append_written_at(row: list[str], written_at: str) -> list[str]:
     return [*row, written_at]
 
 
-def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir: bool, refresh_media: bool = False) -> Path:
+def export_bundle(
+    bundle: ExportBundle,
+    output_root: Path,
+    use_timestamp_subdir: bool,
+    refresh_media: bool = False,
+    media_warnings: list[str] | None = None,
+) -> Path:
     written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if use_timestamp_subdir:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3624,9 +3654,13 @@ def export_bundle(bundle: ExportBundle, output_root: Path, use_timestamp_subdir:
     export_dir.mkdir(parents=True, exist_ok=True)
 
     if bundle.include_images:
-        bundle.image_rows = materialize_media_rows(bundle.article_number, bundle.image_rows, export_dir, "Bild", kind_tag="", force_download=refresh_media)
+        bundle.image_rows, skipped_images = materialize_media_rows(bundle.article_number, bundle.image_rows, export_dir, "Bild", kind_tag="", force_download=refresh_media)
+        if media_warnings is not None:
+            media_warnings.extend(skipped_images)
     if bundle.include_documents:
-        bundle.document_rows = materialize_media_rows(bundle.article_number, bundle.document_rows, export_dir, "Dokument", kind_tag="D", force_download=refresh_media)
+        bundle.document_rows, skipped_documents = materialize_media_rows(bundle.article_number, bundle.document_rows, export_dir, "Dokument", kind_tag="D", force_download=refresh_media)
+        if media_warnings is not None:
+            media_warnings.extend(skipped_documents)
 
     short_row = append_written_at(build_short_text_export_row(bundle), written_at)
     long_row = append_written_at(build_long_text_export_row(bundle), written_at)
@@ -7878,6 +7912,8 @@ class ApolloImportApp:
         self.batch_import_running = False
         self.batch_run_label = "Massenimport"
         self.last_batch_updated_articles: list[str] = []
+        self.batch_completion_dialog: tk.Toplevel | None = None
+        self.last_batch_dialog_info: dict[str, str] = {}
         self.article_number_var = tk.StringVar()
         self.short_module_id_var = tk.StringVar()
         self.long_module_id_var = tk.StringVar()
@@ -11177,10 +11213,10 @@ if ($copied) {{
                 # Suchwörter liegen mit in der Attribute-Datei.
                 self._write_attribute_live(bundle, output_root)
             elif section == "images":
-                bundle.image_rows = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild", kind_tag="")
+                bundle.image_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild", kind_tag="")
                 self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
             elif section == "documents":
-                bundle.document_rows = materialize_media_rows(bundle.article_number, bundle.document_rows, output_root, "Dokument", kind_tag="D")
+                bundle.document_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.document_rows, output_root, "Dokument", kind_tag="D")
                 self._write_media_section_live(bundle, output_root, DOCUMENT_FILE, DOCUMENT_HEADERS, build_document_export_rows(bundle))
             elif section == "videos":
                 self._write_media_section_live(bundle, output_root, VIDEO_FILE, VIDEO_HEADERS, build_video_export_rows(bundle))
@@ -11585,6 +11621,8 @@ if ($copied) {{
                 "cancelled": False,
                 "updated_articles": [],
                 "error_list_path": "",
+                "media_warnings": [],
+                "warning_list_path": "",
             }
             started_at = time.monotonic()
 
@@ -11607,7 +11645,17 @@ if ($copied) {{
                             result = self.kunzer_scraper.scrape_product(identifier)
                             post(index - 1, f"{identifier}: Übersetzung, Medien-Download & Export ...")
                             bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
-                            export_bundle(bundle, output_root, use_timestamp_subdir=False, refresh_media=refresh_media)
+                            article_media_warnings: list[str] = []
+                            export_bundle(
+                                bundle,
+                                output_root,
+                                use_timestamp_subdir=False,
+                                refresh_media=refresh_media,
+                                media_warnings=article_media_warnings,
+                            )
+                            summary["media_warnings"].extend(
+                                (bundle.article_number, warning) for warning in article_media_warnings
+                            )
                             summary["success_count"] = int(summary["success_count"]) + 1
                             summary["last_result"] = result
                             summary["last_bundle"] = bundle
@@ -11644,6 +11692,21 @@ if ($copied) {{
             except Exception:  # pragma: no cover - Fehlerliste darf den Lauf nie kippen
                 summary["error_list_path"] = ""
 
+            warning_list_path = output_root / BATCH_WARNING_LIST_FILENAME
+            try:
+                if summary["media_warnings"]:
+                    write_workbook(
+                        warning_list_path,
+                        "Warnungen",
+                        ["Artikelnummer", "Hinweis"],
+                        [[article_number, warning] for article_number, warning in summary["media_warnings"]],
+                    )
+                    summary["warning_list_path"] = str(warning_list_path)
+                elif not summary["cancelled"]:
+                    warning_list_path.unlink(missing_ok=True)
+            except Exception:  # pragma: no cover - Warnungsliste darf den Lauf nie kippen
+                summary["warning_list_path"] = ""
+
             progress_queue.put(("finish", summary))
 
         def poll_queue() -> None:
@@ -11672,6 +11735,64 @@ if ($copied) {{
         self.batch_cancel_button.configure(state="disabled")
         self.batch_progress_var.set(f"{self.batch_run_label} wird nach dem aktuellen Artikel abgebrochen ...")
         self.status_var.set(f"{self.batch_run_label} wird abgebrochen ...")
+
+    def _open_path_in_default_app(self, path: str) -> None:
+        try:
+            os.startfile(path)
+        except OSError as exc:
+            messagebox.showwarning(APP_TITLE, f"Datei konnte nicht geöffnet werden:\n{path}\n\n{exc}")
+
+    def _show_batch_completion_dialog(self, kind: str, message: str, error_list_path: str, warning_list_path: str) -> None:
+        """Abschlussfenster nach dem Batch: Meldung plus Direkt-Öffnen der Listen.
+
+        Bewusst nicht modal, damit die App sofort weiter bedienbar ist.
+        """
+        if self.batch_completion_dialog is not None and self.batch_completion_dialog.winfo_exists():
+            self.batch_completion_dialog.destroy()
+
+        self.last_batch_dialog_info = {
+            "kind": kind,
+            "message": message,
+            "error_list_path": error_list_path,
+            "warning_list_path": warning_list_path,
+        }
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"{APP_TITLE} – {self.batch_run_label}")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        heading = {"info": "Abgeschlossen", "warn": "Abgeschlossen mit Fehlern", "cancel": "Abgebrochen"}.get(kind, "Abgeschlossen")
+        ttk.Label(frame, text=f"{self.batch_run_label}: {heading}", font=("Segoe UI Semibold", 11)).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+        ttk.Label(frame, text=message, wraplength=560, justify="left").grid(row=1, column=0, sticky="w")
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=2, column=0, sticky="w", pady=(14, 0))
+        column = 0
+        if error_list_path:
+            ttk.Button(
+                button_row,
+                text="Fehlerliste öffnen",
+                command=lambda path=error_list_path: self._open_path_in_default_app(path),
+            ).grid(row=0, column=column, padx=(0, 8))
+            column += 1
+        if warning_list_path:
+            ttk.Button(
+                button_row,
+                text="Warnungsliste öffnen",
+                command=lambda path=warning_list_path: self._open_path_in_default_app(path),
+            ).grid(row=0, column=column, padx=(0, 8))
+            column += 1
+        close_button = ttk.Button(button_row, text="Schließen", command=dialog.destroy)
+        close_button.grid(row=0, column=column)
+
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        close_button.focus_set()
+        self.batch_completion_dialog = dialog
 
     def save_apollo_delete_list(self) -> None:
         """Speichert die Artikelnummern des letzten Laufs (Spalte A) als Löschliste für Apollo."""
@@ -11713,6 +11834,8 @@ if ($copied) {{
     def _set_batch_ui_running(self, running: bool, total: int = 0) -> None:
         self.batch_import_running = running
         if running:
+            if self.batch_completion_dialog is not None and self.batch_completion_dialog.winfo_exists():
+                self.batch_completion_dialog.destroy()
             self.batch_import_button.configure(state="disabled")
             self.batch_update_button.configure(state="disabled")
             self.batch_cancel_button.configure(state="normal")
@@ -11779,12 +11902,22 @@ if ($copied) {{
             if error_list_path
             else ""
         )
+        warning_list_path = str(summary.get("warning_list_path") or "")
+        media_warnings = list(summary.get("media_warnings") or [])
+        if warning_list_path:
+            warning_articles = len({article_number for article_number, _warning in media_warnings})
+            error_list_hint += (
+                f"\n\nHinweis: Bei {warning_articles} Artikeln wurden tote Medien-Links übersprungen (Server liefert die Datei nicht mehr)."
+                f"\nDetails: {warning_list_path}"
+            )
         if cancelled:
             self.batch_progress_var.set(f"Abgebrochen: {processed}/{total} Artikel verarbeitet, {success_count} erfolgreich")
             self.status_var.set(f"{run_label} abgebrochen: {success_count} von {processed} verarbeiteten Artikeln erfolgreich")
-            messagebox.showinfo(
-                APP_TITLE,
+            self._show_batch_completion_dialog(
+                "cancel",
                 f"{run_label} abgebrochen.\n\nVerarbeitet: {processed} von {total}\nErfolgreich geschrieben: {success_count}{error_list_hint}",
+                error_list_path,
+                warning_list_path,
             )
         elif error_messages:
             preview = "\n".join(error_messages[:8])
@@ -11795,16 +11928,20 @@ if ($copied) {{
                 + (f" – Fehlerliste: {BATCH_ERROR_LIST_FILENAME}" if error_list_path else "")
             )
             self.status_var.set(f"{run_label} abgeschlossen mit Fehlern: {success_count}/{total} erfolgreich")
-            messagebox.showwarning(
-                APP_TITLE,
+            self._show_batch_completion_dialog(
+                "warn",
                 f"{run_label} abgeschlossen und direkt in den Output-Pfad geschrieben: {success_count} von {total} Produkten erfolgreich.\n\nFehler:\n{preview}{error_list_hint}",
+                error_list_path,
+                warning_list_path,
             )
         else:
             self.batch_progress_var.set(f"Fertig: {success_count}/{total} Artikel erfolgreich verarbeitet")
             self.status_var.set(f"{run_label} abgeschlossen: {success_count}/{total} Produkte erfolgreich")
-            messagebox.showinfo(
-                APP_TITLE,
-                f"{run_label} erfolgreich abgeschlossen:\n{success_count} Produkte verarbeitet und direkt in den Output-Pfad geschrieben.",
+            self._show_batch_completion_dialog(
+                "info",
+                f"{run_label} erfolgreich abgeschlossen:\n{success_count} Produkte verarbeitet und direkt in den Output-Pfad geschrieben.{error_list_hint}",
+                error_list_path,
+                warning_list_path,
             )
 
     def _build_deepl_client(self) -> DeepLClient:
