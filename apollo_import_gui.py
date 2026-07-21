@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover - optional preview dependency
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.17"
+APP_VERSION = "0.1.18"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -232,6 +232,10 @@ OE_FILE = ("OE-Nummern.xlsx", "Sheet1")
 COMPARISON_FILE = ("Vergleichsnummern.xlsx", "Sheet1")
 ATTRIBUTE_FILE = ("Attribute.xlsx", "Sheet1")
 VEHICLE_LINK_FILE = ("Fahrzeugverknuepfungen.xlsx", "Sheet1")
+# Nach jedem Batch-Lauf mit Fehlern: Liste der fehlgeschlagenen Artikel im
+# Output-Ordner. Spalte A = Artikelnummer, damit die Datei direkt wieder als
+# Produktliste geladen werden kann.
+BATCH_ERROR_LIST_FILENAME = "Massenimport-Fehler.xlsx"
 
 IMAGE_HEADERS = ["Artikelnummer", "BILDPFAD", "Art", "Sprache", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
 DOCUMENT_HEADERS = ["Artikelnummer", "Pfad zum Dokument", "Sprache", "Art", ATTACHMENT_FORMAT_TYPE_HEADER, LAST_WRITTEN_HEADER]
@@ -11573,12 +11577,14 @@ if ($copied) {{
             summary: dict[str, object] = {
                 "success_count": 0,
                 "error_messages": [],
+                "failed_items": [],
                 "last_result": None,
                 "last_bundle": None,
                 "total": total,
                 "processed": 0,
                 "cancelled": False,
                 "updated_articles": [],
+                "error_list_path": "",
             }
             started_at = time.monotonic()
 
@@ -11591,23 +11597,53 @@ if ($copied) {{
                         break
                     identifier = item.product_url or item.article_number
                     post(index - 1, f"{identifier}: Kunzer-Abruf ...")
-                    try:
-                        result = self.kunzer_scraper.scrape_product(identifier)
-                        post(index - 1, f"{identifier}: Übersetzung, Medien-Download & Export ...")
-                        bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
-                        export_bundle(bundle, output_root, use_timestamp_subdir=False, refresh_media=refresh_media)
-                        summary["success_count"] = int(summary["success_count"]) + 1
-                        summary["last_result"] = result
-                        summary["last_bundle"] = bundle
-                        summary["updated_articles"].append(bundle.article_number)
-                        progress_queue.put(("article", bundle))
-                    except Exception as exc:  # pragma: no cover - user facing batch feedback
-                        summary["error_messages"].append(f"{identifier}: {exc}")
+                    last_error: Exception | None = None
+                    # Ein automatischer zweiter Versuch fängt kurze Netzwerk-/
+                    # Timeout-Aussetzer ab, die bei stundenlangen Läufen normal sind.
+                    for attempt in (1, 2):
+                        try:
+                            if attempt > 1:
+                                post(index - 1, f"{identifier}: 2. Versuch ...")
+                            result = self.kunzer_scraper.scrape_product(identifier)
+                            post(index - 1, f"{identifier}: Übersetzung, Medien-Download & Export ...")
+                            bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
+                            export_bundle(bundle, output_root, use_timestamp_subdir=False, refresh_media=refresh_media)
+                            summary["success_count"] = int(summary["success_count"]) + 1
+                            summary["last_result"] = result
+                            summary["last_bundle"] = bundle
+                            summary["updated_articles"].append(bundle.article_number)
+                            progress_queue.put(("article", bundle))
+                            last_error = None
+                            break
+                        except Exception as exc:  # pragma: no cover - user facing batch feedback
+                            last_error = exc
+                            if cancel_event.is_set():
+                                break
+                    if last_error is not None:
+                        summary["error_messages"].append(f"{identifier}: {last_error}")
+                        summary["failed_items"].append((item.article_number or identifier, str(last_error)))
                     summary["processed"] = index
                     post(index, "")
             except Exception as exc:  # pragma: no cover - defensive: Fehler pro Artikel werden oben gefangen
                 summary["error_messages"].append(f"Massenimport unerwartet beendet: {exc}")
             summary["cancelled"] = cancel_event.is_set()
+
+            error_list_path = output_root / BATCH_ERROR_LIST_FILENAME
+            try:
+                if summary["failed_items"]:
+                    write_workbook(
+                        error_list_path,
+                        "Fehler",
+                        ["Artikelnummer", "Fehler"],
+                        [[article_number, error_text] for article_number, error_text in summary["failed_items"]],
+                    )
+                    summary["error_list_path"] = str(error_list_path)
+                elif not summary["cancelled"]:
+                    # Sauberer Lauf: veraltete Fehlerliste vom letzten Mal entfernen.
+                    error_list_path.unlink(missing_ok=True)
+            except Exception:  # pragma: no cover - Fehlerliste darf den Lauf nie kippen
+                summary["error_list_path"] = ""
+
             progress_queue.put(("finish", summary))
 
         def poll_queue() -> None:
@@ -11736,22 +11772,32 @@ if ($copied) {{
         # sofort Text-IDs generieren, auch wenn Texte nicht im Abrufumfang waren.
         self._refresh_article_browser()
         run_label = self.batch_run_label
+        error_list_path = str(summary.get("error_list_path") or "")
+        error_list_hint = (
+            f"\n\nFehlerliste gespeichert:\n{error_list_path}\n\n"
+            "Diese Datei kann direkt als Produktliste geladen werden, um nur die fehlgeschlagenen Artikel erneut zu verarbeiten."
+            if error_list_path
+            else ""
+        )
         if cancelled:
             self.batch_progress_var.set(f"Abgebrochen: {processed}/{total} Artikel verarbeitet, {success_count} erfolgreich")
             self.status_var.set(f"{run_label} abgebrochen: {success_count} von {processed} verarbeiteten Artikeln erfolgreich")
             messagebox.showinfo(
                 APP_TITLE,
-                f"{run_label} abgebrochen.\n\nVerarbeitet: {processed} von {total}\nErfolgreich geschrieben: {success_count}",
+                f"{run_label} abgebrochen.\n\nVerarbeitet: {processed} von {total}\nErfolgreich geschrieben: {success_count}{error_list_hint}",
             )
         elif error_messages:
             preview = "\n".join(error_messages[:8])
             if len(error_messages) > 8:
                 preview += f"\n... und {len(error_messages) - 8} weitere"
-            self.batch_progress_var.set(f"Fertig mit Fehlern: {success_count}/{total} Artikel erfolgreich")
+            self.batch_progress_var.set(
+                f"Fertig mit Fehlern: {success_count}/{total} Artikel erfolgreich"
+                + (f" – Fehlerliste: {BATCH_ERROR_LIST_FILENAME}" if error_list_path else "")
+            )
             self.status_var.set(f"{run_label} abgeschlossen mit Fehlern: {success_count}/{total} erfolgreich")
             messagebox.showwarning(
                 APP_TITLE,
-                f"{run_label} abgeschlossen und direkt in den Output-Pfad geschrieben: {success_count} von {total} Produkten erfolgreich.\n\nFehler:\n{preview}",
+                f"{run_label} abgeschlossen und direkt in den Output-Pfad geschrieben: {success_count} von {total} Produkten erfolgreich.\n\nFehler:\n{preview}{error_list_hint}",
             )
         else:
             self.batch_progress_var.set(f"Fertig: {success_count}/{total} Artikel erfolgreich verarbeitet")
