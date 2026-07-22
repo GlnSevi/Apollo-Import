@@ -4,3 +4,4 @@ output/
 apollo_import_gui_state.json
 build/
 dist/
+.claude/settings.local.json
