@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - optionale KI-Funktion
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.20"
+APP_VERSION = "0.1.21"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -12393,6 +12393,12 @@ if ($copied) {{
                     part for part in [result.short_text_de, result.long_text_de] if str(part or "").strip()
                 )
                 pdf_sources = collect_pdf_sources_from_media_rows(bundle.document_rows)
+                if not pdf_sources:
+                    # Ohne 'Dokumente' im Abrufumfang gibt es keine lokalen Dateien -
+                    # dann die gescrapten PDF-Links direkt für die Textextraktion laden.
+                    pdf_sources = collect_pdf_sources_from_media_rows(
+                        [MediaRow(link) for link in result.document_links]
+                    )
                 pdf_texts = [text for text in (extract_pdf_text(source) for source in pdf_sources) if text]
                 existing_ids = set(attribute_ids_by_article.get(bundle.article_number, set()))
                 hybrid = run_hybrid_attribute_extraction(
