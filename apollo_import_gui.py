@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - optionale KI-Funktion
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.22"
+APP_VERSION = "0.1.23"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -12084,7 +12084,8 @@ if ($copied) {{
         if not article_number:
             return
         self.article_number_var.set(article_number)
-        self._ensure_ids_for_article(article_number)
+        if self._has_german_text():
+            self._ensure_ids_for_article(article_number)
         self._write_live_database()
 
     def _resolve_ids_for_article(self, article_number: str) -> tuple[str, str]:
@@ -12221,7 +12222,16 @@ if ($copied) {{
                 self.article_number_var.set(result.article_number)
             else:
                 self.article_number_var.set(normalize_article_number(result.article_number))
-            self._ensure_ids_for_article(self.article_number_var.get())
+            if scrape_options["short_text"] or scrape_options["long_text"]:
+                self._ensure_ids_for_article(self.article_number_var.get())
+            else:
+                # Ohne Text-Abruf keine neuen Text-IDs erzeugen - nur bereits
+                # bekannte IDs des Artikels anzeigen.
+                article_key = normalize_article_number(self.article_number_var.get())
+                short_id, long_id = self.id_registry.get_ids_for_article(article_key)
+                self.current_id_article_number = article_key
+                self.short_module_id_var.set(short_id)
+                self.long_module_id_var.set(long_id)
             self.kunzer_product_url_var.set(result.product_url)
 
             short_text_de = result.short_text_de if scrape_options["short_text"] else ""
@@ -12270,7 +12280,21 @@ if ($copied) {{
 
         self.refresh_preview()
         if write_live:
-            self._write_live_database(status_message=f"Live gespeichert: {normalize_article_number(result.article_number)}")
+            if scrape_options["short_text"] or scrape_options["long_text"]:
+                self._write_live_database(status_message=f"Live gespeichert: {normalize_article_number(result.article_number)}")
+            else:
+                # Ohne Text-Abruf keine Text-Dateien anfassen (keine leeren
+                # Textzeilen, keine neuen Text-IDs) - nur die abgerufenen
+                # Datenarten schreiben.
+                for section, enabled in (
+                    ("images", scrape_options["images"]),
+                    ("documents", scrape_options["documents"]),
+                    ("videos", scrape_options["videos"]),
+                    ("web_links", scrape_options["web_links"]),
+                ):
+                    if enabled:
+                        self._write_live_section(section)
+                self.status_var.set(f"Live gespeichert: {normalize_article_number(result.article_number)}")
         # Nach dem Laden automatisch die Attribut-Findung starten (Regeln + KI).
         self.root.after(200, lambda: self._start_attribute_autofill(auto=True))
 
@@ -13038,7 +13062,7 @@ if ($copied) {{
             return
 
         current_article = normalize_article_number(self.article_number_var.get())
-        if current_article:
+        if current_article and self._has_german_text():
             self.current_id_article_number = ""
             self._ensure_ids_for_article(current_article)
 
@@ -13244,12 +13268,26 @@ if ($copied) {{
         self._refresh_article_browser()
         self.status_var.set(f"{len(article_numbers)} Artikel aus den Output-Dateien gelöscht.")
 
-    def collect_bundle(self) -> ExportBundle:
+    def _has_german_text(self) -> bool:
+        if not hasattr(self, "short_text_frame") or not hasattr(self, "long_text_frame"):
+            return False
+        return bool(self.short_text_frame.get_german_text().strip() or self.long_text_frame.get_german_text().strip())
+
+    def collect_bundle(self, ensure_ids: bool | None = None) -> ExportBundle:
         article_number = normalize_article_number(self.article_number_var.get())
         if not article_number:
             raise ValueError("Bitte eine Artikelnummer eingeben.")
 
-        short_module_id, long_module_id = self._ensure_ids_for_article(article_number)
+        # Text-IDs nur erzeugen, wenn es auch deutsche Texte gibt - sonst
+        # bekaemen Artikel bei reiner Attribut-/Medienpflege neue Text-IDs.
+        if ensure_ids is None:
+            ensure_ids = self._has_german_text()
+        if ensure_ids:
+            short_module_id, long_module_id = self._ensure_ids_for_article(article_number)
+        else:
+            registry_short, registry_long = self.id_registry.get_ids_for_article(article_number)
+            short_module_id = self.short_module_id_var.get().strip() or registry_short
+            long_module_id = self.long_module_id_var.get().strip() or registry_long
 
         return ExportBundle(
             article_number=article_number,
@@ -13274,7 +13312,7 @@ if ($copied) {{
 
     def refresh_preview(self) -> None:
         current_article = normalize_article_number(self.article_number_var.get())
-        if current_article:
+        if current_article and self._has_german_text():
             self._ensure_ids_for_article(current_article)
         self._refresh_article_browser()
 
