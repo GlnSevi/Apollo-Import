@@ -26,9 +26,10 @@ Alternativ unter Windows:
   - Umlaute in Kurzbezeichnungen werden automatisch ersetzt, z. B. `ä -> ae`, `ö -> oe`, `ü -> ue`, `ß -> ss`
 - Langtexte pro Sprache pflegen
 - Attribute pro Artikel mit `TecDoc Kriterien ID`, Format-Hinweis und Wert pflegen
-- Attribute aus gescrapten Produkttexten vorschlagen lassen
+- Attribute automatisch finden und fuellen (hybrid: Regeln + Claude-KI)
   - erkennt `Label: Wert`-Zeilen und technische Daten (inkl. Bereichen und `LxBxH`-Abmessungen)
-  - Uebernahme immer ueber einen Bestaetigungsdialog, nie automatisch
+  - optional liest eine Claude-KI zusaetzlich Fliesstext und PDF-Dokumente aus
+  - sichere, gegen die Stammdaten validierte Treffer werden automatisch uebernommen; unsichere landen im Bestaetigungsdialog
 - Suchwoerter pro Artikel pflegen
   - werden beim Export als Attribut `Zusatzbezeichnung` (TecDoc Kriterien ID `9595`) in die `Attribute.xlsx` geschrieben, eine Zeile pro Suchwort
 - OE-Nummern als freie Referenzen pro Artikel pflegen
@@ -111,8 +112,15 @@ Im Bereich `Listenimport` kann ausgewaehlt werden, welche Daten geholt werden so
 - `Dokumente`
 - `Videos`
 - `Web Links`
+- `Attribute` (automatische Attribut-Findung, siehe Abschnitt "Attribute automatisch finden")
 
 Wenn `Kurzbezeichnung` oder `Text` aktiviert sind, wird die Uebersetzung im Listenimport automatisch ueber DeepL ausgefuehrt. Dafuer muss ein gueltiger API Key eingetragen sein.
+
+Ist `Attribute` aktiviert, laeuft pro Artikel die automatische Attribut-Findung:
+
+- sichere, validierte Treffer werden direkt in die `Attribute.xlsx` geschrieben - dabei werden nur Kriterien-IDs ergaenzt, die der Artikel noch nicht hat; bestehende (auch manuell gepflegte) Zeilen bleiben unveraendert
+- unsichere Treffer und nicht zugeordnete Angaben landen in der Datei `Attribute_Pruefliste.xlsx` im Output-Ordner
+- faellt die KI aus (z. B. fehlender oder ungueltiger API Key), laeuft der Batch regelbasiert weiter; der Hinweis erscheint in der Warnungsliste
 
 Unterstuetzte Spalten sind flexibel. Mindestens eine der beiden Gruppen muss vorhanden sein:
 
@@ -154,18 +162,26 @@ Der Export erzeugt `Fahrzeugverknuepfungen.xlsx` mit den Spalten:
 
 Pro Fahrzeug werden zwei Zeilen geschrieben: eine mit der TopMotive-Nummer und eine mit der TecDoc-Nummer. So kann im Apollo-Import genau die eine passende Spalte auf `TecDoc Verknuepfungs ID` gemappt werden. Ueber die Spalte `KTyp-System` lassen sich die Zeilen bei Bedarf vorher filtern. Jede Zeile traegt zusaetzlich die GenArt des Artikels; sind einem Artikel mehrere GenArts zugeordnet, wird je GenArt und KTyp-Nummer eine eigene Zeile geschrieben. Bestehende `Fahrzeugverknuepfungen.xlsx` ohne GenArt-Spalten werden beim naechsten Schreiben automatisch auf das neue Format migriert (GenArt-Spalten bleiben bei alten Zeilen leer, bis der Artikel neu exportiert wird).
 
-## Attribute aus Text vorschlagen
+## Attribute automatisch finden
 
-Die GUI kann technische Angaben aus den deutschen Produkttexten lesen und passende Attribute vorschlagen. Erkannt werden `Label: Wert`- und Tab-getrennte Zeilen aus Technische-Daten-Bloecken, z. B.:
+Die Attribut-Findung arbeitet hybrid in zwei Stufen und wird ueber den Button `Attribute automatisch ausfuellen` im Attribute-Tab oder automatisch nach dem Kunzer-Laden gestartet.
+
+**Stufe 1 - Regeln (immer aktiv, kostenlos):** Erkannt werden `Label: Wert`- und Tab-getrennte Zeilen aus Technische-Daten-Bloecken, z. B.:
 
 - `Gewicht: 612 g` -> `Gewicht [kg]` = `0,612` (Einheiten werden automatisch umgerechnet)
 - `Hubhoehe: 150 - 530 mm` -> Bereich als `Wert` + `Wert bis`
 - `Abmessungen (LxBxH): 155 x 17 x 13,5 mm` -> aufgeteilt in `Laenge`, `Breite`, `Hoehe`
-- Schluesselwert-Attribute werden nur vorgeschlagen, wenn der Wert exakt in der Werteliste steht
+- Schluesselwert-Attribute werden nur uebernommen, wenn der Wert exakt in der Werteliste steht
 
 Grundlage ist die pflegbare Zuordnungsdatei `Attribut_Zuordnung.xlsx` (Standard `G:\Apollo\Attribut_Zuordnung.xlsx`, Spalten `Text-Label` und `TecDoc Kriterien ID`), die im Projekt-Tab unter `Datenstaemme` konfiguriert wird.
 
-Vorschlaege erscheinen in einem Bestaetigungsdialog (per Button `Attribute aus Text vorschlagen` im Attribute-Tab oder automatisch nach dem Kunzer-Laden). Nichts wird ohne Bestaetigung uebernommen. Nicht erkannte Angaben koennen im Dialog manuell einem Attribut zugewiesen werden; mit `Zuordnung merken` wird das Text-Label dauerhaft in die Zuordnungsdatei uebernommen, so dass es beim naechsten Mal automatisch erkannt wird.
+**Stufe 2 - Claude-KI (optional, braucht Anthropic API Key):** Alles, was die Regeln nicht zuordnen konnten (Fliesstext, Synonyme, unbekannte Labels), geht zusammen mit dem Text der verlinkten PDF-Dokumente an die Claude API. Die KI bekommt dabei nur eine lokal vorgefilterte Kandidatenliste (max. 300 plausible Attribute statt aller ~5.000) - das haelt die Kosten klein. Der API Key und das Modell werden im Projekt-Tab unter `APIs` eingestellt (auch per Umgebungsvariable `ANTHROPIC_API_KEY`); Standardmodell ist `claude-opus-4-8`, guenstigere Modelle sind waehlbar.
+
+**Gestufte Uebernahme:** Jeder Treffer - egal ob aus Regeln oder KI - wird lokal streng gegen die Attribut-Stammdaten validiert (Zahlformat, Einheiten-Umrechnung, Schluesselwert exakt in Werteliste, maximale Laenge). Nur validierte Treffer werden automatisch uebernommen, und nur fuer Kriterien-IDs, die der Artikel noch nicht hat (bestehende Zeilen werden nie ueberschrieben). Unsichere Treffer erscheinen wie bisher im Bestaetigungsdialog; dort koennen nicht erkannte Angaben manuell zugewiesen und mit `Zuordnung merken` dauerhaft gelernt werden.
+
+**Lernschleife:** Ordnet die KI ein neues Text-Label erfolgreich zu (z. B. `Farbton` -> `Farbe`), wird die Zuordnung mit Hinweis `KI` in die `Attribut_Zuordnung.xlsx` geschrieben. Beim naechsten Artikel greift dann schon die Regel-Stufe - ohne API-Aufruf. KI-Eintraege sind in der Datei ueber die Hinweis-Spalte auffindbar und koennen dort jederzeit korrigiert oder geloescht werden.
+
+Die KI erhaelt den Produkttext als reinen Inhalt und darf nur Attribute aus der mitgeschickten Kandidatenliste waehlen; alles andere wird verworfen. Ohne API Key (oder bei API-Fehlern) laeuft die Findung vollstaendig regelbasiert weiter.
 
 ## Suchwoerter
 
