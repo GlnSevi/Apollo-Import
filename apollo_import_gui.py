@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - optionale KI-Funktion
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.25"
+APP_VERSION = "0.1.26"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -1059,7 +1059,7 @@ _UNIT_ALIASES = {
     "st": "st", "st.": "st", "stk": "st", "stk.": "st", "tlg": "tlg", "tlg.": "tlg", "teile": "st",
     "%": "%", "grad": "grad", "°": "grad",
     "db": "db(a)", "db(a)": "db(a)", "dba": "db(a)", "dezibel": "db(a)",
-    "m2": "m2", "m²": "m2", "qm": "m2", "cm2": "cm2", "cm²": "cm2",
+    "m2": "m2", "m²": "m2", "qm": "m2", "cm2": "cm2", "cm²": "cm2", "mm2": "mm2", "mm²": "mm2",
     "m3": "m3", "m³": "m3", "cbm": "m3",
     "m3/h": "m3/h", "m³/h": "m3/h", "cbm/h": "m3/h", "m3/std": "m3/h", "m³/std": "m3/h", "cbm/std": "m3/h",
     "m3/min": "m3/min", "m³/min": "m3/min", "cbm/min": "m3/min",
@@ -1085,6 +1085,8 @@ _UNIT_CONVERSIONS = {
     ("l/h", "m3/h"): 0.001, ("m3/h", "l/h"): 1000.0,
     ("l/min", "l/h"): 60.0, ("l/h", "l/min"): 1 / 60.0,
     ("cm2", "m2"): 0.0001, ("m2", "cm2"): 10000.0,
+    ("mm2", "cm2"): 0.01, ("cm2", "mm2"): 100.0,
+    ("mm2", "m2"): 0.000001, ("m2", "mm2"): 1000000.0,
 }
 
 
@@ -1159,6 +1161,8 @@ def extract_spec_lines_from_text(text: str) -> list[ExtractedSpecLine]:
             continue
         if "." in label and len(label.split()) > 4:
             continue  # Fliesstext, kein Label
+        if normalize_mapping_label(label) in _SPEC_LABEL_STOPWORDS:
+            continue  # Warnhinweise aus Anleitungen ('WICHTIG: ...'), keine Spezifikation
         specs.append(ExtractedSpecLine(label=label, raw_value=value, source_line=line))
     return specs
 
@@ -1205,6 +1209,14 @@ def parse_numeric_value(raw_value: str) -> tuple[float, float | None, str] | Non
             return number, None, normalize_unit_text(single_match.group(2) or "")
     return None
 
+
+# Zeilen aus Bedienungsanleitungen, die wie 'Label: Wert' aussehen, aber
+# Warnhinweise sind - sie gehören weder in Vorschläge noch in die Prüfliste.
+_SPEC_LABEL_STOPWORDS = {
+    "wichtig", "sehr wichtig", "warnung", "vorsicht", "achtung", "hinweis",
+    "hinweise", "gefahr", "tipp", "tipps", "beachten", "bitte beachten",
+    "important", "warning", "caution", "note", "danger", "attention",
+}
 
 _DIMENSION_ORDER_LABELS = {"l": "laenge", "b": "breite", "h": "hoehe", "t": "tiefe"}
 
@@ -1537,11 +1549,13 @@ def run_hybrid_attribute_extraction(
 
         # Wert-Kandidaten für die lokale Validierung: erst der strukturierte
         # KI-Wert (mit Einheit für die Umrechnung), dann der Originaltext.
+        # Einheit nicht doppelt anhängen, wenn sie schon im Wert steht.
+        unit_suffix = unit if unit and not value.casefold().endswith(unit.casefold()) else ""
         raw_candidates: list[str] = []
         if value and value_to:
-            raw_candidates.append(f"{value} - {value_to} {unit}".strip())
+            raw_candidates.append(f"{value} - {value_to} {unit_suffix}".strip())
         if value:
-            raw_candidates.append(f"{value} {unit}".strip() if unit else value)
+            raw_candidates.append(f"{value} {unit_suffix}".strip() if unit_suffix else value)
         if raw_value:
             raw_candidates.append(raw_value)
 
@@ -3481,6 +3495,7 @@ Du bekommst drei Blöcke:
 Regeln:
 - Ordne ausschließlich Attribute aus der Kandidatenliste zu. Passt kein Kandidat, setze criteria_id auf null.
 - Wähle Attribute streng nach fachlicher Bedeutung, nicht nach Wortähnlichkeit. Ein Attribut aus einem anderen Produktbereich (z. B. das Reifen-Attribut 'externes Rollgeräusch' für das Betriebsgeräusch eines Geräts) ist falsch - nutze dann das allgemeine Attribut (z. B. 'Lautstärke') oder Zusatzinfo.
+- Angaben über geeignete Fahrzeuge oder Motoren (z. B. 'für Benzinmotoren bis 500 PS', 'für Fahrzeuge bis 3,5 t') beschreiben den Einsatzbereich, nicht das Produkt selbst - nicht als Leistungs-/Gewichts-/Hubraumattribut extrahieren, höchstens als Zusatzinfo.
 - value: nur der Zahlen- oder Textwert OHNE Einheit. Dezimaltrennzeichen ist das Komma.
 - Bereiche (z. B. '150 - 530 mm'): value = unterer Wert, value_to = oberer Wert. Sonst value_to leer.
 - unit: die im Text gefundene Einheit (z. B. 'mm', 'kg'), sonst leer.
