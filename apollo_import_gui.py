@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - optionale KI-Funktion
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.26"
+APP_VERSION = "0.1.27"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -1641,6 +1641,36 @@ def collect_pdf_sources_from_media_rows(rows: list["MediaRow"], limit: int = 3) 
     return sources
 
 
+def attribute_row_format_error(row: AttributeRow) -> str:
+    """Prüft eine Attributzeile auf Formatkonformität. Leerer String = ok.
+
+    Numerisch: Wert und Wert bis müssen reine Zahlen sein (deutsches
+    Dezimalkomma erlaubt), bei Bereichen muss 'Wert' <= 'Wert bis' sein.
+    Maximallängen gelten für alle Formate.
+    """
+    value_format = row.value_format.strip().casefold()
+    if value_format == "numerisch":
+        for field_label, field_value in (("Wert", row.value), ("Wert bis", row.value_to)):
+            if field_value.strip() and parse_german_number(field_value) is None:
+                return (
+                    f"{row.display_label()}: {field_label} '{field_value}' ist keine Zahl "
+                    "(Format Numerisch, ohne Einheit eingeben)."
+                )
+        if row.value.strip() and row.value_to.strip():
+            value_from = parse_german_number(row.value)
+            value_to = parse_german_number(row.value_to)
+            if value_from is not None and value_to is not None and value_from > value_to:
+                return (
+                    f"{row.display_label()}: 'Wert' ({row.value}) ist größer als "
+                    f"'Wert bis' ({row.value_to}) - bitte von/bis tauschen."
+                )
+    if row.max_length is not None:
+        for field_label, field_value in (("Wert", row.value), ("Wert bis", row.value_to)):
+            if field_value and len(field_value) > row.max_length:
+                return f"{row.display_label()}: {field_label} ist länger als erlaubt ({row.max_length} Zeichen)."
+    return ""
+
+
 def normalize_attribute_rows(rows: list[AttributeRow]) -> list[AttributeRow]:
     normalized: list[AttributeRow] = []
     seen_values: set[tuple[str, str, str]] = set()
@@ -1655,6 +1685,15 @@ def normalize_attribute_rows(rows: list[AttributeRow]) -> list[AttributeRow]:
         if value_format.casefold() == "kein wert":
             value = ""
             value_to = ""
+        if value_format.casefold() == "numerisch":
+            # Reine Zahlen einheitlich deutsch formatieren ('1.5' -> '1,5').
+            for field_value, setter in ((value, "value"), (value_to, "value_to")):
+                parsed_number = parse_german_number(field_value) if field_value else None
+                if parsed_number is not None:
+                    if setter == "value":
+                        value = format_german_number(parsed_number)
+                    else:
+                        value_to = format_german_number(parsed_number)
         dedupe_key = (criteria_id.casefold(), value.casefold(), value_to.casefold())
         if dedupe_key in seen_values:
             continue
@@ -4341,6 +4380,11 @@ def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
     export_rows: list[list[str]] = []
     seen_search_values: set[str] = set()
     for row in normalize_attribute_rows(bundle.attribute_rows):
+        # Letzte Absicherung vor dem Schreiben: fehlerhafte Formate (z. B.
+        # Text in numerischen Attributen) duerfen nie in die Importdateien.
+        format_error = attribute_row_format_error(row)
+        if format_error:
+            raise ValueError(f"Attribut-Export abgebrochen ({bundle.article_number}): {format_error}")
         export_value = row.value
         if is_attribute_key_value_format(row.value_format):
             export_value = resolve_attribute_export_value(row, bundle.attribute_key_values_by_group)
@@ -8103,27 +8147,57 @@ class AttributeTableFrame(ttk.LabelFrame):
 
     def _build_current_row(self) -> AttributeRow:
         value_format = self.format_var.get().strip()
+        value = self._normalize_current_value(value_format, self.value_var.get())
+        value_to = self._normalize_current_value(value_format, self.value_to_var.get())
+        if value_format.strip().casefold() == "numerisch":
+            value, value_to = self._normalize_numeric_input(value, value_to)
         return AttributeRow(
             criteria_id=self.criteria_id_var.get().strip(),
             label=self.label_var.get().strip(),
             value_format=value_format,
             max_length=self._current_max_length(),
             type_name=self.type_name_var.get().strip(),
-            value=self._normalize_current_value(value_format, self.value_var.get()),
-            value_to=self._normalize_current_value(value_format, self.value_to_var.get()),
+            value=value,
+            value_to=value_to,
         )
+
+    def _normalize_numeric_input(self, value: str, value_to: str) -> tuple[str, str]:
+        """Komfort für numerische Eingaben: Zahlen deutsch formatieren,
+        Einheiten in die Zieleinheit umrechnen ('612 g' -> '0,612' bei [kg])
+        und Bereiche im Wert-Feld ('150 - 530 mm') auf Wert/Wert bis aufteilen.
+        Nicht parsebare Eingaben bleiben unverändert und werden von der
+        Format-Prüfung abgefangen."""
+        option = AttributeOption(
+            criteria_id=self.criteria_id_var.get().strip() or "-",
+            label=self.label_var.get().strip(),
+            value_format="Numerisch",
+        )
+        if value and not value_to:
+            attempt = validate_suggestion_value(option, value, value, {})
+            if attempt is not None and attempt.confident:
+                return attempt.value, attempt.value_to
+        result: list[str] = []
+        for field_value in (value, value_to):
+            if not field_value:
+                result.append(field_value)
+                continue
+            attempt = validate_suggestion_value(option, field_value, field_value, {})
+            if attempt is not None and attempt.confident and not attempt.value_to:
+                result.append(attempt.value)
+            else:
+                result.append(field_value)
+        return result[0], result[1]
 
     def _validate_row(self, row: AttributeRow) -> None:
         if not row.criteria_id:
             raise ValueError("Bitte mindestens eine TecDoc Kriterien ID angeben.")
-        if row.max_length is not None:
-            for value_label, value in [("Wert", row.value), ("Wert bis", row.value_to)]:
-                if value and len(value) > row.max_length:
-                    raise ValueError(f"{value_label} für {row.display_label()} ist länger als erlaubt ({row.max_length}).")
         if row.value_format.strip().casefold() != "kein wert" and not any(
             value.strip() for value in [row.value, row.value_to]
         ):
             raise ValueError("Bitte für dieses Attribut einen Wert oder Wert bis eingeben.")
+        format_error = attribute_row_format_error(row)
+        if format_error:
+            raise ValueError(format_error)
 
     def add_row(self) -> None:
         self._apply_current_attribute_selection()
@@ -8448,10 +8522,12 @@ class AttributeSuggestionDialog(tk.Toplevel):
         unmatched: list[ExtractedSpecLine],
         attribute_options: list[AttributeOption],
         on_apply: Callable[[list[AttributeRow], list[tuple[str, str]]], None],
+        attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] | None = None,
     ) -> None:
         super().__init__(master)
         self.title("Attribute aus Text vorschlagen")
         self.on_apply = on_apply
+        self.attribute_key_values_by_group = dict(attribute_key_values_by_group or {})
         self.attribute_options = list(attribute_options)
         self.options_by_display = {option.display_label(): option for option in self.attribute_options}
         self.options_by_id = {option.criteria_id: option for option in self.attribute_options}
@@ -8627,15 +8703,25 @@ class AttributeSuggestionDialog(tk.Toplevel):
         index = selection[0]
         spec = self.unmatched[index]
         raw_value = self.assign_value_var.get().strip()
-        value, value_to = raw_value, ""
-        range_match = re.match(r"^(.+?)\s*-\s*(.+)$", raw_value)
-        if range_match and option.value_format.strip().casefold() == "numerisch":
-            value, value_to = range_match.group(1).strip(), range_match.group(2).strip()
-        suggestion = AttributeSuggestion(
-            option=option, value=value, value_to=value_to,
-            source_line=spec.source_line, confident=True, note="manuell zugeordnet",
+        # Über die zentrale Validierung: parst Zahlen und Bereiche, rechnet
+        # Einheiten um, löst Schlüsselwerte auf und prüft Maximallängen.
+        suggestion = validate_suggestion_value(
+            option, raw_value, spec.source_line, self.attribute_key_values_by_group
         )
-        self._insert_suggestion(suggestion, checked=True)
+        if suggestion is None:
+            suggestion = AttributeSuggestion(
+                option=option, value=raw_value, source_line=spec.source_line,
+                confident=True, note="manuell zugeordnet",
+            )
+        else:
+            suggestion.note = f"manuell zugeordnet{', ' + suggestion.note if suggestion.note else ''}"
+        if not suggestion.confident:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Hinweis zur Zuordnung: {suggestion.note}\nDie Zeile wird unangehakt eingefügt - bitte Wert prüfen.",
+                parent=self,
+            )
+        self._insert_suggestion(suggestion, checked=suggestion.confident)
         if self.remember_var.get() and spec.label.strip():
             self.learned_entries.append((spec.label.strip(), option.criteria_id))
         self.unmatched_list.delete(index)
@@ -8646,6 +8732,7 @@ class AttributeSuggestionDialog(tk.Toplevel):
 
     def _apply(self) -> None:
         rows: list[AttributeRow] = []
+        format_errors: list[str] = []
         for item_id in self.tree.get_children():
             if item_id not in self.checked_items:
                 continue
@@ -8654,17 +8741,30 @@ class AttributeSuggestionDialog(tk.Toplevel):
                 continue
             values = self.tree.item(item_id, "values")
             option = suggestion.option
-            rows.append(
-                AttributeRow(
-                    criteria_id=option.criteria_id,
-                    label=option.label,
-                    value_format=option.value_format,
-                    max_length=option.max_length,
-                    type_name=option.type_name,
-                    value=str(values[2]).strip(),
-                    value_to=str(values[3]).strip(),
-                )
+            row = AttributeRow(
+                criteria_id=option.criteria_id,
+                label=option.label,
+                value_format=option.value_format,
+                max_length=option.max_length,
+                type_name=option.type_name,
+                value=str(values[2]).strip(),
+                value_to=str(values[3]).strip(),
             )
+            format_error = attribute_row_format_error(row)
+            if format_error:
+                format_errors.append(format_error)
+                continue
+            rows.append(row)
+        if format_errors:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Diese angehakten Zeilen haben ein ungültiges Format und wurden nicht übernommen:\n\n"
+                + "\n".join(format_errors[:8])
+                + ("\n..." if len(format_errors) > 8 else "")
+                + "\n\nBitte Werte korrigieren und erneut übernehmen.",
+                parent=self,
+            )
+            return
         learned = list(self.learned_entries)
         self.destroy()
         self.on_apply(rows, learned)
@@ -11323,6 +11423,7 @@ if ($copied) {{
                 unmatched=result.unmatched,
                 attribute_options=self.attribute_options,
                 on_apply=self._apply_attribute_suggestions,
+                attribute_key_values_by_group=self.attribute_key_values_by_group,
             )
         elif not auto and added == 0:
             messagebox.showinfo(APP_TITLE, "Im Text wurden keine neuen Attribute erkannt.")
