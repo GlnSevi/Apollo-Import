@@ -121,6 +121,9 @@ Ist `Attribute` aktiviert, laeuft pro Artikel die automatische Attribut-Findung:
 - sichere, validierte Treffer werden direkt in die `Attribute.xlsx` geschrieben - dabei werden nur Kriterien-IDs ergaenzt, die der Artikel noch nicht hat; bestehende (auch manuell gepflegte) Zeilen bleiben unveraendert
 - unsichere Treffer und nicht zugeordnete Angaben landen in der Datei `Attribute_Pruefliste.xlsx` im Output-Ordner
 - faellt die KI aus (z. B. fehlender oder ungueltiger API Key), laeuft der Batch regelbasiert weiter; der Hinweis erscheint in der Warnungsliste
+- **Testlauf** (standardmaessig aktiv): mit der Checkbox `Testlauf: nur Bericht, nichts schreiben` wird NICHTS in die Attribute.xlsx geschrieben - stattdessen entsteht der vollstaendige `Attribut-Testbericht.xlsx` (je Angabe: Attribut, Wert, Status, Quelle Regel/KI). Ideal, um einen grossen Lauf erst zu pruefen. Der Bericht wird auch im scharfen Lauf als Protokoll geschrieben
+- ab 4 Artikeln laufen die KI-Aufrufe gesammelt ueber die Anthropic **Batch API** (50 % Rabatt bei gleicher Qualitaet)
+- der Abschlussdialog zeigt den KI-Verbrauch (Token und ungefaehre Kosten in $)
 
 Unterstuetzte Spalten sind flexibel. Mindestens eine der beiden Gruppen muss vorhanden sein:
 
@@ -181,7 +184,9 @@ Grundlage ist die pflegbare Zuordnungsdatei `Attribut_Zuordnung.xlsx` (Standard 
 
 **Gestufte Uebernahme:** Jeder Treffer - egal ob aus Regeln oder KI - wird lokal streng gegen die Attribut-Stammdaten validiert (Zahlformat, Einheiten-Umrechnung, Schluesselwert exakt in Werteliste, maximale Laenge). Nur validierte Treffer werden automatisch uebernommen, und nur fuer Kriterien-IDs, die der Artikel noch nicht hat (bestehende Zeilen werden nie ueberschrieben). Unsichere Treffer erscheinen wie bisher im Bestaetigungsdialog; dort koennen nicht erkannte Angaben manuell zugewiesen und mit `Zuordnung merken` dauerhaft gelernt werden.
 
-**Zusatzinfo als Auffangbecken:** Wichtige technische Angaben, die zu keinem Attribut passen, darf die KI als `Zusatzinfo` (TecDoc Kriterien ID `9202`, max. 20 Zeichen) liefern - als kurze Stichworte wie `IP54` oder `inkl. Koffer`. Pro Artikel sind mehrere Zusatzinfo-Zeilen erlaubt; doppelte Werte werden automatisch verworfen.
+**Zusatzinfo-Slots als Auffangbecken:** Wichtige technische Angaben, die zu keinem Attribut passen, liefert die KI als kurze Stichworte (max. 20 Zeichen, z. B. `IP54`, `inkl. Koffer`). Da Apollo pro Kriterien-ID nur eine Zeile akzeptiert, verteilt die App die wichtigsten Infos auf drei Slots: `9202 Zusatzinfo`, `9213 Zusatz LI/SI 2`, `9220 Information`. Weitere Infos landen im Pruefdialog bzw. in der Pruefliste.
+
+**Label-Mining (Selbst-Training):** Der Button `Labels per KI zuordnen` bei den Datenstaemmen analysiert alle Texte im Output-Ordner, sammelt unbekannte Text-Labels samt Beispielwerten und laesst die KI sie EINMALIG zuordnen. Uebernommen wird nur, was an echten Beispielwerten lokal validiert wurde (Hinweis `KI-Miner` in der Zuordnungsdatei); der Rest landet in der `Label-Zuordnung-Pruefliste.xlsx`. Danach loest die kostenlose Regel-Stufe diese Labels ohne KI-Aufruf - der Grossteil aller Spezifikationszeilen wird damit gratis.
 
 **Lernschleife:** Ordnet die KI ein neues Text-Label erfolgreich zu (z. B. `Farbton` -> `Farbe`), wird die Zuordnung mit Hinweis `KI` in die `Attribut_Zuordnung.xlsx` geschrieben. Beim naechsten Artikel greift dann schon die Regel-Stufe - ohne API-Aufruf. KI-Eintraege sind in der Datei ueber die Hinweis-Spalte auffindbar und koennen dort jederzeit korrigiert oder geloescht werden.
 
