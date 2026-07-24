@@ -291,7 +291,8 @@ LABEL_MINING_REVIEW_HEADERS = [
     "Grund",
 ]
 LABEL_MINING_MAX_LABELS = 250
-LABEL_MINING_CHUNK_SIZE = 50
+# Pro KI-Aufruf: klein genug, dass die JSON-Antwort sicher ins Antwortlimit passt.
+LABEL_MINING_CHUNK_SIZE = 40
 # Vollstaendiges Protokoll der Attribut-Findung im Batch (auch fuer Testlaeufe).
 ATTRIBUTE_REPORT_FILENAME = "Attribut-Testbericht.xlsx"
 ATTRIBUTE_REPORT_HEADERS = [
@@ -3947,7 +3948,11 @@ class ClaudeAttributeClient:
         self.total_cost_usd = 0.0
 
     def extract_attributes(
-        self, user_message: str, web_search: bool = False, system_prompt: str | None = None
+        self,
+        user_message: str,
+        web_search: bool = False,
+        system_prompt: str | None = None,
+        max_tokens: int = 4096,
     ) -> list[dict[str, object]]:
         if anthropic is None:
             raise ClaudeExtractionError(
@@ -3958,7 +3963,7 @@ class ClaudeAttributeClient:
         base_system = system_prompt or CLAUDE_ATTRIBUTE_SYSTEM_PROMPT
         create_kwargs: dict[str, object] = {
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "system": base_system,
         }
         if web_search:
@@ -11700,7 +11705,7 @@ if ($copied) {{
                 answered: set[str] = set()
                 try:
                     extractions = claude_client.extract_attributes(
-                        user_message, system_prompt=CLAUDE_LABEL_MINING_SYSTEM_PROMPT
+                        user_message, system_prompt=CLAUDE_LABEL_MINING_SYSTEM_PROMPT, max_tokens=8192
                     )
                 except ClaudeExtractionError as exc:
                     for label, count, examples in chunk:
