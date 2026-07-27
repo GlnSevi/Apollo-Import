@@ -1212,6 +1212,10 @@ def extract_spec_lines_from_text(text: str) -> list[ExtractedSpecLine]:
             continue
         if "." in label and len(label.split()) > 4:
             continue  # Fliesstext, kein Label
+        if re.fullmatch(r"(?:nr|pos|art)?[.\s)]*\d+[.\s)]*", label, flags=re.IGNORECASE) or re.fullmatch(
+            r"(?:nr|pos)[.\s]*", label, flags=re.IGNORECASE
+        ):
+            continue  # Aufzaehlungen aus PDF-Stuecklisten ('1.', '2)', 'Nr. 3') sind keine Labels
         if normalize_mapping_label(label) in _SPEC_LABEL_STOPWORDS:
             continue  # Warnhinweise aus Anleitungen ('WICHTIG: ...'), keine Spezifikation
         specs.append(ExtractedSpecLine(label=label, raw_value=value, source_line=line))
