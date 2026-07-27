@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - optionale KI-Funktion
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.30"
+APP_VERSION = "0.1.31"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -2993,7 +2993,10 @@ def extract_pdf_text(
                 total += len(page_text)
                 if total >= max_chars:
                     break
-            return "\n".join(parts)[:max_chars].strip()
+            # Steuerzeichen sofort entfernen: sie wandern sonst bis in die
+            # Berichts-Exceldateien und lassen openpyxl das Speichern verweigern
+            # (hat den Pilotbericht v0.1.29 gekostet).
+            return _EXCEL_ILLEGAL_CHARACTERS_RE.sub("", "\n".join(parts)[:max_chars]).strip()
         finally:
             document.close()
     except Exception:
@@ -4479,13 +4482,25 @@ class KunzerScraper:
         return "\n".join(compacted).strip()
 
 
+# Zeichen, die Excel in Zellen verbietet (Steuerzeichen ausser Tab/Zeilenumbruch).
+# openpyxl wirft sonst beim Speichern IllegalCharacterError - und eine
+# Ergebnisliste am Ende eines langen Laufs darf daran nie scheitern.
+_EXCEL_ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+
+def _sanitize_cell_value(value: object) -> object:
+    if isinstance(value, str) and _EXCEL_ILLEGAL_CHARACTERS_RE.search(value):
+        return _EXCEL_ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value
+
+
 def write_workbook(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> None:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = sheet_name
-    worksheet.append(headers)
+    worksheet.append([_sanitize_cell_value(header) for header in headers])
     for row in rows:
-        worksheet.append(row)
+        worksheet.append([_sanitize_cell_value(cell) for cell in row])
     workbook.save(path)
 
 
