@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - optionale KI-Funktion
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.29"
+APP_VERSION = "0.1.30"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -1155,7 +1155,8 @@ def extract_attribute_unit(attribute_label: str) -> str:
 
 
 def parse_german_number(text: str) -> float | None:
-    value = str(text or "").strip().replace(" ", "").replace(" ", "")
+    # Unicode-Minus (−, aus PDF-Texten) wie ein normales Minus behandeln.
+    value = str(text or "").strip().replace("−", "-").replace(" ", "").replace(" ", "")
     if not value:
         return None
     value = re.sub(r"\.(?=\d{3}(\D|$))", "", value)  # Tausenderpunkte
@@ -1184,6 +1185,9 @@ def convert_unit_value(value: float, from_unit: str, to_unit: str) -> float | No
 
 
 _NUMBER_PATTERN = r"\d+(?:[.,]\d+)*"
+# Einzelwerte und Bereichsgrenzen dürfen negativ sein (Temperatur-Messbereiche
+# wie '-20 °C'); in Abmessungen (x-getrennt) bleibt das Vorzeichen außen vor.
+_SIGNED_NUMBER_PATTERN = rf"[+-]?{_NUMBER_PATTERN}"
 # Einheiten dürfen Hochzahlen (m², m³), Klammern (dB(A)) und Schrägstriche
 # (m³/Std., l/min) enthalten.
 _UNIT_PATTERN = r"[A-Za-z²³°/%\".()]{0,8}"
@@ -1240,8 +1244,9 @@ def parse_dimension_value(raw_value: str) -> tuple[list[float], str] | None:
 def parse_numeric_value(raw_value: str) -> tuple[float, float | None, str] | None:
     """Erkennt Einzelwerte und Bereiche: '612 g' / '150 - 530 mm' -> (Wert, Wert-bis, Einheit)."""
     value, _note = _strip_trailing_parenthetical(raw_value)
+    value = value.replace("−", "-")  # Unicode-Minus aus PDF-Texten
     range_match = re.match(
-        rf"^({_NUMBER_PATTERN})\s*(?:-|–|bis)\s*({_NUMBER_PATTERN})\s*({_UNIT_PATTERN})?\s*$",
+        rf"^({_SIGNED_NUMBER_PATTERN})\s*(?:-|–|bis)\s*({_SIGNED_NUMBER_PATTERN})\s*({_UNIT_PATTERN})?\s*$",
         value,
     )
     if range_match:
@@ -1249,7 +1254,7 @@ def parse_numeric_value(raw_value: str) -> tuple[float, float | None, str] | Non
         second = parse_german_number(range_match.group(2))
         if first is not None and second is not None:
             return first, second, normalize_unit_text(range_match.group(3) or "")
-    single_match = re.match(rf"^(?:ca\.?\s*|~\s*)?({_NUMBER_PATTERN})\s*({_UNIT_PATTERN})?\s*$", value)
+    single_match = re.match(rf"^(?:ca\.?\s*|~\s*)?({_SIGNED_NUMBER_PATTERN})\s*({_UNIT_PATTERN})?\s*$", value)
     if single_match:
         number = parse_german_number(single_match.group(1))
         if number is not None:
@@ -4482,6 +4487,32 @@ def write_workbook(path: Path, sheet_name: str, headers: list[str], rows: list[l
     for row in rows:
         worksheet.append(row)
     workbook.save(path)
+
+
+def write_workbook_with_fallback(
+    path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]
+) -> tuple[str, str]:
+    """Schreibt eine Arbeitsmappe; weicht auf einen Zeitstempel-Namen aus,
+    wenn die Zieldatei gesperrt ist (z. B. in Excel geöffnet).
+
+    Rückgabe: (tatsächlich geschriebener Pfad oder '', Warnungstext oder '').
+    Ergebnislisten am Ende langer Läufe dürfen nie stillschweigend verloren
+    gehen - eine gesperrte Datei hat den Pilotbericht v0.1.29 gekostet."""
+    try:
+        write_workbook(path, sheet_name, headers, rows)
+        return str(path), ""
+    except Exception as first_error:
+        fallback = path.with_name(
+            f"{path.stem}_{datetime.now().strftime('%Y%m%d-%H%M%S')}{path.suffix}"
+        )
+        try:
+            write_workbook(fallback, sheet_name, headers, rows)
+            return str(fallback), (
+                f"{path.name} war gesperrt (vermutlich in Excel geöffnet) - "
+                f"stattdessen gespeichert als: {fallback.name}"
+            )
+        except Exception:
+            return "", f"{path.name} konnte nicht gespeichert werden: {first_error}"
 
 
 def read_workbook_headers(path: Path, sheet_name: str) -> list[str]:
@@ -13648,66 +13679,70 @@ if ($copied) {{
 
             summary["cancelled"] = cancel_event.is_set()
 
+            def write_result_list(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> str:
+                """Ergebnisliste schreiben; bei gesperrter Datei Ausweichname
+                plus sichtbare Warnung im Abschlussdialog."""
+                written_path, warning = write_workbook_with_fallback(path, sheet_name, headers, rows)
+                if warning:
+                    summary["error_messages"].append(warning)
+                return written_path
+
             error_list_path = output_root / BATCH_ERROR_LIST_FILENAME
-            try:
-                if summary["failed_items"]:
-                    write_workbook(
-                        error_list_path,
-                        "Fehler",
-                        ["Artikelnummer", "Fehler"],
-                        [[article_number, error_text] for article_number, error_text in summary["failed_items"]],
-                    )
-                    summary["error_list_path"] = str(error_list_path)
-                elif not summary["cancelled"]:
-                    # Sauberer Lauf: veraltete Fehlerliste vom letzten Mal entfernen.
+            if summary["failed_items"]:
+                summary["error_list_path"] = write_result_list(
+                    error_list_path,
+                    "Fehler",
+                    ["Artikelnummer", "Fehler"],
+                    [[article_number, error_text] for article_number, error_text in summary["failed_items"]],
+                )
+            elif not summary["cancelled"]:
+                # Sauberer Lauf: veraltete Fehlerliste vom letzten Mal entfernen.
+                try:
                     error_list_path.unlink(missing_ok=True)
-            except Exception:  # pragma: no cover - Fehlerliste darf den Lauf nie kippen
-                summary["error_list_path"] = ""
+                except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
+                    pass
 
             warning_list_path = output_root / BATCH_WARNING_LIST_FILENAME
-            try:
-                if summary["media_warnings"]:
-                    write_workbook(
-                        warning_list_path,
-                        "Warnungen",
-                        ["Artikelnummer", "Hinweis"],
-                        [[article_number, warning] for article_number, warning in summary["media_warnings"]],
-                    )
-                    summary["warning_list_path"] = str(warning_list_path)
-                elif not summary["cancelled"]:
+            if summary["media_warnings"]:
+                summary["warning_list_path"] = write_result_list(
+                    warning_list_path,
+                    "Warnungen",
+                    ["Artikelnummer", "Hinweis"],
+                    [[article_number, warning] for article_number, warning in summary["media_warnings"]],
+                )
+            elif not summary["cancelled"]:
+                try:
                     warning_list_path.unlink(missing_ok=True)
-            except Exception:  # pragma: no cover - Warnungsliste darf den Lauf nie kippen
-                summary["warning_list_path"] = ""
+                except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
+                    pass
 
             review_list_path = output_root / ATTRIBUTE_REVIEW_LIST_FILENAME
-            try:
-                if summary["attribute_review_rows"]:
-                    write_workbook(
-                        review_list_path,
-                        "Pruefliste",
-                        ATTRIBUTE_REVIEW_HEADERS,
-                        summary["attribute_review_rows"],
-                    )
-                    summary["attribute_review_path"] = str(review_list_path)
-                elif options.get("attributes") and not summary["cancelled"]:
+            if summary["attribute_review_rows"]:
+                summary["attribute_review_path"] = write_result_list(
+                    review_list_path,
+                    "Pruefliste",
+                    ATTRIBUTE_REVIEW_HEADERS,
+                    summary["attribute_review_rows"],
+                )
+            elif options.get("attributes") and not summary["cancelled"]:
+                try:
                     review_list_path.unlink(missing_ok=True)
-            except Exception:  # pragma: no cover - Prüfliste darf den Lauf nie kippen
-                summary["attribute_review_path"] = ""
+                except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
+                    pass
 
             report_path = output_root / ATTRIBUTE_REPORT_FILENAME
-            try:
-                if summary["attribute_report_rows"]:
-                    write_workbook(
-                        report_path,
-                        "Bericht",
-                        ATTRIBUTE_REPORT_HEADERS,
-                        summary["attribute_report_rows"],
-                    )
-                    summary["attribute_report_path"] = str(report_path)
-                elif options.get("attributes") and not summary["cancelled"]:
+            if summary["attribute_report_rows"]:
+                summary["attribute_report_path"] = write_result_list(
+                    report_path,
+                    "Bericht",
+                    ATTRIBUTE_REPORT_HEADERS,
+                    summary["attribute_report_rows"],
+                )
+            elif options.get("attributes") and not summary["cancelled"]:
+                try:
                     report_path.unlink(missing_ok=True)
-            except Exception:  # pragma: no cover - Bericht darf den Lauf nie kippen
-                summary["attribute_report_path"] = ""
+                except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
+                    pass
 
             if claude_client is not None:
                 summary["ai_usage_in"] = claude_client.total_input_tokens
