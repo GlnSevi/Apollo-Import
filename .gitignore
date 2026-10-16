@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 output/
 apollo_import_gui_state.json
+apollo_import_perf.log*
 build/
 dist/
 .claude/settings.local.json
