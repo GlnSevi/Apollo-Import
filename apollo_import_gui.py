@@ -4494,10 +4494,11 @@ class KunzerScraper:
         return "\n".join(compacted).strip()
 
 
-# Zeichen, die Excel in Zellen verbietet (Steuerzeichen ausser Tab/Zeilenumbruch).
+# Zeichen, die Excel in Zellen verbietet (Steuerzeichen ausser Tab/Zeilenumbruch)
+# sowie U+FFFE/U+FFFF, die in XML 1.0 grundsaetzlich unzulaessig sind.
 # openpyxl wirft sonst beim Speichern IllegalCharacterError - und eine
 # Ergebnisliste am Ende eines langen Laufs darf daran nie scheitern.
-_EXCEL_ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+_EXCEL_ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFFFE\uFFFF]")
 
 
 def _sanitize_cell_value(value: object) -> object:
@@ -4506,7 +4507,757 @@ def _sanitize_cell_value(value: object) -> object:
     return value
 
 
-def write_workbook(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> None:
+# ---------------------------------------------------------------------------
+# Schneller Excel-Zugriff auf die Output-Dateien
+#
+# Jedes Live-Speichern liest eine komplette Arbeitsmappe, mergt die Zeilen des
+# Artikels hinein und schreibt die Datei neu. Mit openpyxl kostete das bei
+# Fahrzeugverknuepfungen.xlsx (16.000 Zeilen) rund 2 s - im UI-Thread. Drei
+# Bausteine holen die Zeit zurueck, ohne das Dateiformat zu veraendern:
+#  1. Zeilen-Cache im Prozessspeicher je Datei, gueltig solange die Signatur
+#     (mtime_ns, Groesse) der Datei stimmt. Nach dem Schreiben werden die
+#     gerade geschriebenen Zeilen direkt als Cache gesetzt; der naechste Upsert
+#     liest also gar nicht mehr. Fremde Aenderungen (Datei in Excel bearbeitet)
+#     fallen ueber die Signatur auf.
+#  2. Ein eigener minimaler XLSX-Schreiber (zipfile + handgeschriebenes XML mit
+#     Inline-Strings, derselbe Paketaufbau wie bei openpyxl).
+#  3. Ein eigener Leser fuer sheet1.xml/sharedStrings.xml, der exakt das
+#     liefert, was openpyxl im read_only-Modus liefern wuerde. Bei allem, was
+#     er nicht sicher kennt (Datumszellen, formatierte Zahlen, unbekannte
+#     Blattnamen), uebernimmt weiterhin openpyxl.
+# Dazu ein Platten-Cache der geparsten Zeilen unter %LOCALAPPDATA%, damit der
+# Programmstart unveraenderte Dateien gar nicht mehr parsen muss.
+# ---------------------------------------------------------------------------
+_WORKBOOK_CACHE_FORMAT_VERSION = 1
+_WORKBOOK_ROW_CACHE_MAX_ENTRIES = 64
+_WORKBOOK_ROW_CACHE_LOCK = threading.Lock()
+# Normalisierter Pfad -> (Signatur, Blattname, Rohzeilen inkl. Kopfzeile,
+# "noch nicht im Platten-Cache"). Rohzeilen = openpyxl iter_rows(values_only=True)
+# mit None -> "" und allem anderen als str, in der Breite des Blatts. Die
+# Listen gehoeren dem Cache, Aufrufer kopieren vor dem Veraendern.
+_WORKBOOK_ROW_CACHE: dict[str, tuple[tuple[int, int], str, list[list[str]], bool]] = {}
+_WORKBOOK_CACHE_FLUSH_REGISTERED = False
+# Sperren je Datei (gestreift, damit die Tabelle beim Batch-Export in
+# Zeitstempel-Ordner nicht mitwaechst): UI-Thread, Live-Writer und Batch-Lauf
+# lesen/mergen/schreiben dieselbe Datei dadurch nie gleichzeitig.
+_WORKBOOK_FILE_LOCKS = [threading.RLock() for _ in range(64)]
+SNAPSHOT_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "Apollo Import GUI" / "cache"
+
+_XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_XLSX_DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_XLSX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_XLSX_WORKSHEET_REL_TYPE = f"{_XLSX_DOC_REL_NS}/worksheet"
+_XLSX_CELL_REF_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?(\d+)$")
+_XLSX_RANGE_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$")
+# Excel verbietet diese Zeichen in Blattnamen; openpyxl wirft dafuer ValueError.
+_XLSX_INVALID_SHEET_NAME_RE = re.compile(r"[\\*?:/\[\]]")
+
+
+class _FastXlsxUnsupported(Exception):
+    """Der eigene XLSX-Leser/-Schreiber kann diesen Fall nicht sicher
+    abbilden - der Aufrufer weicht dann auf openpyxl aus."""
+
+
+def _workbook_cache_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _workbook_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _workbook_file_lock(key: str) -> threading.RLock:
+    return _WORKBOOK_FILE_LOCKS[hash(key) % len(_WORKBOOK_FILE_LOCKS)]
+
+
+def _cached_workbook_rows(key: str, signature: tuple[int, int], sheet_name: str) -> list[list[str]] | None:
+    with _WORKBOOK_ROW_CACHE_LOCK:
+        entry = _WORKBOOK_ROW_CACHE.get(key)
+        if entry is None or entry[0] != signature or entry[1] != sheet_name:
+            return None
+        # LRU: zuletzt benutzter Eintrag ans Ende, verdraengt wird vorne.
+        _WORKBOOK_ROW_CACHE[key] = _WORKBOOK_ROW_CACHE.pop(key)
+        return entry[2]
+
+
+def _remember_workbook_rows(
+    key: str, signature: tuple[int, int], sheet_name: str, rows: list[list[str]], dirty: bool = False
+) -> None:
+    """dirty=True: die Zeilen stammen aus einem eigenen Schreibvorgang und
+    stehen noch nicht im Platten-Cache. Der wird nicht bei jedem Live-Speichern
+    mitgeschrieben (das kostete je Datei einen Dateianlauf plus pickle),
+    sondern erst beim Verdraengen aus dem Speicher-Cache und beim Beenden."""
+    global _WORKBOOK_CACHE_FLUSH_REGISTERED
+    evicted: list[tuple[str, tuple[tuple[int, int], str, list[list[str]], bool]]] = []
+    with _WORKBOOK_ROW_CACHE_LOCK:
+        _WORKBOOK_ROW_CACHE.pop(key, None)
+        _WORKBOOK_ROW_CACHE[key] = (signature, sheet_name, rows, dirty)
+        while len(_WORKBOOK_ROW_CACHE) > _WORKBOOK_ROW_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(_WORKBOOK_ROW_CACHE))
+            evicted.append((oldest_key, _WORKBOOK_ROW_CACHE.pop(oldest_key)))
+        if dirty and not _WORKBOOK_CACHE_FLUSH_REGISTERED:
+            import atexit
+
+            atexit.register(_flush_dirty_workbook_rows)
+            _WORKBOOK_CACHE_FLUSH_REGISTERED = True
+    for evicted_key, (evicted_signature, evicted_sheet, evicted_rows, evicted_dirty) in evicted:
+        if evicted_dirty:
+            _store_snapshot_cache(evicted_key, evicted_signature, evicted_sheet, evicted_rows, refresh_only=True)
+
+
+def _forget_workbook_rows(key: str) -> None:
+    with _WORKBOOK_ROW_CACHE_LOCK:
+        _WORKBOOK_ROW_CACHE.pop(key, None)
+
+
+def _flush_dirty_workbook_rows() -> None:
+    """Schreibt alle seit dem letzten Mal selbst geschriebenen Zeilen in den
+    Platten-Cache (laeuft beim Beenden; ein Absturz kostet nur, dass die
+    betroffenen Dateien beim naechsten Start einmal neu geparst werden)."""
+    with _WORKBOOK_ROW_CACHE_LOCK:
+        dirty_entries = [(key, entry) for key, entry in _WORKBOOK_ROW_CACHE.items() if entry[3]]
+        for key, entry in dirty_entries:
+            _WORKBOOK_ROW_CACHE[key] = (entry[0], entry[1], entry[2], False)
+    for key, (signature, sheet_name, rows, _dirty) in dirty_entries:
+        _store_snapshot_cache(key, signature, sheet_name, rows, refresh_only=True)
+
+
+def _snapshot_cache_file(key: str) -> Path:
+    import hashlib
+
+    digest = hashlib.sha1(key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return SNAPSHOT_CACHE_DIR / f"{Path(key).name}.{digest}.rows"
+
+
+def _load_snapshot_cache(key: str, signature: tuple[int, int], sheet_name: str) -> list[list[str]] | None:
+    import pickle
+
+    try:
+        with _snapshot_cache_file(key).open("rb") as handle:
+            payload = pickle.load(handle)
+        if (
+            isinstance(payload, dict)
+            and payload.get("version") == _WORKBOOK_CACHE_FORMAT_VERSION
+            and payload.get("path") == key
+            and payload.get("sheet") == sheet_name
+            and tuple(payload.get("signature", ())) == signature
+            and isinstance(payload.get("rows"), list)
+        ):
+            return payload["rows"]
+    except Exception:
+        # Fehlender, fremder oder kaputter Cache: ignorieren, wird neu aufgebaut.
+        pass
+    return None
+
+
+def _store_snapshot_cache(
+    key: str, signature: tuple[int, int], sheet_name: str, rows: list[list[str]], refresh_only: bool
+) -> None:
+    """Legt die Rohzeilen im lokalen Platten-Cache ab. refresh_only=True
+    aktualisiert nur Dateien, die schon einen Cache-Eintrag haben - so
+    hinterlassen Batch-Exporte in Zeitstempel-Ordner keine Karteileichen."""
+    import pickle
+
+    cache_file = _snapshot_cache_file(key)
+    temp_file = cache_file.with_name(f"{cache_file.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    try:
+        if refresh_only and not cache_file.exists():
+            return
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": _WORKBOOK_CACHE_FORMAT_VERSION,
+            "path": key,
+            "sheet": sheet_name,
+            "signature": signature,
+            "rows": rows,
+        }
+        with temp_file.open("wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temp_file, cache_file)
+    except Exception:
+        # Der Cache ist nur Beschleunigung - ein Fehler hier darf das
+        # eigentliche Speichern nie stoeren.
+        try:
+            temp_file.unlink()
+        except OSError:
+            pass
+
+
+def _workbook_raw_rows(path: Path, sheet_name: str) -> list[list[str]]:
+    """Alle Zeilen (inkl. Kopfzeile) einer Arbeitsmappe als str-Listen, so
+    wie openpyxl sie im read_only-Modus liefern wuerde. Kommt aus dem
+    Speicher-Cache, sonst aus dem Platten-Cache, sonst aus der Datei.
+    Rueckgabe ist der Cache-Eintrag selbst - nicht veraendern."""
+    key = _workbook_cache_key(path)
+    with _workbook_file_lock(key):
+        signature = _workbook_signature(path)
+        if signature is None:
+            _forget_workbook_rows(key)
+            return []
+        rows = _cached_workbook_rows(key, signature, sheet_name)
+        if rows is not None:
+            return rows
+        rows = _load_snapshot_cache(key, signature, sheet_name)
+        if rows is None:
+            rows = _read_workbook_raw_rows_from_file(path, sheet_name)
+            if _workbook_signature(path) != signature:
+                # Datei wurde waehrend des Lesens veraendert: Ergebnis nicht merken.
+                return rows
+            _store_snapshot_cache(key, signature, sheet_name, rows, refresh_only=False)
+        _remember_workbook_rows(key, signature, sheet_name, rows)
+        return rows
+
+
+def _read_workbook_raw_rows_from_file(path: Path, sheet_name: str) -> list[list[str]]:
+    try:
+        return _read_xlsx_rows_fast(path, sheet_name)
+    except Exception:
+        # Alles, was der eigene Leser nicht sicher kennt (oder eine kaputte
+        # Datei), landet bei openpyxl - der wirft dann die gewohnten Fehler.
+        pass
+    return _read_xlsx_rows_with_openpyxl(path, sheet_name)
+
+
+def _read_xlsx_rows_with_openpyxl(path: Path, sheet_name: str) -> list[list[str]]:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.active
+        return [
+            ["" if value is None else str(value) for value in values]
+            for values in worksheet.iter_rows(values_only=True)
+        ]
+    finally:
+        workbook.close()
+
+
+def _xlsx_column_index(letters: str) -> int:
+    index = 0
+    for char in letters.upper():
+        index = index * 26 + ord(char) - 64
+    return index
+
+
+def _xlsx_column_letters(count: int) -> list[str]:
+    letters: list[str] = []
+    for index in range(1, count + 1):
+        name = ""
+        remainder = index
+        while remainder:
+            remainder, digit = divmod(remainder - 1, 26)
+            name = chr(65 + digit) + name
+        letters.append(name)
+    return letters
+
+
+def _xlsx_number_text(value: str) -> str:
+    """Zahl aus <v> genau wie openpyxl (_cast_number + str): int, sonst float."""
+    if "." in value or "E" in value or "e" in value:
+        return str(float(value))
+    return str(int(value))
+
+
+def _xlsx_text_content(element: ET.Element, t_tag: str, r_tag: str) -> str:
+    """Text eines <is>/<si>-Knotens wie openpyxl Text.content: erst der
+    einfache <t>-Text, dann die Rich-Text-Laeufe <r><t>; Phonetik (rPh) faellt weg."""
+    plain = None
+    runs: list[str] = []
+    for child in element:
+        if child.tag == t_tag:
+            plain = child.text
+        elif child.tag == r_tag:
+            run = child.find(t_tag)
+            if run is not None and run.text is not None:
+                runs.append(run.text)
+    return (plain or "") + "".join(runs)
+
+
+def _xlsx_locate_sheet_part(archive, sheet_name: str) -> str:
+    names = set(archive.namelist())
+    if "xl/workbook.xml" not in names or "xl/_rels/workbook.xml.rels" not in names:
+        raise _FastXlsxUnsupported("Arbeitsmappe ohne workbook.xml")
+    relationships: dict[str, tuple[str, str]] = {}
+    for relationship in ET.fromstring(archive.read("xl/_rels/workbook.xml.rels")):
+        if relationship.tag == f"{{{_XLSX_PKG_REL_NS}}}Relationship":
+            relationships[relationship.get("Id", "")] = (relationship.get("Type", ""), relationship.get("Target", ""))
+    for sheet in ET.fromstring(archive.read("xl/workbook.xml")).iter(f"{{{_XLSX_MAIN_NS}}}sheet"):
+        if sheet.get("name") != sheet_name:
+            continue
+        rel_type, target = relationships.get(sheet.get(f"{{{_XLSX_DOC_REL_NS}}}id", ""), ("", ""))
+        if rel_type != _XLSX_WORKSHEET_REL_TYPE or not target:
+            raise _FastXlsxUnsupported("Blatt ist kein normales Tabellenblatt")
+        part = target.lstrip("/") if target.startswith("/") else f"xl/{target}"
+        if part not in names:
+            raise _FastXlsxUnsupported(f"Blattdatei {part} fehlt")
+        return part
+    # Unbekannter Blattname: openpyxl nimmt dann das aktive Blatt - das bildet
+    # der eigene Leser nicht nach.
+    raise _FastXlsxUnsupported(f"Blatt {sheet_name!r} nicht gefunden")
+
+
+def _xlsx_read_shared_strings(archive) -> list[str]:
+    si_tag = f"{{{_XLSX_MAIN_NS}}}si"
+    t_tag = f"{{{_XLSX_MAIN_NS}}}t"
+    r_tag = f"{{{_XLSX_MAIN_NS}}}r"
+    strings: list[str] = []
+    with archive.open("xl/sharedStrings.xml") as source:
+        for _event, element in ET.iterparse(source):
+            if element.tag == si_tag:
+                # openpyxl entfernt in Shared Strings die Escape-Markierung x005F_.
+                strings.append(_xlsx_text_content(element, t_tag, r_tag).replace("x005F_", ""))
+                element.clear()
+    return strings
+
+
+_XLSX_ENTITY_RE = re.compile(r"&(#x[0-9A-Fa-f]+|#[0-9]+|amp|lt|gt|quot|apos);")
+_XLSX_NAMED_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+_XLSX_DIMENSION_RE = re.compile(r'<dimension ref="([^"]*)"/>')
+# Ein Token im Blattinhalt: Zeilenanfang (Nr., selbstschliessend?), Zeilenende
+# oder eine Inline-String-Zelle (Spaltenbuchstaben, Text) - genau die Formen,
+# die der eigene Schreiber und openpyxl/lxml erzeugen.
+_XLSX_INLINE_TOKEN_RE = re.compile(
+    r'<row r="(\d+)"(?:\s[^>]*?)?(/?)>'
+    r"|</row>"
+    r'|<c r="([A-Z]{1,3})\d+" t="inlineStr"(?:/>|></c>|><is><t(?: xml:space="preserve")?>([^<]*)</t></is></c>)'
+)
+# Zeilen eines Blatts vor dem Zusammenbau: [(Zeilennummer, [(Spalte, Wert|None), ...]), ...]
+_XlsxParsedRows = list[tuple[int, list[tuple[int, str | None]]]]
+
+
+def _xlsx_unescape(text: str) -> str:
+    """XML-Entities aufloesen wie ein XML-Parser (nur die fuenf Standard-
+    Entities und Zeichenreferenzen - html.unescape waere hier falsch, es deutet
+    z. B. &#133; nach HTML-Regeln um)."""
+    matches = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal matches
+        matches += 1
+        entity = match.group(1)
+        if entity[0] == "#":
+            return chr(int(entity[2:], 16) if entity[1] in "xX" else int(entity[1:]))
+        return _XLSX_NAMED_ENTITIES[entity]
+
+    unescaped = _XLSX_ENTITY_RE.sub(replace, text)
+    if text.count("&") != matches:
+        raise _FastXlsxUnsupported("Unbekannte XML-Entity")
+    return unescaped
+
+
+def _xlsx_collect_rows_regex(data: bytes) -> tuple[_XlsxParsedRows, str | None] | None:
+    """Schneller Pfad fuer Blaetter, die ausschliesslich aus Inline-String-
+    Zellen bestehen (eigener Schreiber, openpyxl). Liest sheetData Token fuer
+    Token und verlangt, dass die Tokens luecken- und restlos aneinander
+    anschliessen; jede Abweichung liefert None, dann parst ElementTree."""
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
+    if text.startswith("<?xml"):
+        declaration = text[: text.find("?>")]
+        encoding = re.search(r"""encoding=["']([^"']*)["']""", declaration)
+        if encoding is not None and encoding.group(1).lower() not in ("utf-8", "utf8"):
+            return None
+    dimension_match = _XLSX_DIMENSION_RE.search(text)
+    if dimension_match is None and "<dimension" in text:
+        return None
+    dimension = dimension_match.group(1) if dimension_match is not None else None
+    data_start = text.find("<sheetData")
+    if data_start < 0:
+        return None
+    if text.startswith("<sheetData/>", data_start):
+        return [], dimension
+    if not text.startswith("<sheetData>", data_start):
+        return None
+    position = data_start + len("<sheetData>")
+    data_end = text.find("</sheetData>", position)
+    if data_end < 0:
+        return None
+
+    parsed_rows: _XlsxParsedRows = []
+    cells: list[tuple[int, str | None]] | None = None
+    column_indexes: dict[str, int] = {}
+    for match in _XLSX_INLINE_TOKEN_RE.finditer(text, position, data_end):
+        if match.start() != position:
+            return None
+        position = match.end()
+        row_number = match.group(1)
+        if row_number is not None:
+            if cells is not None:
+                return None
+            cells = []
+            parsed_rows.append((int(row_number), cells))
+            if match.group(2):
+                cells = None
+            continue
+        letters = match.group(3)
+        if letters is None:
+            if cells is None:
+                return None
+            cells = None
+            continue
+        if cells is None:
+            return None
+        column = column_indexes.get(letters)
+        if column is None:
+            column = column_indexes[letters] = _xlsx_column_index(letters)
+        value = match.group(4)
+        if value is not None:
+            if "\r" in value:
+                # Zeilenenden normalisiert jeder XML-Parser zu \n; nur die
+                # Zeichenreferenz &#13; bleibt ein echter Wagenruecklauf.
+                value = value.replace("\r\n", "\n").replace("\r", "\n")
+            if "&" in value:
+                value = _xlsx_unescape(value)
+        cells.append((column, value))
+    if position != data_end or cells is not None:
+        return None
+    return parsed_rows, dimension
+
+
+def _xlsx_collect_rows_etree(source, shared_strings: list[str]) -> tuple[_XlsxParsedRows, str | None]:
+    """Allgemeiner Pfad ueber ElementTree, bildet openpyxls WorkSheetParser
+    nach (Zellen ohne r-Attribut, Shared Strings, Zahlen, Booleans, Rich Text)."""
+    row_tag = f"{{{_XLSX_MAIN_NS}}}row"
+    v_tag = f"{{{_XLSX_MAIN_NS}}}v"
+    is_tag = f"{{{_XLSX_MAIN_NS}}}is"
+    t_tag = f"{{{_XLSX_MAIN_NS}}}t"
+    r_tag = f"{{{_XLSX_MAIN_NS}}}r"
+    dimension_tag = f"{{{_XLSX_MAIN_NS}}}dimension"
+    column_indexes: dict[str, int] = {}
+    dimension: str | None = None
+    dimension_seen = False
+    parsed_rows: _XlsxParsedRows = []
+    row_counter = 0
+
+    for _event, element in ET.iterparse(source):
+        tag = element.tag
+        if tag == row_tag:
+            row_ref = element.get("r")
+            if row_ref is None:
+                row_counter += 1
+            else:
+                try:
+                    row_counter = int(row_ref)
+                except ValueError:
+                    row_float = float(row_ref)
+                    if not row_float.is_integer():
+                        raise _FastXlsxUnsupported(f"Ungueltige Zeilennummer {row_ref!r}")
+                    row_counter = int(row_float)
+            column_counter = 0
+            cells: list[tuple[int, str | None]] = []
+            for cell in element:
+                cell_ref = cell.get("r")
+                if cell_ref:
+                    letters = cell_ref.rstrip("0123456789")
+                    column = column_indexes.get(letters)
+                    if column is None:
+                        match = _XLSX_CELL_REF_RE.match(cell_ref)
+                        if match is None:
+                            raise _FastXlsxUnsupported(f"Ungueltige Zellreferenz {cell_ref!r}")
+                        column = column_indexes[letters] = _xlsx_column_index(match.group(1))
+                    column_counter = column
+                else:
+                    column_counter += 1
+                data_type = cell.get("t", "n")
+                if data_type == "inlineStr":
+                    inline = cell.find(is_tag)
+                    if inline is None:
+                        value = None
+                    elif len(inline) == 1 and inline[0].tag == t_tag:
+                        value = inline[0].text or ""
+                    else:
+                        value = _xlsx_text_content(inline, t_tag, r_tag)
+                else:
+                    value = cell.findtext(v_tag, None) or None
+                    if value is not None:
+                        if data_type == "n":
+                            if cell.get("s", "0") not in ("0", ""):
+                                # Formatierte Zahl - koennte ein Datum sein, das
+                                # openpyxl in datetime wandelt. Lieber openpyxl.
+                                raise _FastXlsxUnsupported("Formatierte Zahlenzelle")
+                            value = _xlsx_number_text(value)
+                        elif data_type == "s":
+                            value = shared_strings[int(value)]
+                        elif data_type == "b":
+                            value = str(bool(int(value)))
+                        elif data_type not in ("str", "e"):
+                            raise _FastXlsxUnsupported(f"Zelltyp {data_type!r}")
+                cells.append((column_counter, value))
+            parsed_rows.append((row_counter, cells))
+            element.clear()
+        elif tag == dimension_tag and not dimension_seen:
+            dimension_seen = True
+            dimension = element.get("ref")
+            if dimension is None:
+                raise _FastXlsxUnsupported("Dimension ohne ref")
+    return parsed_rows, dimension
+
+
+def _xlsx_dimension_bounds(dimension: str | None) -> tuple[int | None, int | None]:
+    """(max_col, max_row) aus <dimension ref="A1:G16152"/>; ohne Dimension
+    beides None - dann richtet sich jede Zeile nach ihrer letzten Zelle."""
+    if dimension is None:
+        return None, None
+    match = _XLSX_RANGE_RE.match(dimension)
+    if match is None:
+        raise _FastXlsxUnsupported("Unbekannte Dimensionsangabe")
+    return _xlsx_column_index(match.group(3) or match.group(1)), int(match.group(4) or match.group(2))
+
+
+def _xlsx_assemble_rows(parsed_rows: _XlsxParsedRows, max_col: int | None, max_row: int | None) -> list[list[str]]:
+    """Baut die Zeilen exakt wie openpyxl read_only (_cells_by_row/_get_row):
+    Luecken werden mit Leerzeilen gefuellt, die Breite kommt aus <dimension>
+    (sonst aus der letzten Zelle je Zeile), Zeilen hinter dem Dimensionsende
+    fallen weg, None wird zu ""."""
+    rows: list[list[str]] = []
+    empty_row: list[str] = [] if max_col is None else [""] * max_col
+    counter = 1
+    index = 1
+    for index, cells in parsed_rows:
+        if max_row is not None and index > max_row:
+            break
+        while counter < index:
+            counter += 1
+            rows.append(list(empty_row))
+        if counter <= index:
+            counter += 1
+            if not cells and not max_col:
+                rows.append([])
+                continue
+            width = max_col or cells[-1][0]
+            row = [""] * width
+            for column, value in cells:
+                if 1 <= column <= width:
+                    row[column - 1] = "" if value is None else value
+            rows.append(row)
+    if max_row is not None and max_row < index:
+        rows.extend(list(empty_row) for _ in range(counter, max_row + 1))
+    return rows
+
+
+def _read_xlsx_rows_fast(path: Path, sheet_name: str) -> list[list[str]]:
+    import zipfile
+
+    with zipfile.ZipFile(path) as archive:
+        sheet_part = _xlsx_locate_sheet_part(archive, sheet_name)
+        data = archive.read(sheet_part)
+        collected = _xlsx_collect_rows_regex(data)
+        if collected is None:
+            shared_strings = _xlsx_read_shared_strings(archive) if "xl/sharedStrings.xml" in archive.namelist() else []
+            collected = _xlsx_collect_rows_etree(io.BytesIO(data), shared_strings)
+    parsed_rows, dimension = collected
+    max_col, max_row = _xlsx_dimension_bounds(dimension)
+    return _xlsx_assemble_rows(parsed_rows, max_col, max_row)
+
+
+def _escape_xml_text(value: str) -> str:
+    if "&" in value:
+        value = value.replace("&", "&amp;")
+    if "<" in value:
+        value = value.replace("<", "&lt;")
+    if ">" in value:
+        value = value.replace(">", "&gt;")
+    if "\r" in value:
+        # Wagenruecklauf als Zeichenreferenz, sonst macht jeder XML-Parser beim
+        # Lesen ein \n daraus (openpyxl/lxml schreibt ihn genauso).
+        value = value.replace("\r", "&#13;")
+    return value
+
+
+def _escape_xml_attribute(value: str) -> str:
+    return _escape_xml_text(value).replace('"', "&quot;").replace("\n", "&#10;").replace("\t", "&#9;")
+
+
+_XLSX_XML_HEADER = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+_XLSX_CONTENT_TYPES = (
+    _XLSX_XML_HEADER
+    + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+    '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+    '<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>'
+    '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+    '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+    "</Types>"
+)
+_XLSX_PACKAGE_RELS = (
+    _XLSX_XML_HEADER
+    + f'<Relationships xmlns="{_XLSX_PKG_REL_NS}">'
+    f'<Relationship Id="rId1" Type="{_XLSX_DOC_REL_NS}/officeDocument" Target="xl/workbook.xml"/>'
+    f'<Relationship Id="rId2" Type="{_XLSX_PKG_REL_NS}/metadata/core-properties" Target="docProps/core.xml"/>'
+    f'<Relationship Id="rId3" Type="{_XLSX_DOC_REL_NS}/extended-properties" Target="docProps/app.xml"/>'
+    "</Relationships>"
+)
+_XLSX_WORKBOOK_RELS = (
+    _XLSX_XML_HEADER
+    + f'<Relationships xmlns="{_XLSX_PKG_REL_NS}">'
+    f'<Relationship Id="rId1" Type="{_XLSX_WORKSHEET_REL_TYPE}" Target="worksheets/sheet1.xml"/>'
+    f'<Relationship Id="rId2" Type="{_XLSX_DOC_REL_NS}/styles" Target="styles.xml"/>'
+    f'<Relationship Id="rId3" Type="{_XLSX_DOC_REL_NS}/theme" Target="theme/theme1.xml"/>'
+    "</Relationships>"
+)
+_XLSX_APP_PROPERTIES = (
+    _XLSX_XML_HEADER
+    + '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
+    f"<Application>Microsoft Excel Compatible / {APP_TITLE}</Application><AppVersion>3.1</AppVersion></Properties>"
+)
+# Minimales Stylesheet, identisch mit dem, das openpyxl fuer eine leere
+# Arbeitsmappe schreibt (eine Schrift, zwei Fuellungen, ein Rahmen, ein Stil).
+_XLSX_STYLES = (
+    _XLSX_XML_HEADER
+    + f'<styleSheet xmlns="{_XLSX_MAIN_NS}"><numFmts count="0"/>'
+    '<fonts count="1"><font><name val="Calibri"/><family val="2"/><color theme="1"/><sz val="11"/><scheme val="minor"/></font></fonts>'
+    '<fills count="2"><fill><patternFill/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
+    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" pivotButton="0" quotePrefix="0" xfId="0"/></cellXfs>'
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0" hidden="0"/></cellStyles>'
+    '<tableStyles count="0" defaultTableStyle="TableStyleMedium9" defaultPivotStyle="PivotStyleLight16"/>'
+    "</styleSheet>"
+)
+
+
+def _xlsx_core_properties() -> str:
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return (
+        _XLSX_XML_HEADER
+        + '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        f"<dc:creator>{_escape_xml_text(APP_TITLE)}</dc:creator>"
+        f'<dcterms:created xsi:type="dcterms:W3CDTF">{stamp}</dcterms:created>'
+        f'<dcterms:modified xsi:type="dcterms:W3CDTF">{stamp}</dcterms:modified>'
+        "</cp:coreProperties>"
+    )
+
+
+def _xlsx_workbook_xml(sheet_name: str) -> str:
+    return (
+        _XLSX_XML_HEADER
+        + f'<workbook xmlns="{_XLSX_MAIN_NS}" xmlns:r="{_XLSX_DOC_REL_NS}"><workbookPr/>'
+        '<bookViews><workbookView visibility="visible" minimized="0" showHorizontalScroll="1" showVerticalScroll="1" '
+        'showSheetTabs="1" tabRatio="600" firstSheet="0" activeTab="0" autoFilterDateGrouping="1"/></bookViews>'
+        f'<sheets><sheet name="{_escape_xml_attribute(sheet_name)}" sheetId="1" state="visible" r:id="rId1"/></sheets>'
+        '<definedNames/><calcPr calcId="124519" fullCalcOnLoad="1"/></workbook>'
+    )
+
+
+def _write_xlsx_fast(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> list[list[str]] | None:
+    """Schreibt die Arbeitsmappe ohne openpyxl (Inline-Strings, alles Text).
+
+    Rueckgabe: die geschriebenen Rohzeilen (inkl. Kopfzeile, auf volle Breite
+    aufgefuellt) fuer den Zeilen-Cache - oder None, wenn Zahlen/Booleans dabei
+    waren; dann wird die Datei beim naechsten Zugriff normal gelesen.
+    Wirft _FastXlsxUnsupported bei allem, was nur openpyxl korrekt schreibt
+    (z. B. datetime-Werte oder ungueltige Blattnamen)."""
+    import zipfile
+
+    try:
+        from openpyxl.writer.theme import theme_xml
+    except ImportError as error:  # pragma: no cover - andere openpyxl-Version
+        raise _FastXlsxUnsupported(str(error)) from error
+    if not sheet_name or len(sheet_name) > 31 or _XLSX_INVALID_SHEET_NAME_RE.search(sheet_name):
+        raise _FastXlsxUnsupported(f"Blattname {sheet_name!r} ungueltig")
+
+    all_rows = [list(headers), *rows]
+    width = max(1, max(len(row) for row in all_rows))
+    letters = _xlsx_column_letters(width)
+    cached_rows: list[list[str]] | None = []
+    row_chunks: list[str] = []
+    last_row_with_cells = 0
+    for row_number, row in enumerate(all_rows, start=1):
+        if not row:
+            # openpyxl legt fuer eine leere Zeile keine Zellen an; sie zaehlt
+            # nur dann (als Leerzeile), wenn spaeter noch Zeilen folgen.
+            if cached_rows is not None:
+                cached_rows.append([""] * width)
+            continue
+        last_row_with_cells = row_number
+        row_label = str(row_number)
+        cells: list[str] = []
+        cached_row: list[str] = []
+        # Verbotene Zeichen einmal je Zeile suchen statt je Zelle - die
+        # Regex-Suche pro Zelle war der teuerste Einzelposten beim Schreiben.
+        try:
+            sanitize_cells = _EXCEL_ILLEGAL_CHARACTERS_RE.search("".join(row)) is not None
+        except TypeError:
+            sanitize_cells = True  # nicht nur Strings: Zelle fuer Zelle pruefen
+        for column_index, raw_value in enumerate(row):
+            value = _sanitize_cell_value(raw_value) if sanitize_cells else raw_value
+            if value is None:
+                # openpyxl schreibt fuer None keine Zelle.
+                cached_row.append("")
+                continue
+            ref = letters[column_index] + row_label
+            if isinstance(value, str):
+                cached_row.append(value)
+                if not value:
+                    cells.append(f'<c r="{ref}" t="inlineStr"/>')
+                else:
+                    preserve = value != value.strip()
+                    if "&" in value or "<" in value or ">" in value or "\r" in value:
+                        value = _escape_xml_text(value)
+                    if preserve:
+                        cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{value}</t></is></c>')
+                    else:
+                        cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{value}</t></is></c>')
+            elif isinstance(value, bool):
+                cached_rows = None
+                cells.append(f'<c r="{ref}" t="b"><v>{int(value)}</v></c>')
+            elif isinstance(value, (int, float)):
+                cached_rows = None
+                number = "%.16g" % value
+                if number in ("nan", "inf", "-inf"):
+                    number = ""
+                cells.append(f'<c r="{ref}" t="n"><v>{number}</v></c>')
+            else:
+                raise _FastXlsxUnsupported(f"Zelltyp {type(value).__name__}")
+        if cached_rows is not None:
+            if len(cached_row) < width:
+                cached_row.extend([""] * (width - len(cached_row)))
+            cached_rows.append(cached_row)
+        row_chunks.append(f'<row r="{row_label}">{"".join(cells)}</row>')
+    if cached_rows is not None:
+        del cached_rows[last_row_with_cells:]
+
+    sheet_xml = (
+        _XLSX_XML_HEADER
+        + f'<worksheet xmlns="{_XLSX_MAIN_NS}"><sheetPr><outlinePr summaryBelow="1" summaryRight="1"/><pageSetUpPr/></sheetPr>'
+        f'<dimension ref="A1:{letters[-1]}{max(1, last_row_with_cells)}"/>'
+        '<sheetViews><sheetView workbookViewId="0"><selection activeCell="A1" sqref="A1"/></sheetView></sheetViews>'
+        '<sheetFormatPr baseColWidth="8" defaultRowHeight="15"/><sheetData>'
+        + "".join(row_chunks)
+        + '</sheetData><pageMargins left="0.75" right="0.75" top="1" bottom="1" header="0.5" footer="0.5"/></worksheet>'
+    )
+
+    # Erst komplett im Speicher packen, dann in einem Zug auf die Platte: eine
+    # gesperrte Zieldatei (in Excel geoeffnet) faellt wie bisher als OSError
+    # auf, eine halb geschriebene Datei gibt es nicht.
+    # Kompressionsstufe 2: bei 16.000 Zeilen 15 ms statt 48 ms (Stufe 6) fuer
+    # rund 8 % groessere Dateien - jeder Leser versteht beides.
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=2) as archive:
+        archive.writestr("[Content_Types].xml", _XLSX_CONTENT_TYPES)
+        archive.writestr("_rels/.rels", _XLSX_PACKAGE_RELS)
+        archive.writestr("docProps/app.xml", _XLSX_APP_PROPERTIES)
+        archive.writestr("docProps/core.xml", _xlsx_core_properties())
+        archive.writestr("xl/workbook.xml", _xlsx_workbook_xml(sheet_name))
+        archive.writestr("xl/_rels/workbook.xml.rels", _XLSX_WORKBOOK_RELS)
+        archive.writestr("xl/styles.xml", _XLSX_STYLES)
+        archive.writestr("xl/theme/theme1.xml", theme_xml)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    with open(path, "wb") as handle:
+        handle.write(buffer.getbuffer())
+    return cached_rows
+
+
+def _write_workbook_with_openpyxl(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> None:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = sheet_name
@@ -4514,6 +5265,36 @@ def write_workbook(path: Path, sheet_name: str, headers: list[str], rows: list[l
     for row in rows:
         worksheet.append([_sanitize_cell_value(cell) for cell in row])
     workbook.save(path)
+
+
+def _workbook_already_holds(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> bool:
+    """True, wenn die Datei bereits genau diese Kopfzeile und Zeilen enthaelt.
+    Dann darf das Schreiben entfallen - etwa beim Live-Speichern eines
+    Artikels ohne Aenderung oder bei Dateien, in denen der Artikel gar nicht
+    vorkommt. Der Vergleich laeuft gegen die gecachten Rohzeilen."""
+    if not path.exists():
+        return False
+    raw_rows = _workbook_raw_rows(path, sheet_name)
+    if len(raw_rows) != len(rows) + 1 or raw_rows[0] != list(headers):
+        return False
+    return all(existing == new for existing, new in zip(raw_rows[1:], rows))
+
+
+def write_workbook(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> None:
+    key = _workbook_cache_key(path)
+    with _workbook_file_lock(key):
+        written_rows: list[list[str]] | None = None
+        try:
+            try:
+                written_rows = _write_xlsx_fast(path, sheet_name, headers, rows)
+            except _FastXlsxUnsupported:
+                _write_workbook_with_openpyxl(path, sheet_name, headers, rows)
+        finally:
+            signature = _workbook_signature(path)
+            if written_rows is None or signature is None:
+                _forget_workbook_rows(key)
+            else:
+                _remember_workbook_rows(key, signature, sheet_name, written_rows, dirty=True)
 
 
 def write_workbook_with_fallback(
@@ -4546,13 +5327,8 @@ def read_workbook_headers(path: Path, sheet_name: str) -> list[str]:
     if not path.exists():
         return []
 
-    workbook = load_workbook(path, read_only=True, data_only=True)
-    try:
-        worksheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.active
-        first_row = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
-        return ["" if value is None else str(value) for value in first_row]
-    finally:
-        workbook.close()
+    raw_rows = _workbook_raw_rows(path, sheet_name)
+    return list(raw_rows[0]) if raw_rows else []
 
 
 def is_legacy_oe_workbook(path: Path, sheet_name: str) -> bool:
@@ -4591,21 +5367,16 @@ def read_workbook_rows(path: Path, sheet_name: str, expected_width: int) -> list
     if not path.exists():
         return []
 
-    workbook = load_workbook(path, read_only=True, data_only=True)
-    try:
-        worksheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.active
-        existing_rows: list[list[str]] = []
-        row_iter = worksheet.iter_rows(values_only=True)
-        next(row_iter, None)
-        for values in row_iter:
-            row = ["" if value is None else str(value) for value in values[:expected_width]]
-            if len(row) < expected_width:
-                row.extend([""] * (expected_width - len(row)))
-            if any(cell.strip() for cell in row):
-                existing_rows.append(row)
-        return existing_rows
-    finally:
-        workbook.close()
+    existing_rows: list[list[str]] = []
+    # Erste Rohzeile ist die Kopfzeile; die Zeilen sind frische Listen, die
+    # Aufrufer gefahrlos veraendern duerfen.
+    for values in _workbook_raw_rows(path, sheet_name)[1:]:
+        row = values[:expected_width]
+        if len(row) < expected_width:
+            row.extend([""] * (expected_width - len(row)))
+        if any(map(str.strip, row)):
+            existing_rows.append(row)
+    return existing_rows
 
 
 def prepare_existing_rows_for_write(path: Path, sheet_name: str, headers: list[str]) -> list[list[str]]:
@@ -4676,9 +5447,12 @@ def write_workbook_with_upsert(
     key_index: int = 0,
     replace_article_keys: set[str] | None = None,
 ) -> None:
-    existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
-    merged_rows = merge_rows_by_article(existing_rows, rows, key_index=key_index, replace_article_keys=replace_article_keys)
-    write_workbook(path, sheet_name, headers, merged_rows)
+    with _workbook_file_lock(_workbook_cache_key(path)):
+        existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
+        merged_rows = merge_rows_by_article(existing_rows, rows, key_index=key_index, replace_article_keys=replace_article_keys)
+        if _workbook_already_holds(path, sheet_name, headers, merged_rows):
+            return
+        write_workbook(path, sheet_name, headers, merged_rows)
 
 
 def remove_article_rows_from_workbook(
@@ -4695,13 +5469,16 @@ def remove_article_rows_from_workbook(
     if not normalized_article_numbers:
         return
 
-    existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
-    remaining_rows = [
-        row
-        for row in existing_rows
-        if len(row) <= key_index or normalize_article_number(str(row[key_index])) not in normalized_article_numbers
-    ]
-    write_workbook(path, sheet_name, headers, remaining_rows)
+    with _workbook_file_lock(_workbook_cache_key(path)):
+        existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
+        remaining_rows = [
+            row
+            for row in existing_rows
+            if len(row) <= key_index or normalize_article_number(str(row[key_index])) not in normalized_article_numbers
+        ]
+        if _workbook_already_holds(path, sheet_name, headers, remaining_rows):
+            return
+        write_workbook(path, sheet_name, headers, remaining_rows)
 
 
 def replace_article_rows_preserving_timestamps(
@@ -4712,45 +5489,50 @@ def replace_article_rows_preserving_timestamps(
     rows: list[list[str]],
     key_index: int = 0,
 ) -> None:
-    existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
-    article_key = normalize_article_number(article_number)
-    has_last_written = bool(headers) and headers[-1] == LAST_WRITTEN_HEADER
-    written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _workbook_file_lock(_workbook_cache_key(path)):
+        existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
+        article_key = normalize_article_number(article_number)
+        has_last_written = bool(headers) and headers[-1] == LAST_WRITTEN_HEADER
+        written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    rebuilt_rows = rows
-    if has_last_written:
-        existing_timestamps_by_signature: dict[tuple[str, ...], list[str]] = {}
-        signature_width = len(headers) - 1
-        for row in existing_rows:
-            if len(row) <= key_index or normalize_article_number(str(row[key_index])) != article_key:
+        rebuilt_rows = rows
+        if has_last_written:
+            existing_timestamps_by_signature: dict[tuple[str, ...], list[str]] = {}
+            signature_width = len(headers) - 1
+            for row in existing_rows:
+                if len(row) <= key_index or normalize_article_number(str(row[key_index])) != article_key:
+                    continue
+                signature = tuple(str(cell) for cell in row[:signature_width])
+                existing_timestamps_by_signature.setdefault(signature, []).append(row[-1].strip() or written_at)
+
+            rebuilt_rows = []
+            for row in rows:
+                signature_values = [str(cell) for cell in row[:signature_width]]
+                if len(signature_values) < signature_width:
+                    signature_values.extend([""] * (signature_width - len(signature_values)))
+                signature = tuple(signature_values)
+                known_timestamps = existing_timestamps_by_signature.get(signature, [])
+                timestamp = known_timestamps.pop(0) if known_timestamps else written_at
+                rebuilt_rows.append(signature_values + [timestamp])
+
+        merged_rows: list[list[str]] = []
+        inserted = False
+        for existing_row in existing_rows:
+            if len(existing_row) > key_index and normalize_article_number(str(existing_row[key_index])) == article_key:
+                if not inserted:
+                    merged_rows.extend(rebuilt_rows)
+                    inserted = True
                 continue
-            signature = tuple(str(cell) for cell in row[:signature_width])
-            existing_timestamps_by_signature.setdefault(signature, []).append(row[-1].strip() or written_at)
+            merged_rows.append(existing_row)
 
-        rebuilt_rows = []
-        for row in rows:
-            signature_values = [str(cell) for cell in row[:signature_width]]
-            if len(signature_values) < signature_width:
-                signature_values.extend([""] * (signature_width - len(signature_values)))
-            signature = tuple(signature_values)
-            known_timestamps = existing_timestamps_by_signature.get(signature, [])
-            timestamp = known_timestamps.pop(0) if known_timestamps else written_at
-            rebuilt_rows.append(signature_values + [timestamp])
+        if not inserted:
+            merged_rows.extend(rebuilt_rows)
 
-    merged_rows: list[list[str]] = []
-    inserted = False
-    for existing_row in existing_rows:
-        if len(existing_row) > key_index and normalize_article_number(str(existing_row[key_index])) == article_key:
-            if not inserted:
-                merged_rows.extend(rebuilt_rows)
-                inserted = True
-            continue
-        merged_rows.append(existing_row)
-
-    if not inserted:
-        merged_rows.extend(rebuilt_rows)
-
-    write_workbook(path, sheet_name, headers, merged_rows)
+        # Unveraenderte Zeilen behalten ihren Zeitstempel - ist der Artikel also
+        # unveraendert, ist die Datei es auch und das Schreiben entfaellt.
+        if _workbook_already_holds(path, sheet_name, headers, merged_rows):
+            return
+        write_workbook(path, sheet_name, headers, merged_rows)
 
 
 def build_short_text_export_row(bundle: ExportBundle) -> list[str]:
@@ -5293,6 +6075,9 @@ def load_article_snapshots_from_folder(
     if not folder.exists():
         return {}
 
+    # Die Datei-Lesevorgaenge laufen ueber den Zeilen-Cache (Speicher, dann
+    # Platten-Cache unter SNAPSHOT_CACHE_DIR): beim Start werden nur Dateien
+    # geparst, deren Signatur sich seit dem letzten Lauf geaendert hat.
     snapshots: dict[str, StoredArticleSnapshot] = {}
 
     def ensure_snapshot(article_number: str) -> StoredArticleSnapshot:
