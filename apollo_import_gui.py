@@ -2583,8 +2583,11 @@ def catalog_cache_dir() -> Path:
 
 
 def _dataclass_cache_schema(cls: type) -> tuple:
-    """Modul, Name und Feldliste einer Datenklasse - aendert sich eine, passt kein alter Cache mehr."""
-    return (cls.__module__, cls.__qualname__, tuple(f.name for f in fields(cls)))
+    """Name, Feldnamen und Feldtypen einer Datenklasse - aendert sich etwas
+    davon, passt kein alter Cache mehr. Bewusst ohne Modulnamen: beim
+    Programmstart heisst das Modul __main__, in Skripten apollo_import_gui,
+    und beide sollen denselben Cache nutzen (siehe _CatalogCacheUnpickler)."""
+    return (cls.__qualname__, tuple((f.name, str(f.type)) for f in fields(cls)))
 
 
 def _vehicle_catalog_cache_schema() -> tuple:
@@ -2594,13 +2597,18 @@ def _vehicle_catalog_cache_schema() -> tuple:
 
 
 def _catalog_cache_header(kind: str, source_path: Path, schema: tuple) -> dict[str, object] | None:
-    """Kennung des Quellstands; None, wenn die Quelldatei nicht per stat() erreichbar ist."""
+    """Kennung des Quellstands; None, wenn die Quelldatei nicht per stat() erreichbar ist.
+
+    Die App-Version gehoert dazu: aendert ein Release die Parse-Logik, wird
+    der Cache einmal neu aufgebaut, statt alte Strukturen zu uebernehmen,
+    solange die Quelldatei unveraendert bleibt."""
     try:
         stat = source_path.stat()
     except OSError:
         return None
     return {
         "format": CATALOG_CACHE_FORMAT_VERSION,
+        "app": APP_VERSION,
         "kind": kind,
         "python": tuple(sys.version_info[:2]),
         "source": os.path.normcase(str(source_path)),
@@ -2608,6 +2616,21 @@ def _catalog_cache_header(kind: str, source_path: Path, schema: tuple) -> dict[s
         "size": stat.st_size,
         "schema": schema,
     }
+
+
+# Modulnamen, unter denen die Klassen dieses Moduls in einem Cache stehen
+# koennen: "__main__" (Start per exe oder Skript) und der Importname.
+_CATALOG_CACHE_MODULE_NAMES = frozenset({"__main__", "apollo_import_gui", __name__})
+
+
+class _CatalogCacheUnpickler(pickle.Unpickler):
+    """Loest Klassenreferenzen aus dem Cache im laufenden Modul auf - gleich,
+    ob der Cache von einem __main__- oder einem Import-Lauf geschrieben wurde."""
+
+    def find_class(self, module: str, name: str):
+        if module in _CATALOG_CACHE_MODULE_NAMES:
+            module = __name__
+        return super().find_class(module, name)
 
 
 def _catalog_cache_path(kind: str, source_path: Path) -> Path:
@@ -2619,9 +2642,11 @@ def _read_catalog_cache(cache_path: Path, header: dict[str, object]) -> object |
     """Liefert die gecachten Daten oder None (kein, alter oder kaputter Cache)."""
     try:
         with open(cache_path, "rb") as handle:
-            if pickle.load(handle) != header:
+            # Je Pickle ein eigener Unpickler: der Memo-Speicher wuerde sonst
+            # vom Kopf in die Nutzdaten hineinreichen und deren Verweise verschieben.
+            if _CatalogCacheUnpickler(handle).load() != header:
                 return None
-            return pickle.load(handle)
+            return _CatalogCacheUnpickler(handle).load()
     except Exception:
         # Fehlende Datei, abgebrochener Schreibvorgang, fremdes Format oder
         # geaenderte Klassen: kein Fehler, sondern schlicht "nicht brauchbar".
@@ -3726,22 +3751,19 @@ class IdRegistry:
             workbook_path = folder / file_name
             if not workbook_path.exists():
                 continue
+            # Erstes Blatt ueber den schnellen Leser samt Speicher-/Platten-Cache
+            # (Rohzeilen wie openpyxl read_only, None -> ""); die Datei-Sperre
+            # haelt den Live-Writer dabei von halb geschriebenen Dateien fern.
             try:
-                workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+                raw_rows = _workbook_first_sheet_raw_rows(workbook_path)
             except Exception as exc:  # pragma: no cover - defensive user feedback
                 warnings.append(f"{file_name}: {exc}")
                 continue
 
-            worksheet = workbook[workbook.sheetnames[0]]
-            rows = worksheet.iter_rows(values_only=True)
-            try:
-                header = next(rows)
-            except StopIteration:
-                workbook.close()
+            if not raw_rows:
                 continue
-            header_map = {str(value).strip(): index for index, value in enumerate(header) if value is not None}
+            header_map = {value.strip(): index for index, value in enumerate(raw_rows[0]) if value}
             if "Text Modul ID" not in header_map:
-                workbook.close()
                 continue
             id_index = header_map["Text Modul ID"]
             article_index = None
@@ -3749,23 +3771,19 @@ class IdRegistry:
                 if candidate_name in header_map:
                     article_index = header_map[candidate_name]
                     break
-            for row in rows:
-                if row is None or id_index >= len(row):
+            for row in raw_rows[1:]:
+                if id_index >= len(row):
                     continue
-                value = row[id_index]
-                if value is None:
-                    continue
-                candidate = str(value).strip()
+                candidate = row[id_index].strip()
                 if candidate:
                     self.used_ids.add(candidate)
-                    if article_index is not None and article_index < len(row) and row[article_index] is not None:
-                        article_number = normalize_article_number(str(row[article_index]))
+                    if article_index is not None and article_index < len(row):
+                        article_number = normalize_article_number(row[article_index])
                         if article_number:
                             if file_name in {"Kurzbezeichnung-NEU.xlsx", "Kurzbezeichnung_zu_ID.xlsx"}:
                                 self.short_ids_by_article[article_number] = candidate
                             elif file_name in {"Text-NEU.xlsx", "Text_zu_ID.xlsx"}:
                                 self.long_ids_by_article[article_number] = candidate
-            workbook.close()
 
         return len(self.used_ids), warnings
 
@@ -3799,6 +3817,58 @@ class IdRegistry:
                 return candidate
 
 
+def _parse_genart_options(path: Path) -> list[GenArtOption]:
+    """Liest die GenArt-Datei (Blatt 'Genarten', sonst das aktive Blatt) in
+    fertige Optionen samt Suchtokens. Fehler laufen als ValueError durch."""
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook["Genarten"] if "Genarten" in workbook.sheetnames else workbook.active
+        rows = worksheet.iter_rows(values_only=True)
+        header = next(rows, None)
+        if not header:
+            raise ValueError("Die GenArt-Datei ist leer.")
+        header_map = {str(value).strip(): index for index, value in enumerate(header) if value is not None}
+        required_headers = {"ID", "Bezeichnung", "Genart"}
+        if not required_headers.issubset(header_map):
+            raise ValueError("Die GenArt-Datei braucht die Spalten ID, Bezeichnung und Genart.")
+
+        options: list[GenArtOption] = []
+        for row in rows:
+            if row is None:
+                continue
+            option_id = str(row[header_map["ID"]]).strip() if header_map["ID"] < len(row) and row[header_map["ID"]] is not None else ""
+            bezeichnung = (
+                str(row[header_map["Bezeichnung"]]).strip()
+                if header_map["Bezeichnung"] < len(row) and row[header_map["Bezeichnung"]] is not None
+                else ""
+            )
+            genart = (
+                str(row[header_map["Genart"]]).strip()
+                if header_map["Genart"] < len(row) and row[header_map["Genart"]] is not None
+                else ""
+            )
+            if not option_id or not (bezeichnung or genart):
+                continue
+
+            normalized_bezeichnung = normalize_match_text(bezeichnung)
+            normalized_genart = normalize_match_text(genart)
+            tokens = build_match_tokens(f"{bezeichnung} {genart}")
+            families = infer_match_families_from_tokens(tokens)
+            option = GenArtOption(
+                id=option_id,
+                bezeichnung=bezeichnung,
+                genart=genart,
+                normalized_bezeichnung=normalized_bezeichnung,
+                normalized_genart=normalized_genart,
+                tokens=tokens,
+                families=families,
+            )
+            options.append(option)
+    finally:
+        workbook.close()
+    return options
+
+
 class GenArtRegistry:
     def __init__(self) -> None:
         self.options: list[GenArtOption] = []
@@ -3807,52 +3877,17 @@ class GenArtRegistry:
         self.source_path: Path | None = None
 
     def load_from_workbook(self, path: Path) -> int:
-        workbook = load_workbook(path, read_only=True, data_only=True)
-        try:
-            worksheet = workbook["Genarten"] if "Genarten" in workbook.sheetnames else workbook.active
-            rows = worksheet.iter_rows(values_only=True)
-            header = next(rows, None)
-            if not header:
-                raise ValueError("Die GenArt-Datei ist leer.")
-            header_map = {str(value).strip(): index for index, value in enumerate(header) if value is not None}
-            required_headers = {"ID", "Bezeichnung", "Genart"}
-            if not required_headers.issubset(header_map):
-                raise ValueError("Die GenArt-Datei braucht die Spalten ID, Bezeichnung und Genart.")
-
-            options: list[GenArtOption] = []
-            for row in rows:
-                if row is None:
-                    continue
-                option_id = str(row[header_map["ID"]]).strip() if header_map["ID"] < len(row) and row[header_map["ID"]] is not None else ""
-                bezeichnung = (
-                    str(row[header_map["Bezeichnung"]]).strip()
-                    if header_map["Bezeichnung"] < len(row) and row[header_map["Bezeichnung"]] is not None
-                    else ""
-                )
-                genart = (
-                    str(row[header_map["Genart"]]).strip()
-                    if header_map["Genart"] < len(row) and row[header_map["Genart"]] is not None
-                    else ""
-                )
-                if not option_id or not (bezeichnung or genart):
-                    continue
-
-                normalized_bezeichnung = normalize_match_text(bezeichnung)
-                normalized_genart = normalize_match_text(genart)
-                tokens = build_match_tokens(f"{bezeichnung} {genart}")
-                families = infer_match_families_from_tokens(tokens)
-                option = GenArtOption(
-                    id=option_id,
-                    bezeichnung=bezeichnung,
-                    genart=genart,
-                    normalized_bezeichnung=normalized_bezeichnung,
-                    normalized_genart=normalized_genart,
-                    tokens=tokens,
-                    families=families,
-                )
-                options.append(option)
-        finally:
-            workbook.close()
+        # Das Parsen der ~12.500 Zeilen kostet gut eine Sekunde beim Start;
+        # die fertigen Optionen kommen beim naechsten Mal aus dem lokalen
+        # Stammdaten-Cache (siehe load_with_catalog_cache). Scheitert der
+        # Parser, laeuft der Fehler wie bisher durch und nichts wird gecacht.
+        options = load_with_catalog_cache(
+            "genart",
+            path,
+            _dataclass_cache_schema(GenArtOption),
+            list,
+            lambda: _parse_genart_options(path),
+        )
 
         self.options = options
         self.options_by_display = {option.display_label(): option for option in options}
@@ -4722,11 +4757,21 @@ class KunzerScraper:
 # openpyxl wirft sonst beim Speichern IllegalCharacterError - und eine
 # Ergebnisliste am Ende eines langen Laufs darf daran nie scheitern.
 _EXCEL_ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFFFE\uFFFF]")
+# Excel erlaubt je Zelle hoechstens 32.767 Zeichen. openpyxl kuerzt laengere
+# Texte stillschweigend (Cell.check_string); eine Datei mit laengerer Zelle
+# oeffnet Excel gar nicht erst. Der eigene Schreiber muss daher genauso kuerzen.
+EXCEL_CELL_MAX_LENGTH = 32767
 
 
 def _sanitize_cell_value(value: object) -> object:
-    if isinstance(value, str) and _EXCEL_ILLEGAL_CHARACTERS_RE.search(value):
-        return _EXCEL_ILLEGAL_CHARACTERS_RE.sub("", value)
+    """Verbotene Zeichen entfernen und auf die Excel-Hoechstlaenge kuerzen -
+    fuer beide Schreiber dieselbe Regel, damit Zeilen-Cache und Datei
+    uebereinstimmen."""
+    if isinstance(value, str):
+        if _EXCEL_ILLEGAL_CHARACTERS_RE.search(value):
+            value = _EXCEL_ILLEGAL_CHARACTERS_RE.sub("", value)
+        if len(value) > EXCEL_CELL_MAX_LENGTH:
+            value = value[:EXCEL_CELL_MAX_LENGTH]
     return value
 
 
@@ -4764,6 +4809,10 @@ _WORKBOOK_CACHE_FLUSH_REGISTERED = False
 # Zeitstempel-Ordner nicht mitwaechst): UI-Thread, Live-Writer und Batch-Lauf
 # lesen/mergen/schreiben dieselbe Datei dadurch nie gleichzeitig.
 _WORKBOOK_FILE_LOCKS = [threading.RLock() for _ in range(64)]
+# Normalisierter Pfad -> (Signatur, Blattname) der Dateien, in denen das Blatt
+# nachweislich unter genau diesem Namen liegt (eigener Schreibvorgang oder
+# Zip-Blick). Spart beim "nicht schreiben, wenn identisch" den Dateizugriff.
+_WORKBOOK_SHEET_VERIFIED: dict[str, tuple[tuple[int, int], str]] = {}
 SNAPSHOT_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "Apollo Import GUI" / "cache"
 
 _XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -4865,6 +4914,7 @@ def _load_snapshot_cache(key: str, signature: tuple[int, int], sheet_name: str) 
         if (
             isinstance(payload, dict)
             and payload.get("version") == _WORKBOOK_CACHE_FORMAT_VERSION
+            and payload.get("app") == APP_VERSION
             and payload.get("path") == key
             and payload.get("sheet") == sheet_name
             and tuple(payload.get("signature", ())) == signature
@@ -4882,7 +4932,9 @@ def _store_snapshot_cache(
 ) -> None:
     """Legt die Rohzeilen im lokalen Platten-Cache ab. refresh_only=True
     aktualisiert nur Dateien, die schon einen Cache-Eintrag haben - so
-    hinterlassen Batch-Exporte in Zeitstempel-Ordner keine Karteileichen."""
+    hinterlassen Batch-Exporte in Zeitstempel-Ordner keine Karteileichen.
+    Die App-Version steht mit im Kopf: aendert ein Update den Leser, wird
+    jede Datei einmal neu geparst statt mit alten Zeilen weiterzulaufen."""
     import pickle
 
     cache_file = _snapshot_cache_file(key)
@@ -4893,6 +4945,7 @@ def _store_snapshot_cache(
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": _WORKBOOK_CACHE_FORMAT_VERSION,
+            "app": APP_VERSION,
             "path": key,
             "sheet": sheet_name,
             "signature": signature,
@@ -4955,6 +5008,55 @@ def _read_xlsx_rows_with_openpyxl(path: Path, sheet_name: str) -> list[list[str]
         ]
     finally:
         workbook.close()
+
+
+def _xlsx_sheet_names(path: Path) -> list[str]:
+    """Blattnamen in Dateireihenfolge per billigem Zip-Blick auf xl/workbook.xml
+    (ohne openpyxl, ~2 ms); leere Liste, wenn die Datei kein lesbares XLSX-Paket ist."""
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            workbook_xml = archive.read("xl/workbook.xml")
+        return [sheet.get("name") or "" for sheet in ET.fromstring(workbook_xml).iter(f"{{{_XLSX_MAIN_NS}}}sheet")]
+    except Exception:
+        return []
+
+
+def _workbook_first_sheet_raw_rows(path: Path) -> list[list[str]]:
+    """Rohzeilen des ersten Blatts (inkl. Kopfzeile) fuer Dateien ohne festen
+    Blattnamen, etwa im Import-Ordner - ueber dieselben Caches wie
+    _workbook_raw_rows. Ohne lesbares Paket uebernimmt openpyxl und liefert
+    seine gewohnte Fehlermeldung."""
+    sheet_names = _xlsx_sheet_names(path)
+    if not sheet_names:
+        return _read_xlsx_rows_with_openpyxl(path, "")
+    return _workbook_raw_rows(path, sheet_names[0])
+
+
+def _workbook_holds_sheet(path: Path, sheet_name: str) -> bool:
+    """True, wenn die Datei ein Blatt mit genau diesem Namen enthaelt. Das
+    Ergebnis wird je Dateistand gemerkt, damit der Zip-Blick nicht bei jedem
+    Live-Speichern anfaellt."""
+    key = _workbook_cache_key(path)
+    signature = _workbook_signature(path)
+    if signature is None:
+        return False
+    with _WORKBOOK_ROW_CACHE_LOCK:
+        if _WORKBOOK_SHEET_VERIFIED.get(key) == (signature, sheet_name):
+            return True
+    if sheet_name not in _xlsx_sheet_names(path):
+        return False
+    if _workbook_signature(path) == signature:
+        _remember_workbook_sheet(key, signature, sheet_name)
+    return True
+
+
+def _remember_workbook_sheet(key: str, signature: tuple[int, int], sheet_name: str) -> None:
+    with _WORKBOOK_ROW_CACHE_LOCK:
+        if len(_WORKBOOK_SHEET_VERIFIED) >= _WORKBOOK_ROW_CACHE_MAX_ENTRIES * 4:
+            _WORKBOOK_SHEET_VERIFIED.clear()
+        _WORKBOOK_SHEET_VERIFIED[key] = (signature, sheet_name)
 
 
 def _xlsx_column_index(letters: str) -> int:
@@ -5407,8 +5509,11 @@ def _write_xlsx_fast(path: Path, sheet_name: str, headers: list[str], rows: list
         cached_row: list[str] = []
         # Verbotene Zeichen einmal je Zeile suchen statt je Zelle - die
         # Regex-Suche pro Zelle war der teuerste Einzelposten beim Schreiben.
+        # Ist die ganze Zeile laenger als eine Zelle sein darf, koennte eine
+        # Zelle ueber der Hoechstlaenge liegen: dann ebenfalls Zelle fuer Zelle.
         try:
-            sanitize_cells = _EXCEL_ILLEGAL_CHARACTERS_RE.search("".join(row)) is not None
+            joined = "".join(row)
+            sanitize_cells = len(joined) > EXCEL_CELL_MAX_LENGTH or _EXCEL_ILLEGAL_CHARACTERS_RE.search(joined) is not None
         except TypeError:
             sanitize_cells = True  # nicht nur Strings: Zelle fuer Zelle pruefen
         for column_index, raw_value in enumerate(row):
@@ -5500,24 +5605,41 @@ def _workbook_already_holds(path: Path, sheet_name: str, headers: list[str], row
     raw_rows = _workbook_raw_rows(path, sheet_name)
     if len(raw_rows) != len(rows) + 1 or raw_rows[0] != list(headers):
         return False
-    return all(existing == new for existing, new in zip(raw_rows[1:], rows))
+    for existing, new in zip(raw_rows[1:], rows):
+        # Der Cache haelt die Zeilen so, wie sie geschrieben wurden (ohne
+        # verbotene Zeichen, auf Zellenlaenge gekuerzt) - erst bei einem
+        # Unterschied lohnt der Vergleich mit der bereinigten neuen Zeile.
+        if existing != new and existing != [_sanitize_cell_value(cell) for cell in new]:
+            return False
+    # Gleiche Zeilen, aber unter einem anderen Blattnamen (in Excel umbenannt,
+    # aus einem anderen Werkzeug): der Leser hat dann ueber openpyxl das aktive
+    # Blatt geliefert. Die Datei wird trotzdem neu geschrieben, damit sie den
+    # Blattnamen der Dateispezifikation bekommt und wieder im schnellen
+    # Lesepfad liegt - so wie vor dem Zeilen-Cache jedes Speichern den Namen
+    # normalisiert hat.
+    return _workbook_holds_sheet(path, sheet_name)
 
 
 def write_workbook(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> None:
     key = _workbook_cache_key(path)
     with _workbook_file_lock(key):
         written_rows: list[list[str]] | None = None
+        written = False
         try:
             try:
                 written_rows = _write_xlsx_fast(path, sheet_name, headers, rows)
             except _FastXlsxUnsupported:
                 _write_workbook_with_openpyxl(path, sheet_name, headers, rows)
+            written = True
         finally:
             signature = _workbook_signature(path)
             if written_rows is None or signature is None:
                 _forget_workbook_rows(key)
             else:
                 _remember_workbook_rows(key, signature, sheet_name, written_rows, dirty=True)
+            if written and signature is not None:
+                # Beide Schreiber legen das Blatt unter dem gewuenschten Namen an.
+                _remember_workbook_sheet(key, signature, sheet_name)
 
 
 def write_workbook_with_fallback(
