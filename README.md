@@ -95,10 +95,12 @@ Die GenArt wird nach dem Laden bewusst nicht automatisch gesetzt, sondern manuel
 
 Die bisherige reine Text-Vorschau wurde durch ein `Artikelverzeichnis` ersetzt. Dort werden nur Artikel aus den aktuellen Output-Dateien tabellarisch gelistet.
 
-- Artikel koennen per Button oder Doppelklick wieder in die Maske geladen werden
+- Suchfeld ueber der Tabelle: mehrere Begriffe mit Leerzeichen trennen, alle muessen vorkommen (Artikelnummer, Kurz-/Text-ID, GenArt, Kurzbezeichnungen aller Sprachen, deutscher Text, OE-/Vergleichsnummern samt Hersteller, Suchwoerter); Treffer-Zaehler, `Enter` waehlt einen eindeutigen Treffer, `Esc` oder `Leeren` setzt zurueck
+- Artikel koennen per Button oder Doppelklick wieder in die Maske geladen werden; der Wechsel blockiert die Oberflaeche nicht mehr (Bild-, PDF- und Video-Vorschauen laden im Hintergrund, die Liste wird nur bei geaenderten Dateien neu aufgebaut)
 - fuer jeden Artikel werden Quelle, IDs und Medienanzahlen angezeigt
 - rechts werden alle aktuell in den Export-Excel-Dateien vorhandenen Daten des markierten Artikels angezeigt
 - Bilder zeigen ein Thumbnail, Dokumente bei PDFs die erste Seite und sonst eine kompakte Dateivorschau
+- Web Links zeigen Host-Badge und Seitentitel; der Webseiten-Screenshot (Playwright) wird nur noch auf Knopfdruck `Webseiten-Vorschau laden` erzeugt und dann zwischengespeichert
 
 ## Listenimport CSV/XLSX
 
