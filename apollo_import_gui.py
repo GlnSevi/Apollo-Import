@@ -5710,6 +5710,61 @@ class MultiLineTranslationFrame(ttk.LabelFrame):
         self._toggle_uni_state()
 
 
+PREVIEW_THUMBNAIL_SIZE = (260, 180)
+PREVIEW_LOADING_TEXT = "Vorschau wird geladen…"
+
+
+class PreviewLoader:
+    """Fuehrt Vorschau-Arbeit (Downloads, PDF-Rendering, Screenshots) in einem
+    Hintergrund-Thread aus und liefert das Ergebnis im UI-Thread ab.
+
+    Frueher liefen diese Downloads synchron beim Befuellen der Medien-Tabellen,
+    d. h. jeder Artikelwechsel blockierte die Oberflaeche fuer mehrere Sekunden.
+    Jede neue Anfrage erhoeht die Generation; Ergebnisse aelterer Anfragen werden
+    verworfen, damit beim schnellen Durchklicken nie eine veraltete Vorschau
+    "nachklappt". Tk-Objekte (PhotoImage) werden ausschliesslich im UI-Thread
+    erzeugt, der Worker liefert nur PIL-Bilder bzw. Rohdaten.
+    """
+
+    def __init__(self, widget: tk.Misc) -> None:
+        self.widget = widget
+        self.generation = 0
+
+    def cancel(self) -> None:
+        self.generation += 1
+
+    def submit(
+        self,
+        work: Callable[[], object],
+        on_done: Callable[[object | None, Exception | None], None],
+    ) -> None:
+        self.generation += 1
+        generation = self.generation
+
+        def run() -> None:
+            result: object | None = None
+            error: Exception | None = None
+            try:
+                result = work()
+            except Exception as exc:  # pragma: no cover - Vorschau darf nie die App kippen
+                error = exc
+            if generation != self.generation:
+                return
+
+            def deliver() -> None:
+                if generation != self.generation:
+                    return
+                on_done(result, error)
+
+            try:
+                self.widget.after(0, deliver)
+            except Exception:
+                # Fenster bereits geschlossen oder keine Ereignisschleife mehr.
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+
 class MediaTableFrame(ttk.LabelFrame):
     def __init__(
         self,
@@ -5735,6 +5790,7 @@ class MediaTableFrame(ttk.LabelFrame):
         self.preview_photo: object | None = None
         self.preview_bytes_cache: dict[str, bytes] = {}
         self.pdf_preview_cache: dict[str, bytes] = {}
+        self.preview_loader = PreviewLoader(self)
         self.inline_editor: ttk.Entry | None = None
         self.inline_editor_item = ""
         self.inline_editor_column = ""
@@ -5913,6 +5969,7 @@ class MediaTableFrame(ttk.LabelFrame):
         self._handle_selection()
 
     def _reset_preview(self) -> None:
+        self.preview_loader.cancel()
         self.preview_photo = None
         self.preview_title_var.set("Keine Auswahl")
         self.preview_meta_var.set("Wähle eine Zeile aus, um mehr Details zu sehen.")
@@ -5922,9 +5979,31 @@ class MediaTableFrame(ttk.LabelFrame):
         self.set_preview_visible(not self.preview_visible)
 
     def set_preview_visible(self, visible: bool) -> None:
+        was_visible = self.preview_visible
         self.preview_visible = bool(visible)
         self.preview_toggle_var.set("Vorschau ausblenden" if self.preview_visible else "Vorschau einblenden")
         self._apply_responsive_layout()
+        # Bei ausgeblendeter Vorschau wird nichts geladen; beim Einblenden die
+        # Vorschau der aktuellen Zeile nachholen.
+        if self.preview_visible and not was_visible and self.tree.selection():
+            self._handle_selection()
+
+    def _show_preview_text(self, text: str) -> None:
+        self.preview_photo = None
+        self.preview_visual.configure(text=text, image="", font=(UI_FONT_FAMILY, 10), wraplength=220, justify="center")
+
+    def _show_loaded_preview(self, image: object | None, error: Exception | None, error_label: str) -> None:
+        """Nimmt das im Hintergrund geladene PIL-Bild entgegen (laeuft im UI-Thread)."""
+        if error is None and image is not None:
+            try:
+                photo = ImageTk.PhotoImage(image)
+            except Exception as exc:  # pragma: no cover - exotische Bildformate
+                error = exc
+            else:
+                self.preview_photo = photo
+                self.preview_visual.configure(image=photo, text="")
+                return
+        self._show_preview_text(f"{error_label}\n{error}" if error is not None else error_label)
 
     def _handle_resize(self, _event: tk.Event[tk.Misc]) -> None:
         if self._layout_after_id is not None:
@@ -6055,6 +6134,8 @@ class MediaTableFrame(ttk.LabelFrame):
         self.inline_editor_column = ""
 
     def _update_preview(self, path_or_link: str, art: str, sprache: str) -> None:
+        # Laufende Hintergrund-Ladevorgaenge gehoeren zur vorherigen Zeile.
+        self.preview_loader.cancel()
         parsed = urlparse(path_or_link)
         raw_name = unquote(parsed.path if parsed.scheme else path_or_link)
         name = Path(raw_name).name or path_or_link
@@ -6091,17 +6172,31 @@ class MediaTableFrame(ttk.LabelFrame):
             self.preview_visual.configure(text="Pillow für Bildvorschau installieren", image="", wraplength=220, justify="center")
             return
 
-        try:
-            image = self._load_preview_image(path_or_link)
-        except Exception as exc:  # pragma: no cover - user-specific preview issues
-            self.preview_photo = None
-            self.preview_visual.configure(text=f"Keine Bildvorschau verfügbar\n{exc}", image="", wraplength=220, justify="center")
+        if not self.preview_visible:
+            self.preview_loader.cancel()
+            self._show_preview_text("Vorschau ausgeblendet")
             return
 
-        image.thumbnail((260, 180))
-        photo = ImageTk.PhotoImage(image)
-        self.preview_photo = photo
-        self.preview_visual.configure(image=photo, text="")
+        def load_thumbnail() -> object:
+            image = self._load_preview_image(path_or_link)
+            image.thumbnail(PREVIEW_THUMBNAIL_SIZE)
+            return image
+
+        # Bereits geladene Bilder sofort zeigen; alles andere (Download vom
+        # Server oder Netzlaufwerk) laeuft im Hintergrund, damit der
+        # Artikelwechsel nicht auf die Bildvorschau warten muss.
+        if path_or_link.strip() in self.preview_bytes_cache:
+            try:
+                self._show_loaded_preview(load_thumbnail(), None, "Keine Bildvorschau verfügbar")
+            except Exception as exc:  # pragma: no cover - user-specific preview issues
+                self._show_loaded_preview(None, exc, "Keine Bildvorschau verfügbar")
+            return
+
+        self._show_preview_text(PREVIEW_LOADING_TEXT)
+        self.preview_loader.submit(
+            load_thumbnail,
+            lambda image, error: self._show_loaded_preview(image, error, "Keine Bildvorschau verfügbar"),
+        )
 
     def _update_document_preview(self, path_or_link: str, art: str, sprache: str, extension: str) -> None:
         self.preview_meta_var.set(
@@ -6132,17 +6227,30 @@ class MediaTableFrame(ttk.LabelFrame):
             self.preview_visual.configure(text="PyMuPDF für PDF-Vorschau installieren", image="", wraplength=220, justify="center")
             return
 
-        try:
-            image = self._render_pdf_preview(path_or_link)
-        except Exception as exc:  # pragma: no cover - environment-specific PDF issues
-            self.preview_photo = None
-            self.preview_visual.configure(text=f"Keine PDF-Vorschau verfügbar\n{exc}", image="", wraplength=220, justify="center")
+        if not self.preview_visible:
+            self.preview_loader.cancel()
+            self._show_preview_text("Vorschau ausgeblendet")
             return
 
-        image.thumbnail((260, 180))
-        photo = ImageTk.PhotoImage(image)
-        self.preview_photo = photo
-        self.preview_visual.configure(image=photo, text="")
+        def render_thumbnail() -> object:
+            image = self._render_pdf_preview(path_or_link)
+            image.thumbnail(PREVIEW_THUMBNAIL_SIZE)
+            return image
+
+        # Gerenderte Seiten kommen aus dem Cache; PDF-Download und Rendering
+        # laufen im Hintergrund (siehe PreviewLoader).
+        if path_or_link.strip() in self.pdf_preview_cache:
+            try:
+                self._show_loaded_preview(render_thumbnail(), None, "Keine PDF-Vorschau verfügbar")
+            except Exception as exc:  # pragma: no cover - environment-specific PDF issues
+                self._show_loaded_preview(None, exc, "Keine PDF-Vorschau verfügbar")
+            return
+
+        self._show_preview_text(PREVIEW_LOADING_TEXT)
+        self.preview_loader.submit(
+            render_thumbnail,
+            lambda image, error: self._show_loaded_preview(image, error, "Keine PDF-Vorschau verfügbar"),
+        )
 
     def _load_preview_image(self, path_or_link: str) -> object:
         data = self._load_preview_bytes(path_or_link)
@@ -6209,6 +6317,9 @@ class LinkTableFrame(ttk.LabelFrame):
         self.remote_image_cache: dict[str, bytes] = {}
         self.web_preview_cache: dict[str, tuple[bytes, str]] = {}
         self.page_title_cache: dict[str, str] = {}
+        self.preview_loader = PreviewLoader(self)
+        self.current_preview_link = ""
+        self.web_preview_button: ttk.Button | None = None
         self.preview_visible = True
         self.preview_toggle_var = tk.StringVar(value="Vorschau ausblenden")
         self.compact_preview_layout: bool | None = None
@@ -6264,6 +6375,17 @@ class LinkTableFrame(ttk.LabelFrame):
         ttk.Label(preview_frame, textvariable=self.preview_meta_var, foreground="#5E6472", wraplength=250, justify="left").grid(
             row=2, column=0, sticky="w"
         )
+        if preview_kind == "web":
+            # Der Webseiten-Screenshot (headless Chromium) kostet 7-10 s und lief
+            # frueher bei jedem Artikelwechsel automatisch. Jetzt nur auf Wunsch.
+            self.web_preview_button = ttk.Button(
+                preview_frame,
+                text="Webseiten-Vorschau laden",
+                command=self.load_web_preview_on_demand,
+                state="disabled",
+            )
+            self.web_preview_button.grid(row=3, column=0, sticky="w", pady=(10, 0))
+            self.preview_visual.bind("<Button-1>", lambda _event: self.load_web_preview_on_demand())
         self._reset_preview()
         self.bind("<Configure>", self._handle_resize)
         self.after_idle(self._apply_responsive_layout)
@@ -6420,18 +6542,45 @@ class LinkTableFrame(ttk.LabelFrame):
         self._handle_selection()
 
     def _reset_preview(self) -> None:
+        self.preview_loader.cancel()
+        self.current_preview_link = ""
         self.preview_photo = None
         self.preview_title_var.set("Keine Auswahl")
         self.preview_meta_var.set("Wähle eine Zeile aus, um mehr Details zu sehen.")
         self.preview_visual.configure(text="Keine Vorschau", image="", wraplength=220, justify="center")
+        if self.web_preview_button is not None:
+            self.web_preview_button.configure(state="disabled")
 
     def toggle_preview(self) -> None:
         self.set_preview_visible(not self.preview_visible)
 
     def set_preview_visible(self, visible: bool) -> None:
+        was_visible = self.preview_visible
         self.preview_visible = bool(visible)
         self.preview_toggle_var.set("Vorschau ausblenden" if self.preview_visible else "Vorschau einblenden")
         self._apply_responsive_layout()
+        # Bei ausgeblendeter Vorschau wird nichts geladen; beim Einblenden die
+        # Vorschau der aktuellen Zeile nachholen.
+        if self.preview_visible and not was_visible and self.tree.selection():
+            self._handle_selection()
+
+    def _show_preview_text(self, text: str) -> None:
+        self.preview_photo = None
+        self.preview_visual.configure(text=text, image="", font=(UI_FONT_FAMILY, 10), wraplength=220, justify="center")
+
+    def _show_preview_badge(self, badge: str, size: int) -> None:
+        self.preview_photo = None
+        self.preview_visual.configure(text=badge, image="", font=("Segoe UI Semibold", size), wraplength=220, justify="center")
+
+    def _show_preview_image(self, image: object, fallback_badge: str, badge_size: int) -> None:
+        """Zeigt ein PIL-Bild in der Vorschau (laeuft im UI-Thread); bei Fehlern das Badge."""
+        try:
+            photo = ImageTk.PhotoImage(image)
+        except Exception:  # pragma: no cover - exotische Bildformate
+            self._show_preview_badge(fallback_badge, badge_size)
+            return
+        self.preview_photo = photo
+        self.preview_visual.configure(image=photo, text="")
 
     def _handle_resize(self, _event: tk.Event[tk.Misc]) -> None:
         if self._layout_after_id is not None:
@@ -6465,6 +6614,8 @@ class LinkTableFrame(ttk.LabelFrame):
             self._last_link_column_width = link_width
 
     def _update_preview(self, link: str) -> None:
+        # Laufende Hintergrund-Ladevorgaenge gehoeren zur vorherigen Zeile.
+        self.preview_loader.cancel()
         parsed = urlparse(link)
         host = parsed.netloc.lower().removeprefix("www.") if parsed.netloc else "-"
         path = unquote(parsed.path or "/")
@@ -6481,43 +6632,108 @@ class LinkTableFrame(ttk.LabelFrame):
         self.preview_meta_var.set(f"Host: {host or '-'}\nPfad: {path or '/'}\nLink: {link}")
 
         if not video_id or Image is None or ImageTk is None:
-            self.preview_photo = None
-            self.preview_visual.configure(text="VIDEO", image="", font=("Segoe UI Semibold", 18), wraplength=220, justify="center")
+            self._show_preview_badge("VIDEO", 18)
+            return
+
+        if not self.preview_visible:
+            self._show_preview_text("Vorschau ausgeblendet")
             return
 
         thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-        try:
+
+        def load_thumbnail() -> object:
             image = self._load_remote_image(thumbnail_url)
-        except Exception:  # pragma: no cover - preview only
-            self.preview_photo = None
-            self.preview_visual.configure(text="VIDEO", image="", font=("Segoe UI Semibold", 18), wraplength=220, justify="center")
+            image.thumbnail(PREVIEW_THUMBNAIL_SIZE)
+            return image
+
+        def show(image: object | None, error: Exception | None) -> None:
+            if error is not None or image is None:
+                self._show_preview_badge("VIDEO", 18)
+                return
+            self._show_preview_image(image, "VIDEO", 18)
+
+        # Bekannte Thumbnails sofort zeigen, neue im Hintergrund laden.
+        if thumbnail_url in self.remote_image_cache:
+            try:
+                show(load_thumbnail(), None)
+            except Exception as exc:  # pragma: no cover - preview only
+                show(None, exc)
             return
 
-        image.thumbnail((260, 180))
-        photo = ImageTk.PhotoImage(image)
-        self.preview_photo = photo
-        self.preview_visual.configure(image=photo, text="")
+        self._show_preview_text(PREVIEW_LOADING_TEXT)
+        self.preview_loader.submit(load_thumbnail, show)
 
     def _update_web_preview(self, link: str, host: str, path: str) -> None:
-        title = self._fetch_page_title(link)
-        self.preview_title_var.set(title or host or "Web-Link")
+        parsed = urlparse(link)
+        is_http_link = parsed.scheme in {"http", "https"}
+        self.current_preview_link = link
+        cached_title = self.page_title_cache.get(link)
+        self.preview_title_var.set(cached_title or host or "Web-Link")
         self.preview_meta_var.set(f"Host: {host or '-'}\nPfad: {path or '/'}\nLink: {link}")
-        if Image is not None and ImageTk is not None:
+        if self.web_preview_button is not None:
+            can_render = is_http_link and Image is not None and ImageTk is not None
+            self.web_preview_button.configure(state="normal" if can_render else "disabled")
+
+        # Ein bereits aufgenommener Screenshot wird sofort gezeigt. Neue
+        # Screenshots nur auf Wunsch (Button bzw. Klick auf die Vorschau), weil
+        # der headless Browser pro Seite 7-10 s braucht und das frueher jeden
+        # Artikelwechsel blockiert hat.
+        cached = self.web_preview_cache.get(link)
+        if cached is not None and Image is not None and ImageTk is not None:
+            screenshot_bytes, page_title = cached
             try:
-                image, page_title = self._render_web_preview(link)
+                image = Image.open(io.BytesIO(screenshot_bytes))
+                image.thumbnail(PREVIEW_THUMBNAIL_SIZE)
                 if page_title:
                     self.preview_title_var.set(page_title)
-                image.thumbnail((260, 180))
-                photo = ImageTk.PhotoImage(image)
-                self.preview_photo = photo
-                self.preview_visual.configure(image=photo, text="")
+                self._show_preview_image(image, (host or "LINK").upper(), 16)
                 return
             except Exception:  # pragma: no cover - preview only
                 pass
 
-        badge = (host or "LINK").upper()
-        self.preview_photo = None
-        self.preview_visual.configure(text=badge, image="", font=("Segoe UI Semibold", 16), wraplength=220, justify="center")
+        self._show_preview_badge((host or "LINK").upper(), 16)
+
+        # Nur der Seitentitel wird im Hintergrund nachgeladen (eine kleine
+        # HTTP-Anfrage), nicht der Screenshot.
+        if is_http_link and cached_title is None and self.preview_visible:
+
+            def apply_title(title: object | None, error: Exception | None) -> None:
+                if error is None and title:
+                    self.preview_title_var.set(str(title))
+
+            self.preview_loader.submit(lambda: self._fetch_page_title(link), apply_title)
+
+    def load_web_preview_on_demand(self) -> None:
+        """Nimmt den Webseiten-Screenshot im Hintergrund auf (Button bzw. Klick auf die Vorschau)."""
+        link = self.current_preview_link
+        parsed = urlparse(link)
+        if parsed.scheme not in {"http", "https"} or Image is None or ImageTk is None:
+            return
+        if not self.preview_visible:
+            return
+
+        self._show_preview_text(PREVIEW_LOADING_TEXT)
+        if self.web_preview_button is not None:
+            self.web_preview_button.configure(state="disabled")
+
+        def render() -> object:
+            image, title = self._render_web_preview(link)
+            image.thumbnail(PREVIEW_THUMBNAIL_SIZE)
+            return image, title
+
+        def show(result: object | None, error: Exception | None) -> None:
+            if self.web_preview_button is not None:
+                self.web_preview_button.configure(state="normal")
+            host = parsed.netloc.lower().removeprefix("www.") if parsed.netloc else ""
+            if error is not None or result is None:
+                self._show_preview_badge((host or "LINK").upper(), 16)
+                return
+            image, title = result  # type: ignore[misc]
+            if title:
+                self.preview_title_var.set(str(title))
+            self._show_preview_image(image, (host or "LINK").upper(), 16)
+
+        self.preview_loader.submit(render, show)
 
     def _load_remote_image(self, url: str) -> object:
         cached = self.remote_image_cache.get(url)
@@ -9358,6 +9574,8 @@ class ApolloImportApp:
         self.attribute_mapping: dict[str, str] = {}
         self.article_browser_cache_dir = ""
         self.article_browser_cache_signature: tuple[tuple[str, int, int], ...] | None = None
+        # Datenstand, den die Artikelliste zuletzt gezeichnet hat (siehe _article_browser_render_key).
+        self.article_browser_rendered_key: tuple[tuple[str, int], ...] | None = None
         self.live_write_suspended = False
         self.article_browser_context_menu: tk.Menu | None = None
         self.background_task_running = False
@@ -12658,8 +12876,10 @@ if ($copied) {{
         selected_article = current_article or (self.article_browser_tree.selection()[0] if self.article_browser_tree.selection() else "")
         selected_article = normalize_article_number(selected_article) or normalize_article_number(self.article_number_var.get())
 
-        for item_id in self.article_browser_tree.get_children():
-            self.article_browser_tree.delete(item_id)
+        # Merken, welchen Datenstand die Liste zeigt (siehe _refresh_article_browser).
+        self.article_browser_rendered_key = self._article_browser_render_key()
+        # Ein Aufruf statt ~3.800 Einzel-Deletes (0,6 s -> wenige ms).
+        self.article_browser_tree.delete(*self.article_browser_tree.get_children())
 
         for article_number in sorted(self.article_browser_records):
             snapshot = self.article_browser_records[article_number]
@@ -13015,6 +13235,7 @@ if ($copied) {{
 
         self.id_registry.remember_article_ids(bundle.article_number, bundle.short_module_id, bundle.long_module_id)
         self._upsert_article_browser_section(section, bundle, output_root)
+        self._mark_article_browser_in_sync(output_root)
         self.status_var.set(status_message or f"Live gespeichert: {bundle.article_number}")
         return True
 
@@ -13036,6 +13257,7 @@ if ($copied) {{
 
         self.id_registry.remember_article_ids(bundle.article_number, bundle.short_module_id, bundle.long_module_id)
         self._upsert_article_browser_from_bundle(bundle, output_root)
+        self._mark_article_browser_in_sync(output_root)
         self.status_var.set(status_message or f"Live gespeichert: {bundle.article_number}")
         return True
 
@@ -14233,7 +14455,15 @@ if ($copied) {{
                 self.article_browser_cache_dir == str(output_folder)
                 and self.article_browser_cache_signature == signature
             ):
-                self._render_article_browser()
+                # Auf der Platte hat sich nichts geaendert. Die Liste nur neu
+                # aufbauen, wenn sich die Datensaetze seit dem letzten Aufbau
+                # geaendert haben (z. B. Live-Upsert); sonst reicht der Abgleich
+                # von Auswahl und Detailansicht. Der komplette Neuaufbau der
+                # ~3.800 Zeilen kostete sonst bei jedem Artikelwechsel ~0,5 s.
+                if self._article_browser_render_key() == self.article_browser_rendered_key:
+                    self._sync_article_browser_selection()
+                else:
+                    self._render_article_browser()
                 return
             records = load_article_snapshots_from_folder(
                 output_folder,
@@ -14249,6 +14479,48 @@ if ($copied) {{
         self.article_browser_cache_dir = str(output_folder)
         self.article_browser_cache_signature = signature
         self._render_article_browser()
+
+    def _article_browser_render_key(self) -> tuple[tuple[str, int], ...]:
+        """Kennung des Datenstands der Artikelliste.
+
+        Jeder Upsert ersetzt den Snapshot eines Artikels durch ein neues Objekt
+        (siehe _copy_snapshot/_snapshot_from_bundle), daher reicht die Objekt-
+        Identitaet je Artikel, um "seit dem letzten Aufbau geaendert" zu erkennen.
+        """
+        return tuple((article_number, id(snapshot)) for article_number, snapshot in self.article_browser_records.items())
+
+    def _sync_article_browser_selection(self) -> None:
+        """Gleicht Auswahl und Detailansicht ab, ohne die Liste neu aufzubauen."""
+        selection = self.article_browser_tree.selection()
+        selected_article = normalize_article_number(selection[0]) if selection else ""
+        selected_article = selected_article or normalize_article_number(self.article_number_var.get())
+        if (
+            selected_article
+            and selected_article in self.article_browser_records
+            and self.article_browser_tree.exists(selected_article)
+        ):
+            if tuple(selection) != (selected_article,):
+                self.article_browser_tree.selection_set(selected_article)
+                self.article_browser_tree.focus(selected_article)
+            self._update_article_browser_detail(self.article_browser_records[selected_article])
+        else:
+            self._update_article_browser_detail(None)
+
+    def _mark_article_browser_in_sync(self, output_root: Path) -> None:
+        """Nach einem Live-Schreiben entspricht die Artikelliste dem Output-Ordner.
+
+        Die Upsert-Methoden setzen die Ordner-Signatur auf None, was beim
+        naechsten refresh_preview() ein komplettes Neuladen aller Excel-Dateien
+        erzwingt (~2-3 s vom Netzlaufwerk - bei jedem Artikelwechsel nach einer
+        Aenderung). Der Eintrag wurde aber bereits im Speicher aktualisiert, also
+        reicht es, die jetzt gueltige Signatur zu merken. Aenderungen von aussen
+        erkennt die Signatur weiterhin.
+        """
+        try:
+            self.article_browser_cache_dir = str(output_root)
+            self.article_browser_cache_signature = self._build_output_folder_signature(output_root)
+        except OSError:
+            self.article_browser_cache_signature = None
 
     def _update_article_browser_detail(self, snapshot: StoredArticleSnapshot | None) -> None:
         self.article_browser_detail.configure(state="normal")
@@ -14323,7 +14595,10 @@ if ($copied) {{
             messagebox.showwarning(APP_TITLE, "Der ausgewählte Artikel konnte nicht geladen werden.")
             return
 
-        self._apply_article_snapshot(snapshot)
+        # Beim Befuellen der Maske darf kein Live-Schreiben auf das Netzlaufwerk
+        # ausgeloest werden (der Batch-Pfad macht das genauso).
+        with self._suspend_live_write():
+            self._apply_article_snapshot(snapshot)
         self.refresh_preview()
 
     def _on_article_browser_select(self, _event: tk.Event[tk.Misc]) -> None:
