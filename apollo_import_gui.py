@@ -5580,9 +5580,35 @@ def _write_xlsx_fast(path: Path, sheet_name: str, headers: list[str], rows: list
         archive.writestr("xl/styles.xml", _XLSX_STYLES)
         archive.writestr("xl/theme/theme1.xml", theme_xml)
         archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
-    with open(path, "wb") as handle:
-        handle.write(buffer.getbuffer())
+    # getvalue() statt getbuffer(): ein offener memoryview-Export hielte im
+    # Fehlerpfad (Ziel gesperrt) den BytesIO fest und loest beim Aufraeumen
+    # einen BufferError aus; die Kopie kostet bei 0,5 MB nichts.
+    _replace_file_atomically(path, buffer.getvalue())
     return cached_rows
+
+
+def _workbook_temp_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.tmp")
+
+
+def _replace_file_atomically(path: Path, payload: bytes) -> None:
+    """Schreibt erst eine Temp-Datei im Zielordner und tauscht sie dann per os.replace ein.
+
+    Damit bleibt die alte Datei vollstaendig erhalten, wenn das Ziel gesperrt ist
+    (Excel haelt den Share-Mode, andere Programme setzen Byte-Range-Sperren):
+    vorher konnte open(path, "wb") die Datei auf 0 Byte kuerzen und der
+    anschliessende Schreibvorgang scheitern - zurueck blieb ein kaputtes Paket."""
+    temp_path = _workbook_temp_path(path)
+    try:
+        with open(temp_path, "wb") as handle:
+            handle.write(payload)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def _write_workbook_with_openpyxl(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> None:
@@ -5592,7 +5618,17 @@ def _write_workbook_with_openpyxl(path: Path, sheet_name: str, headers: list[str
     worksheet.append([_sanitize_cell_value(header) for header in headers])
     for row in rows:
         worksheet.append([_sanitize_cell_value(cell) for cell in row])
-    workbook.save(path)
+    # Gleiche Atomaritaet wie im schnellen Schreiber: nie eine halb geschriebene Zieldatei.
+    temp_path = _workbook_temp_path(path)
+    try:
+        workbook.save(temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def _workbook_already_holds(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> bool:
