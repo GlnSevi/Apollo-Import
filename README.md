@@ -31,7 +31,7 @@ Alternativ unter Windows:
   - optional liest eine Claude-KI zusaetzlich Fliesstext und PDF-Dokumente aus
   - sichere, gegen die Stammdaten validierte Treffer werden automatisch uebernommen; unsichere landen im Bestaetigungsdialog
 - Suchwoerter pro Artikel pflegen
-  - werden beim Export als Attribut `Zusatzbezeichnung` (TecDoc Kriterien ID `9595`) in die `Attribute.xlsx` geschrieben, eine Zeile pro Suchwort
+  - werden beim Export als Referenz vom Typ `Gebrauchsnummer` (TecDoc ID `2`) in die `Gebrauchsnummern.xlsx` geschrieben, eine Zeile pro Suchwort
 - OE-Nummern als freie Referenzen pro Artikel pflegen
 - Vergleichsnummern mit Mitbewerber-ID pro Artikel pflegen
 - Mitbewerber aus `KHer.csv` nachschlagen und direkt in Vergleichsnummern uebernehmen
@@ -194,15 +194,15 @@ Die KI erhaelt den Produkttext als reinen Inhalt und darf nur Attribute aus der 
 
 ## Suchwoerter
 
-Apollo kennt keine nativen Keywords oder Suchbegriffe. Im Tab `Suchwoerter` koennen deshalb pro Artikel freie Suchbegriffe gepflegt werden, die beim Export als Attribut mitgeschrieben werden:
+Suchwoerter sind in Apollo Referenzen vom Typ `Gebrauchsnummer` (Reiter `Referenzen`, Typ mit TecDoc ID `2`); das Suchwort steht als Freitext in der Spalte `Nummer`. Im Tab `Suchwoerter` koennen deshalb pro Artikel freie Suchbegriffe gepflegt werden, die beim Export in eine eigene Referenzdatei geschrieben werden:
 
-- jedes Suchwort wird eine eigene Zeile in `Attribute.xlsx`
-- `TecDoc Kriterien ID` = `9595`, `Attribut Bezeichnung` = `Zusatzbezeichnung`, `Format` = `Alphanumerisch`
-- maximal 20 Zeichen pro Suchwort (Vorgabe aus den Attribut-Stammdaten); laengere Eingaben werden abgewiesen
+- jedes Suchwort wird eine eigene Zeile in `Gebrauchsnummern.xlsx`
+- Spalten: `Artikelnummer`, `TecDoc ID` = `2`, `Gebrauchsnummer` = Suchwort (gleicher Aufbau wie `OE-Nummern.xlsx`, nur ohne Hersteller-ID)
+- maximal 50 Zeichen pro Suchwort; laengere Eingaben werden abgewiesen
 - mehrere Suchwoerter koennen mit `;` getrennt auf einmal eingegeben werden
-- Duplikate werden automatisch ignoriert, auch gegenueber manuell gepflegten `9595`-Zeilen im Attribute-Tab
+- Duplikate werden automatisch ignoriert
 
-Beim erneuten Laden eines Artikels aus den Output-Dateien werden `9595`-Zeilen automatisch wieder dem Tab `Suchwoerter` zugeordnet (nicht dem Attribute-Tab).
+Bis v0.1.31 wurden Suchwoerter faelschlich als Attribut `Zusatzbezeichnung` (Kriterien ID `9595`) in die `Attribute.xlsx` geschrieben. Solche Altzeilen werden beim Laden aus den Output-Dateien weiterhin als Suchwoerter erkannt und beim naechsten Speichern des Artikels nach `Gebrauchsnummern.xlsx` ueberfuehrt; aus der `Attribute.xlsx` verschwinden sie dabei.
 
 ## TecDoc Anhangsformattyp ID
 
@@ -241,6 +241,7 @@ Die GUI erzeugt aktuell diese Dateien:
 - `Attribute.xlsx`
 - `OE-Nummern.xlsx`
 - `Vergleichsnummern.xlsx`
+- `Gebrauchsnummern.xlsx`
 - `Fahrzeugverknuepfungen.xlsx`
 - `Bilder.xlsx`
 - `Dokumente.xlsx`

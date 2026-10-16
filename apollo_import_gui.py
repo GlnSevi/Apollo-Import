@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - optionale KI-Funktion
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.31"
+APP_VERSION = "0.1.32"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -259,6 +259,8 @@ WEB_LINK_FILE = ("Web Link.xlsx", "Tabelle1")
 GENART_FILE = ("GenArt_Artikel.xlsx", "GenArt")
 OE_FILE = ("OE-Nummern.xlsx", "Sheet1")
 COMPARISON_FILE = ("Vergleichsnummern.xlsx", "Sheet1")
+# Suchwörter = Referenzen vom Typ "Gebrauchsnummer" (TecDoc ID 2), Freitext in "Nummer".
+USAGE_NUMBER_FILE = ("Gebrauchsnummern.xlsx", "Sheet1")
 ATTRIBUTE_FILE = ("Attribute.xlsx", "Sheet1")
 VEHICLE_LINK_FILE = ("Fahrzeugverknuepfungen.xlsx", "Sheet1")
 # Nach jedem Batch-Lauf mit Fehlern: Liste der fehlgeschlagenen Artikel im
@@ -321,6 +323,7 @@ GENART_HEADERS = ["Artikelnummer", "GenArt ID", "GenArt Bezeichnung", LAST_WRITT
 LEGACY_OE_HEADERS = ["Artikelnummer", "TecDoc ID", "OE-Nummer", LAST_WRITTEN_HEADER]
 OE_HEADERS = ["Artikelnummer", "TecDoc ID", "KHerNr", "OE-Nummer", LAST_WRITTEN_HEADER]
 COMPARISON_HEADERS = ["Artikelnummer", "TecDoc ID", "Mitbewerber ID", "Vergleichsnummer", LAST_WRITTEN_HEADER]
+USAGE_NUMBER_HEADERS = ["Artikelnummer", "TecDoc ID", "Gebrauchsnummer", LAST_WRITTEN_HEADER]
 LEGACY_ATTRIBUTE_HEADERS = ["Artikelnummer", "TecDoc Kriterien ID", "Attribut Bezeichnung", "Format", "Wert", LAST_WRITTEN_HEADER]
 ATTRIBUTE_HEADERS_WITH_VALUE_FROM = [
     "Artikelnummer",
@@ -351,11 +354,15 @@ VEHICLE_LINK_HEADERS = ["Artikelnummer", "Fahrzeugtyp", "KTypNr", "KTyp-System",
 # Zuordnung von Text-Labels (aus gescrapten Produkttexten) zu TecDoc Kriterien IDs.
 ATTRIBUTE_MAPPING_SHEET = "Zuordnung"
 ATTRIBUTE_MAPPING_HEADERS = ["Text-Label", "TecDoc Kriterien ID", "Hinweis"]
-# Suchwörter werden als Attribut 'Zusatzbezeichnung' (TOPMOTIVE, alphanumerisch)
-# exportiert, weil Apollo keine nativen Keywords kennt. Pro Suchwort eine Attributzeile.
-SEARCH_TERM_CRITERIA_ID = "9595"
-SEARCH_TERM_ATTRIBUTE_LABEL = "Zusatzbezeichnung"
-SEARCH_TERM_ATTRIBUTE_FORMAT = "Alphanumerisch"
+# Suchwörter gehören in Apollo in die Referenzen-Tabelle als Typ "Gebrauchsnummer"
+# (TecDoc ID 2) mit dem Suchwort als Freitext in der Spalte "Nummer". Pro Suchwort
+# eine Referenzzeile in Gebrauchsnummern.xlsx.
+USAGE_NUMBER_TECDOC_ID = "2"
+# Bis v0.1.31 wurden Suchwörter als Attribut 'Zusatzbezeichnung' (9595) in die
+# Attribute.xlsx geschrieben. Solche Altzeilen werden beim Laden weiterhin als
+# Suchwörter erkannt und beim nächsten Schreiben in die Referenzen überführt.
+# Die Kriterien-ID bleibt von der automatischen Attribut-Findung ausgenommen.
+LEGACY_SEARCH_TERM_CRITERIA_ID = "9595"
 # Freitext-Attribute (je max. 20 Zeichen) als Auffangbecken der KI für
 # technische Angaben, die zu keinem anderen Attribut passen. Apollo akzeptiert
 # pro Artikel nur EINE Zeile je Kriterien-ID, deshalb werden die wichtigsten
@@ -363,7 +370,7 @@ SEARCH_TERM_ATTRIBUTE_FORMAT = "Alphanumerisch"
 FREE_TEXT_SLOT_IDS = ["9202", "9213", "9220"]
 # Die KI liefert alle Kurzinfos unter dieser ID; die App verteilt auf die Slots.
 FREE_TEXT_CRITERIA_ID = FREE_TEXT_SLOT_IDS[0]
-SEARCH_TERM_MAX_LENGTH = 20
+SEARCH_TERM_MAX_LENGTH = 50
 CSV_ARTICLE_HEADER_ALIASES = {
     "artikelnummer",
     "artikelnr",
@@ -1546,7 +1553,7 @@ def run_rule_attribute_pass(
     review_keys: set[tuple[str, str]] = set()
     for suggestion in suggestions:
         criteria_id = suggestion.option.criteria_id
-        if not criteria_id or criteria_id == SEARCH_TERM_CRITERIA_ID:
+        if not criteria_id or criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID:
             continue
         if criteria_id in existing_criteria_ids or criteria_id in accepted_ids:
             continue
@@ -1655,7 +1662,7 @@ def apply_ai_extractions(
             occupied_label_keys.add(attribute_base_label_key(occupied_option.label))
 
     def blocked(criteria_id: str) -> bool:
-        if not criteria_id or criteria_id == SEARCH_TERM_CRITERIA_ID:
+        if not criteria_id or criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID:
             return True
         if criteria_id == FREE_TEXT_CRITERIA_ID:
             # Zusatzinfos werden gesammelt und erst danach auf die freien
@@ -2110,7 +2117,7 @@ def select_candidate_attribute_options(
 
     scored: list[tuple[float, AttributeOption]] = []
     for option in attribute_options:
-        if option.criteria_id == SEARCH_TERM_CRITERIA_ID:
+        if option.criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID:
             continue
         if option.value_format.strip().casefold() == "kein wert":
             continue
@@ -4861,9 +4868,15 @@ def build_vehicle_link_export_rows(bundle: ExportBundle) -> list[list[str]]:
     return export_rows
 
 
+def build_usage_number_export_rows(bundle: ExportBundle) -> list[list[str]]:
+    return [
+        [bundle.article_number, USAGE_NUMBER_TECDOC_ID, term]
+        for term in normalize_search_terms(bundle.search_terms)
+    ]
+
+
 def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
     export_rows: list[list[str]] = []
-    seen_search_values: set[str] = set()
     for row in normalize_attribute_rows(bundle.attribute_rows):
         # Letzte Absicherung vor dem Schreiben: fehlerhafte Formate (z. B.
         # Text in numerischen Attributen) duerfen nie in die Importdateien.
@@ -4873,8 +4886,6 @@ def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
         export_value = row.value
         if is_attribute_key_value_format(row.value_format):
             export_value = resolve_attribute_export_value(row, bundle.attribute_key_values_by_group)
-        if row.criteria_id == SEARCH_TERM_CRITERIA_ID:
-            seen_search_values.add(export_value.strip().casefold())
         export_rows.append(
             [
                 bundle.article_number,
@@ -4883,21 +4894,6 @@ def build_attribute_export_rows(bundle: ExportBundle) -> list[list[str]]:
                 row.value_format,
                 export_value,
                 row.value_to,
-            ]
-        )
-    # Suchwörter als zusätzliche 'Zusatzbezeichnung'-Zeilen (eine pro Suchwort).
-    for term in normalize_search_terms(bundle.search_terms):
-        if term.casefold() in seen_search_values:
-            continue
-        seen_search_values.add(term.casefold())
-        export_rows.append(
-            [
-                bundle.article_number,
-                SEARCH_TERM_CRITERIA_ID,
-                SEARCH_TERM_ATTRIBUTE_LABEL,
-                SEARCH_TERM_ATTRIBUTE_FORMAT,
-                term,
-                "",
             ]
         )
     return export_rows
@@ -4946,7 +4942,7 @@ def append_attribute_rows_add_only(
     appended_rows: list[list[str]] = []
     for row in normalize_attribute_rows(new_rows):
         criteria_id = row.criteria_id.strip()
-        if not criteria_id or criteria_id == SEARCH_TERM_CRITERIA_ID or criteria_id in existing_ids:
+        if not criteria_id or criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID or criteria_id in existing_ids:
             continue
         export_value = row.value
         if is_attribute_key_value_format(row.value_format):
@@ -4998,6 +4994,7 @@ def export_bundle(
     web_rows = [append_written_at(row, written_at) for row in build_web_export_rows(bundle)] if bundle.include_web_links else []
     oe_rows = [append_written_at(row, written_at) for row in build_oe_export_rows(bundle)]
     comparison_rows = [append_written_at(row, written_at) for row in build_comparison_export_rows(bundle)]
+    usage_number_rows = [append_written_at(row, written_at) for row in build_usage_number_export_rows(bundle)]
     vehicle_link_rows = [append_written_at(row, written_at) for row in build_vehicle_link_export_rows(bundle)]
     attribute_rows = [append_written_at(row, written_at) for row in build_attribute_export_rows(bundle)]
 
@@ -5013,6 +5010,8 @@ def export_bundle(
             write_workbook(export_dir / OE_FILE[0], OE_FILE[1], OE_HEADERS, oe_rows)
         if comparison_rows:
             write_workbook(export_dir / COMPARISON_FILE[0], COMPARISON_FILE[1], COMPARISON_HEADERS, comparison_rows)
+        if usage_number_rows:
+            write_workbook(export_dir / USAGE_NUMBER_FILE[0], USAGE_NUMBER_FILE[1], USAGE_NUMBER_HEADERS, usage_number_rows)
         if vehicle_link_rows:
             write_workbook(export_dir / VEHICLE_LINK_FILE[0], VEHICLE_LINK_FILE[1], VEHICLE_LINK_HEADERS, vehicle_link_rows)
         if attribute_rows:
@@ -5070,6 +5069,13 @@ def export_bundle(
                 COMPARISON_FILE[1],
                 COMPARISON_HEADERS,
                 comparison_rows,
+                replace_article_keys=article_keys,
+            )
+            write_workbook_with_upsert(
+                export_dir / USAGE_NUMBER_FILE[0],
+                USAGE_NUMBER_FILE[1],
+                USAGE_NUMBER_HEADERS,
+                usage_number_rows,
                 replace_article_keys=article_keys,
             )
             write_workbook_with_upsert(
@@ -5143,7 +5149,7 @@ def build_preview(bundle: ExportBundle) -> str:
         f"- Vergleichsnummern: {len(normalize_comparison_number_rows(bundle.comparison_number_rows))}",
         f"- Fahrzeugverknüpfungen: {len(normalize_vehicle_link_rows(bundle.vehicle_link_rows))} Fahrzeuge / {len(build_vehicle_link_export_rows(bundle))} Zeilen",
         f"- Attribute: {len(normalize_attribute_rows(bundle.attribute_rows))}",
-        f"- Suchwörter: {len(normalize_search_terms(bundle.search_terms))} (als Attribut {SEARCH_TERM_CRITERIA_ID} {SEARCH_TERM_ATTRIBUTE_LABEL})",
+        f"- Suchwörter: {len(normalize_search_terms(bundle.search_terms))} (als Gebrauchsnummern, Referenztyp {USAGE_NUMBER_TECDOC_ID})",
         "",
         "Medien",
         f"- Bilder: {len(bundle.image_rows)}",
@@ -5158,6 +5164,7 @@ def build_preview(bundle: ExportBundle) -> str:
         f"- {GENART_FILE[0]}",
         f"- {OE_FILE[0]}",
         f"- {COMPARISON_FILE[0]}",
+        f"- {USAGE_NUMBER_FILE[0]}",
         f"- {VEHICLE_LINK_FILE[0]}",
         f"- {ATTRIBUTE_FILE[0]}",
         f"- {IMAGE_FILE[0]}",
@@ -5402,14 +5409,25 @@ def load_article_snapshots_from_folder(
                 )
         ensure_snapshot(article_number).vehicle_link_rows.append(link_row)
 
+    usage_number_rows = read_workbook_rows(folder / USAGE_NUMBER_FILE[0], USAGE_NUMBER_FILE[1], len(USAGE_NUMBER_HEADERS))
+    for row in usage_number_rows:
+        article_number = normalize_article_number(row[0])
+        if not article_number:
+            continue
+        search_term = row[2].strip()
+        if search_term:
+            ensure_snapshot(article_number).search_terms.append(search_term)
+
     attribute_rows = prepare_existing_rows_for_write(folder / ATTRIBUTE_FILE[0], ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS)
     for row in attribute_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
         criteria_id = row[1].strip()
-        if criteria_id == SEARCH_TERM_CRITERIA_ID:
-            # 'Zusatzbezeichnung'-Zeilen sind Suchwörter und gehören in den Suchwörter-Tab.
+        if criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID:
+            # Altbestand bis v0.1.31: Suchwörter lagen als 'Zusatzbezeichnung' in der
+            # Attribute-Datei. Weiter in den Suchwörter-Tab übernehmen; beim nächsten
+            # Schreiben wandern sie in Gebrauchsnummern.xlsx und verschwinden hier.
             search_term = row[4].strip()
             if search_term:
                 ensure_snapshot(article_number).search_terms.append(search_term)
@@ -7847,8 +7865,8 @@ class SearchTermFrame(ttk.LabelFrame):
         ttk.Label(
             header,
             text=(
-                "Apollo kennt keine nativen Suchbegriffe. Suchwörter werden deshalb beim Export als Attribut "
-                f"'{SEARCH_TERM_ATTRIBUTE_LABEL}' (TecDoc Kriterien ID {SEARCH_TERM_CRITERIA_ID}) in die Attribute.xlsx geschrieben - "
+                "Suchwörter werden in Apollo als Referenz vom Typ 'Gebrauchsnummer' gepflegt (Referenzen > Typ 2, "
+                f"Suchwort als Freitext in 'Nummer'). Der Export schreibt sie in die {USAGE_NUMBER_FILE[0]} - "
                 f"eine Zeile pro Suchwort, maximal {SEARCH_TERM_MAX_LENGTH} Zeichen. Mehrere Suchwörter mit ; trennen."
             ),
             foreground="#5E6472",
@@ -11772,7 +11790,7 @@ if ($copied) {{
                     criteria_id = str(item.get("criteria_id") or "").strip()
                     if (
                         not criteria_id
-                        or criteria_id == SEARCH_TERM_CRITERIA_ID
+                        or criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID
                         or criteria_id in FREE_TEXT_SLOT_IDS
                         or criteria_id not in candidate_ids
                     ):
@@ -12681,6 +12699,7 @@ if ($copied) {{
             GENART_FILE[0],
             OE_FILE[0],
             COMPARISON_FILE[0],
+            USAGE_NUMBER_FILE[0],
             VEHICLE_LINK_FILE[0],
             ATTRIBUTE_FILE[0],
             IMAGE_FILE[0],
@@ -12905,6 +12924,15 @@ if ($copied) {{
             build_comparison_export_rows(bundle),
         )
 
+    def _write_usage_number_live(self, bundle: ExportBundle, output_root: Path) -> None:
+        replace_article_rows_preserving_timestamps(
+            output_root / USAGE_NUMBER_FILE[0],
+            USAGE_NUMBER_FILE[1],
+            USAGE_NUMBER_HEADERS,
+            bundle.article_number,
+            build_usage_number_export_rows(bundle),
+        )
+
     def _write_vehicle_link_live(self, bundle: ExportBundle, output_root: Path) -> None:
         replace_article_rows_preserving_timestamps(
             output_root / VEHICLE_LINK_FILE[0],
@@ -12966,7 +12994,8 @@ if ($copied) {{
             elif section == "attributes":
                 self._write_attribute_live(bundle, output_root)
             elif section == "search_terms":
-                # Suchwörter liegen mit in der Attribute-Datei.
+                self._write_usage_number_live(bundle, output_root)
+                # Altbestand: eventuelle 9595-Suchwortzeilen aus der Attribute-Datei räumen.
                 self._write_attribute_live(bundle, output_root)
             elif section == "images":
                 bundle.image_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild", kind_tag="")
@@ -14370,6 +14399,7 @@ if ($copied) {{
                 (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
                 (OE_FILE, OE_HEADERS),
                 (COMPARISON_FILE, COMPARISON_HEADERS),
+                (USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS),
                 (VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS),
                 (IMAGE_FILE, IMAGE_HEADERS),
                 (DOCUMENT_FILE, DOCUMENT_HEADERS),
