@@ -29,6 +29,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 import xml.etree.ElementTree as ET
+import weakref
 import webbrowser
 
 from openpyxl import Workbook, load_workbook
@@ -9554,6 +9555,15 @@ class ApolloImportApp:
         self.attribute_mapping_count_var = tk.StringVar(value="0 Zuordnungen geladen")
         self.article_browser_collapsed = False
         self.article_browser_toggle_var = tk.StringVar()
+        # Suche im Artikelverzeichnis: Eingabe wird entprellt (after-Timer), der
+        # durchsuchbare Text je Artikel wird gecacht und ueber eine schwache
+        # Referenz auf den Snapshot automatisch ungueltig, sobald der Artikel
+        # neu geladen oder ersetzt wurde.
+        self.article_browser_search_var = tk.StringVar()
+        self.article_browser_search_count_var = tk.StringVar()
+        self._article_browser_search_after_id: str | None = None
+        self._article_browser_applied_search = ""
+        self._article_search_blob_cache: dict[str, tuple[weakref.ref[StoredArticleSnapshot], str]] = {}
         self.settings_dialog: tk.Toplevel | None = None
         self.settings_notebook: ttk.Notebook | None = None
         self._settings_tab_canvases: list[tuple[str, tk.Canvas]] = []
@@ -10444,6 +10454,7 @@ class ApolloImportApp:
             },
             "article_browser": {
                 "selected_article": selected_browser_article,
+                "search_text": self.article_browser_search_var.get(),
             },
         }
 
@@ -10646,6 +10657,9 @@ class ApolloImportApp:
             browser_state = payload.get("article_browser")
             if isinstance(browser_state, dict):
                 self.pending_article_browser_selection = normalize_article_number(str(browser_state.get("selected_article", "")))
+                # Suchtext vor dem ersten Rendern setzen - so filtert schon der
+                # erste Aufbau des Verzeichnisses und nichts wird doppelt gezeichnet.
+                self.article_browser_search_var.set(str(browser_state.get("search_text", "")))
 
         self._apply_article_browser_visibility()
         self._schedule_project_tab_layout()
@@ -10653,6 +10667,9 @@ class ApolloImportApp:
     def _apply_pending_session_selection(self) -> None:
         selected_article = normalize_article_number(self.pending_article_browser_selection)
         if not selected_article or selected_article not in self.article_browser_records:
+            return
+        # Ein wiederhergestellter Suchtext kann den Artikel ausgeblendet haben.
+        if not self.article_browser_tree.exists(selected_article):
             return
         self.article_browser_tree.selection_set(selected_article)
         self.article_browser_tree.focus(selected_article)
@@ -11528,7 +11545,25 @@ if ($copied) {{
         self.browser_table_frame = browser_table_frame
         browser_table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         browser_table_frame.columnconfigure(0, weight=1)
-        browser_table_frame.rowconfigure(0, weight=1)
+        browser_table_frame.rowconfigure(1, weight=1)
+
+        # Suchzeile direkt ueber der Tabelle: alle Begriffe (Leerzeichen-getrennt)
+        # muessen im Artikel vorkommen; Enter waehlt bei genau einem Treffer aus.
+        browser_search_frame = ttk.Frame(browser_table_frame)
+        browser_search_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        browser_search_frame.columnconfigure(1, weight=1)
+        ttk.Label(browser_search_frame, text="Suche:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.article_browser_search_entry = ttk.Entry(browser_search_frame, textvariable=self.article_browser_search_var)
+        self.article_browser_search_entry.grid(row=0, column=1, sticky="ew")
+        self.article_browser_search_entry.bind("<Return>", self._on_article_browser_search_return)
+        self.article_browser_search_entry.bind("<Escape>", self._on_article_browser_search_escape)
+        ttk.Button(browser_search_frame, text="Leeren", width=8, command=self._clear_article_browser_search).grid(
+            row=0, column=2, padx=(6, 10)
+        )
+        ttk.Label(browser_search_frame, textvariable=self.article_browser_search_count_var, foreground="#5E6472").grid(
+            row=0, column=3, sticky="e"
+        )
+        self.article_browser_search_var.trace_add("write", self._on_article_browser_search_changed)
 
         self.article_browser_tree = ttk.Treeview(
             browser_table_frame,
@@ -11537,7 +11572,7 @@ if ($copied) {{
             height=10,
             selectmode="extended",
         )
-        self.article_browser_tree.grid(row=0, column=0, sticky="nsew")
+        self.article_browser_tree.grid(row=1, column=0, sticky="nsew")
         self.article_browser_tree.heading("article", text="Artikelnummer")
         self.article_browser_tree.heading("source", text="Quelle")
         self.article_browser_tree.heading("short_id", text="Kurz-ID")
@@ -11571,7 +11606,7 @@ if ($copied) {{
         self.article_browser_context_menu.add_command(label="Zeilen löschen", command=self.delete_selected_articles_from_browser)
 
         browser_scrollbar = ttk.Scrollbar(browser_table_frame, orient="vertical", command=self.article_browser_tree.yview)
-        browser_scrollbar.grid(row=0, column=1, sticky="ns")
+        browser_scrollbar.grid(row=1, column=1, sticky="ns")
         self.article_browser_tree.configure(yscrollcommand=browser_scrollbar.set)
 
         detail_frame = ttk.LabelFrame(self.browser_content_frame, text="Exportdaten", padding=10)
@@ -12881,7 +12916,9 @@ if ($copied) {{
         # Ein Aufruf statt ~3.800 Einzel-Deletes (0,6 s -> wenige ms).
         self.article_browser_tree.delete(*self.article_browser_tree.get_children())
 
-        for article_number in sorted(self.article_browser_records):
+        visible_article_numbers = self._visible_article_numbers()
+        self._update_article_browser_search_count(len(visible_article_numbers))
+        for article_number in visible_article_numbers:
             snapshot = self.article_browser_records[article_number]
             self.article_browser_tree.insert(
                 "",
@@ -12903,12 +12940,131 @@ if ($copied) {{
                 ),
             )
 
-        if selected_article and selected_article in self.article_browser_records:
+        # Auswahl nur erhalten, wenn der Artikel die Suche ueberlebt hat - sonst
+        # wuerde selection_set auf eine nicht vorhandene Zeile einen TclError werfen.
+        if selected_article and selected_article in self.article_browser_records and self.article_browser_tree.exists(selected_article):
             self.article_browser_tree.selection_set(selected_article)
             self.article_browser_tree.focus(selected_article)
             self._update_article_browser_detail(self.article_browser_records[selected_article])
         else:
             self._update_article_browser_detail(None)
+
+    def _visible_article_numbers(self) -> list[str]:
+        """Sortierte Artikelnummern, die der aktuelle Suchtext uebrig laesst.
+
+        Der Suchtext wird an Leerzeichen in Begriffe zerlegt; jeder Begriff muss
+        (ohne Gross-/Kleinschreibung, als Teilstring) im Such-Blob des Artikels
+        vorkommen. Ohne Suchtext kommt die komplette Liste zurueck - das
+        Verzeichnis verhaelt sich dann exakt wie vor Einfuehrung der Suche.
+        """
+        query = self.article_browser_search_var.get()
+        self._article_browser_applied_search = query
+        tokens = [token.casefold() for token in query.split()]
+        # Verwaiste Cache-Eintraege (geloeschte Artikel, leerer Output-Ordner)
+        # aufraeumen, damit der Cache nicht ueber die Laufzeit waechst.
+        if len(self._article_search_blob_cache) > len(self.article_browser_records):
+            for cached_article in list(self._article_search_blob_cache):
+                if cached_article not in self.article_browser_records:
+                    del self._article_search_blob_cache[cached_article]
+        if not tokens:
+            return sorted(self.article_browser_records)
+
+        visible: list[str] = []
+        for article_number in sorted(self.article_browser_records):
+            blob = self._article_search_blob(article_number, self.article_browser_records[article_number])
+            if all(token in blob for token in tokens):
+                visible.append(article_number)
+        return visible
+
+    def _article_search_blob(self, article_number: str, snapshot: StoredArticleSnapshot) -> str:
+        """Durchsuchbarer Text eines Artikels (casefold), je Snapshot gecacht.
+
+        Der Cache haengt ueber eine schwache Referenz an der Objektidentitaet des
+        Snapshots: Upserts und ein Neuladen des Verzeichnisses erzeugen neue
+        Snapshot-Objekte, damit faellt der alte Blob automatisch raus. Die
+        Upsert-/Loesch-Methoden raeumen den Eintrag zusaetzlich explizit ab.
+        """
+        cached = self._article_search_blob_cache.get(article_number)
+        if cached is not None and cached[0]() is snapshot:
+            return cached[1]
+
+        parts: list[str] = [snapshot.article_number, snapshot.short_module_id, snapshot.long_module_id]
+        for selection in snapshot.genart_selections:
+            parts.append(selection.id)
+            parts.append(selection.bezeichnung)
+        short_texts = snapshot.short_texts
+        parts.extend((short_texts.de, short_texts.en, short_texts.cz, short_texts.fr, short_texts.it, short_texts.nl, short_texts.uni))
+        # Langtext nur Deutsch: reicht fuer die Suche und haelt den Blob klein.
+        parts.append(snapshot.long_texts.de)
+        for oe_row in snapshot.oe_number_rows:
+            parts.append(oe_row.value)
+            parts.append(oe_row.manufacturer_name)
+        for comparison_row in snapshot.comparison_number_rows:
+            parts.append(comparison_row.reference_number)
+            parts.append(comparison_row.competitor_name)
+        parts.extend(snapshot.search_terms)
+        blob = "\n".join(part for part in parts if part).casefold()
+        self._article_search_blob_cache[article_number] = (weakref.ref(snapshot), blob)
+        return blob
+
+    def _update_article_browser_search_count(self, visible_count: int) -> None:
+        total_count = len(self.article_browser_records)
+        total_label = f"{total_count:,}".replace(",", ".")
+        if not self.article_browser_search_var.get().strip():
+            self.article_browser_search_count_var.set(f"{total_label} Artikel")
+        elif visible_count:
+            self.article_browser_search_count_var.set(f"{visible_count:,}".replace(",", ".") + f" von {total_label} Artikeln")
+        else:
+            self.article_browser_search_count_var.set(f"Keine Treffer ({total_label} Artikel)")
+
+    def _on_article_browser_search_changed(self, *_args: object) -> None:
+        # Entprellen: erst ~250 ms nach dem letzten Tastendruck filtern, sonst
+        # wuerde jede Eingabe die komplette Tabelle (~3.800 Zeilen) neu aufbauen.
+        self._cancel_article_browser_search_timer()
+        self._article_browser_search_after_id = self.root.after(250, self._apply_article_browser_search)
+
+    def _cancel_article_browser_search_timer(self) -> None:
+        if self._article_browser_search_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._article_browser_search_after_id)
+        except tk.TclError:
+            pass
+        self._article_browser_search_after_id = None
+
+    def _apply_article_browser_search(self) -> None:
+        self._article_browser_search_after_id = None
+        if not hasattr(self, "article_browser_tree"):
+            return
+        # Nichts tun, wenn die Tabelle diesen Suchtext schon zeigt (z. B. nach
+        # Wiederherstellen des Sitzungsstands oder Tippen + sofortigem Loeschen).
+        if self.article_browser_search_var.get() == self._article_browser_applied_search:
+            return
+        self._render_article_browser()
+
+    def _clear_article_browser_search(self) -> None:
+        self.article_browser_search_var.set("")
+        # Der Trace hat gerade einen Timer gestartet - sofort filtern statt warten.
+        self._cancel_article_browser_search_timer()
+        self._apply_article_browser_search()
+
+    def _on_article_browser_search_escape(self, _event: tk.Event[tk.Misc]) -> str:
+        self._clear_article_browser_search()
+        return "break"
+
+    def _on_article_browser_search_return(self, _event: tk.Event[tk.Misc]) -> str:
+        # Enter filtert sofort (ohne auf das Entprellen zu warten) und waehlt
+        # bei genau einem Treffer diesen Artikel aus.
+        self._cancel_article_browser_search_timer()
+        self._apply_article_browser_search()
+        visible = self.article_browser_tree.get_children()
+        if len(visible) == 1:
+            article_number = str(visible[0])
+            self.article_browser_tree.selection_set(article_number)
+            self.article_browser_tree.focus(article_number)
+            self.article_browser_tree.see(article_number)
+            self._update_article_browser_detail(self.article_browser_records.get(article_number))
+        return "break"
 
     def _build_output_folder_signature(self, output_folder: Path) -> tuple[tuple[str, int, int], ...]:
         signature: list[tuple[str, int, int]] = []
@@ -12937,6 +13093,7 @@ if ($copied) {{
 
     def _upsert_article_browser_from_bundle(self, bundle: ExportBundle, output_root: Path) -> None:
         self.article_browser_records[bundle.article_number] = self._snapshot_from_bundle(bundle, output_root)
+        self._article_search_blob_cache.pop(bundle.article_number, None)
         self.article_browser_cache_dir = str(output_root)
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
@@ -12986,6 +13143,7 @@ if ($copied) {{
             snapshot.attribute_rows = list(bundle.attribute_rows)
             snapshot.search_terms = list(bundle.search_terms)
         self.article_browser_records[bundle.article_number] = snapshot
+        self._article_search_blob_cache.pop(bundle.article_number, None)
         self.article_browser_cache_dir = str(output_root)
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
@@ -13084,6 +13242,7 @@ if ($copied) {{
             snapshot.search_terms = list(bundle.search_terms)
 
         self.article_browser_records[bundle.article_number] = snapshot
+        self._article_search_blob_cache.pop(bundle.article_number, None)
         self.article_browser_cache_dir = str(output_root)
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
@@ -14689,6 +14848,7 @@ if ($copied) {{
 
         for article_number in article_numbers:
             self.article_browser_records.pop(article_number, None)
+            self._article_search_blob_cache.pop(article_number, None)
         self._load_known_ids(initial=True)
         self._refresh_article_browser()
         self.status_var.set(f"{len(article_numbers)} Artikel aus den Output-Dateien gelöscht.")
