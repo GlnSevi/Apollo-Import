@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import csv
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from difflib import SequenceMatcher, get_close_matches
+import hashlib
 from html import unescape
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import pickle
 import queue
 import random
 import re
@@ -24,7 +27,7 @@ import tkinter as tk
 import unicodedata
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Callable
+from typing import Any, Callable, TypeVar
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
@@ -33,8 +36,6 @@ import weakref
 import webbrowser
 
 from openpyxl import Workbook, load_workbook
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
 
 try:
     from PIL import Image, ImageTk
@@ -42,18 +43,71 @@ except ImportError:  # pragma: no cover - optional preview dependency
     Image = None
     ImageTk = None
 
-try:
-    import pymupdf
-except ImportError:  # pragma: no cover - optional preview dependency
-    try:
-        import fitz as pymupdf  # type: ignore[no-redef]
-    except ImportError:  # pragma: no cover - optional preview dependency
-        pymupdf = None
+# Playwright, PyMuPDF und das Anthropic-SDK werden erst beim ersten Gebrauch
+# importiert (_get_playwright_api, _get_pymupdf, _get_anthropic). Ihr Import
+# kostete beim Programmstart zusammen 5-8 s (allein anthropic ~6 s wegen der
+# vielen pydantic-Modelle), gebraucht werden sie aber nur fuer Kunzer-Abruf und
+# Web-Vorschau, PDF-Vorschau/-Text und die KI-Attributfindung. Die Optional-
+# Semantik bleibt erhalten: fehlt das Paket, liefern die Helfer None, genau wie
+# frueher der Top-Level-Import mit except ImportError. Die Importe stehen als
+# normale import-Anweisungen in den Helfern, damit PyInstaller sie weiterhin
+# findet.
+_LAZY_MODULE_UNLOADED = object()
+_pymupdf_module: Any = _LAZY_MODULE_UNLOADED
+_anthropic_module: Any = _LAZY_MODULE_UNLOADED
+_playwright_api: tuple[Callable[..., Any], type[Exception]] | None = None
 
-try:
-    import anthropic
-except ImportError:  # pragma: no cover - optionale KI-Funktion
-    anthropic = None
+
+def _get_pymupdf() -> Any:
+    """PyMuPDF beim ersten Aufruf importieren; None, wenn es nicht installiert ist."""
+    global _pymupdf_module
+    if _pymupdf_module is _LAZY_MODULE_UNLOADED:
+        try:
+            import pymupdf as module
+        except ImportError:  # pragma: no cover - optional preview dependency
+            try:
+                import fitz as module  # type: ignore[no-redef]
+            except ImportError:  # pragma: no cover - optional preview dependency
+                module = None
+        _pymupdf_module = module
+    return _pymupdf_module
+
+
+def _get_anthropic() -> Any:
+    """Anthropic-SDK beim ersten Aufruf importieren; None, wenn es nicht installiert ist."""
+    global _anthropic_module
+    if _anthropic_module is _LAZY_MODULE_UNLOADED:
+        try:
+            import anthropic as module
+        except ImportError:  # pragma: no cover - optionale KI-Funktion
+            module = None
+        _anthropic_module = module
+    return _anthropic_module
+
+
+def _anthropic_available() -> bool:
+    """Prueft ohne den teuren Import, ob das Anthropic-SDK vorhanden ist.
+
+    Wird im UI-Thread gebraucht (Client bauen); der eigentliche Import laeuft
+    dann im Arbeits-Thread beim ersten API-Aufruf.
+    """
+    if _anthropic_module is not _LAZY_MODULE_UNLOADED:
+        return _anthropic_module is not None
+    try:
+        return importlib.util.find_spec("anthropic") is not None
+    except (ImportError, ValueError):  # pragma: no cover - defekte Installation
+        return False
+
+
+def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
+    """Liefert (sync_playwright, PlaywrightTimeoutError); Playwright bleibt Pflichtabhaengigkeit."""
+    global _playwright_api
+    if _playwright_api is None:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+
+        _playwright_api = (sync_playwright, PlaywrightTimeoutError)
+    return _playwright_api
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
@@ -2501,7 +2555,148 @@ def _format_vehicle_date(value: object) -> str:
     return date_part
 
 
+# ---------------------------------------------------------------------------
+# Lokaler Cache fuer geparste Stammdaten (KTyp-Katalog, Attribute, Schluesselwerte)
+#
+# Das Parsen der KTyp.xlsx (12,7 MB, ~84.000 Zeilen) mit openpyxl kostet rund
+# 10 s und bremst ueber den GIL waehrenddessen die ganze Oberflaeche. Die fertig
+# aufgebauten Python-Strukturen lassen sich dagegen in ~0,3 s per pickle laden.
+# Deshalb liegt je Quelldatei eine Kopie der geparsten Daten unter
+# %LOCALAPPDATA%\Apollo Import GUI\cache. Schluessel ist der Pfad plus
+# (st_mtime_ns, st_size) der Quelldatei, dazu Formatversion, Python-Version und
+# die Feldlisten der beteiligten Klassen. Passt etwas nicht oder ist die Datei
+# kaputt, wird der Cache ignoriert, neu geparst und anschliessend neu
+# geschrieben. Der Cache ist reine Beschleunigung - ohne ihn laeuft alles wie
+# bisher.
+# ---------------------------------------------------------------------------
+CATALOG_CACHE_FORMAT_VERSION = 1
+CATALOG_CACHE_DIR_NAME = "Apollo Import GUI"
+
+CatalogT = TypeVar("CatalogT")
+
+
+def catalog_cache_dir() -> Path:
+    """Ordner fuer die Stammdaten-Caches (LOCALAPPDATA, ersatzweise das Temp-Verzeichnis)."""
+    base = os.environ.get("LOCALAPPDATA", "").strip()
+    root = Path(base) if base else Path(tempfile.gettempdir())
+    return root / CATALOG_CACHE_DIR_NAME / "cache"
+
+
+def _dataclass_cache_schema(cls: type) -> tuple:
+    """Modul, Name und Feldliste einer Datenklasse - aendert sich eine, passt kein alter Cache mehr."""
+    return (cls.__module__, cls.__qualname__, tuple(f.name for f in fields(cls)))
+
+
+def _vehicle_catalog_cache_schema() -> tuple:
+    # VehicleCatalog ist keine Datenklasse: die Attributnamen einer frischen
+    # Instanz dienen als Schema, damit neue Felder alte Caches entwerten.
+    return (_dataclass_cache_schema(VehicleMatch), tuple(sorted(vars(VehicleCatalog()))))
+
+
+def _catalog_cache_header(kind: str, source_path: Path, schema: tuple) -> dict[str, object] | None:
+    """Kennung des Quellstands; None, wenn die Quelldatei nicht per stat() erreichbar ist."""
+    try:
+        stat = source_path.stat()
+    except OSError:
+        return None
+    return {
+        "format": CATALOG_CACHE_FORMAT_VERSION,
+        "kind": kind,
+        "python": tuple(sys.version_info[:2]),
+        "source": os.path.normcase(str(source_path)),
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "schema": schema,
+    }
+
+
+def _catalog_cache_path(kind: str, source_path: Path) -> Path:
+    digest = hashlib.sha1(os.path.normcase(str(source_path)).encode("utf-8")).hexdigest()[:16]
+    return catalog_cache_dir() / f"{kind}_{digest}.pickle"
+
+
+def _read_catalog_cache(cache_path: Path, header: dict[str, object]) -> object | None:
+    """Liefert die gecachten Daten oder None (kein, alter oder kaputter Cache)."""
+    try:
+        with open(cache_path, "rb") as handle:
+            if pickle.load(handle) != header:
+                return None
+            return pickle.load(handle)
+    except Exception:
+        # Fehlende Datei, abgebrochener Schreibvorgang, fremdes Format oder
+        # geaenderte Klassen: kein Fehler, sondern schlicht "nicht brauchbar".
+        return None
+
+
+def _write_catalog_cache(cache_path: Path, header: dict[str, object], payload: object) -> bool:
+    """Schreibt Kopf und Daten atomar (Temp-Datei + os.replace); Fehler werden geschluckt."""
+    temp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(temp_path, "wb") as handle:
+            pickle.dump(header, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temp_path, cache_path)
+        return True
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def read_catalog_cache(kind: str, source_path: Path, schema: tuple, expected_type: type[CatalogT]) -> CatalogT | None:
+    """Nur den Cache probieren, ohne zu parsen (fuer den synchronen Schnellstart)."""
+    header = _catalog_cache_header(kind, source_path, schema)
+    if header is None:
+        return None
+    cached = _read_catalog_cache(_catalog_cache_path(kind, source_path), header)
+    return cached if isinstance(cached, expected_type) else None
+
+
+def load_with_catalog_cache(
+    kind: str,
+    source_path: Path,
+    schema: tuple,
+    expected_type: type[CatalogT],
+    parse: Callable[[], CatalogT],
+) -> CatalogT:
+    """Cache lesen oder parsen und das Ergebnis fuer den naechsten Start ablegen."""
+    # Der Kopf wird vor dem Parsen bestimmt: er beschreibt genau den Dateistand,
+    # den parse() gleich liest - auch wenn die Quelle waehrenddessen ersetzt wird.
+    header = _catalog_cache_header(kind, source_path, schema)
+    if header is None:
+        return parse()
+    cache_path = _catalog_cache_path(kind, source_path)
+    cached = _read_catalog_cache(cache_path, header)
+    if isinstance(cached, expected_type):
+        return cached
+    result = parse()
+    _write_catalog_cache(cache_path, header, result)
+    return result
+
+
+def load_vehicle_catalog_from_cache(workbook_path: Path) -> VehicleCatalog | None:
+    """Fertiger KTyp-Katalog aus dem lokalen Cache oder None, wenn er neu geparst werden muss."""
+    if not path_exists_safe(workbook_path):
+        return None
+    return read_catalog_cache("ktyp", workbook_path, _vehicle_catalog_cache_schema(), VehicleCatalog)
+
+
 def load_vehicle_catalog(workbook_path: Path) -> VehicleCatalog:
+    if not path_exists_safe(workbook_path):
+        return VehicleCatalog()
+    return load_with_catalog_cache(
+        "ktyp",
+        workbook_path,
+        _vehicle_catalog_cache_schema(),
+        VehicleCatalog,
+        lambda: _parse_vehicle_catalog(workbook_path),
+    )
+
+
+def _parse_vehicle_catalog(workbook_path: Path) -> VehicleCatalog:
     catalog = VehicleCatalog()
     if not path_exists_safe(workbook_path):
         return catalog
@@ -2583,6 +2778,18 @@ def load_vehicle_catalog(workbook_path: Path) -> VehicleCatalog:
 
 
 def load_attribute_options(workbook_path: Path) -> list[AttributeOption]:
+    if not path_exists_safe(workbook_path):
+        return []
+    return load_with_catalog_cache(
+        "attribute",
+        workbook_path,
+        _dataclass_cache_schema(AttributeOption),
+        list,
+        lambda: _parse_attribute_options(workbook_path),
+    )
+
+
+def _parse_attribute_options(workbook_path: Path) -> list[AttributeOption]:
     if not path_exists_safe(workbook_path):
         return []
 
@@ -2760,6 +2967,18 @@ def append_attribute_mapping_entries(workbook_path: Path, entries: list[tuple[st
 
 
 def load_attribute_key_value_options(workbook_path: Path) -> list[AttributeKeyValueOption]:
+    if not path_exists_safe(workbook_path):
+        return []
+    return load_with_catalog_cache(
+        "schluesselwerte",
+        workbook_path,
+        _dataclass_cache_schema(AttributeKeyValueOption),
+        list,
+        lambda: _parse_attribute_key_value_options(workbook_path),
+    )
+
+
+def _parse_attribute_key_value_options(workbook_path: Path) -> list[AttributeKeyValueOption]:
     if not path_exists_safe(workbook_path):
         return []
 
@@ -2983,6 +3202,7 @@ def extract_pdf_text(
     oder Parsen werden bewusst geschluckt, damit die Attribut-Findung nie an
     einem defekten Dokument scheitert.
     """
+    pymupdf = _get_pymupdf()
     if pymupdf is None:
         return ""
     try:
@@ -3974,6 +4194,7 @@ class ClaudeAttributeClient:
         system_prompt: str | None = None,
         max_tokens: int = 4096,
     ) -> list[dict[str, object]]:
+        anthropic = _get_anthropic()
         if anthropic is None:
             raise ClaudeExtractionError(
                 "KI-Funktion nicht verfügbar: Python-Paket 'anthropic' ist nicht installiert."
@@ -4054,6 +4275,7 @@ class ClaudeAttributeClient:
         entweder die Extraktionsliste oder ein ClaudeExtractionError. Ein
         Abbruch über cancel_check füllt offene Schlüssel mit Abbruch-Fehlern.
         """
+        anthropic = _get_anthropic()
         if anthropic is None:
             raise ClaudeExtractionError(
                 "KI-Funktion nicht verfügbar: Python-Paket 'anthropic' ist nicht installiert."
@@ -4216,6 +4438,7 @@ class KunzerScraper:
         if cached is not None:
             return self._clone_result(cached)
         browser_path = self._detect_browser_path()
+        sync_playwright, PlaywrightTimeoutError = _get_playwright_api()
 
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
@@ -7008,7 +7231,7 @@ class MediaTableFrame(ttk.LabelFrame):
             self.preview_photo = None
             self.preview_visual.configure(text="Pillow für PDF-Vorschau installieren", image="", wraplength=220, justify="center")
             return
-        if pymupdf is None:
+        if _get_pymupdf() is None:
             self.preview_photo = None
             self.preview_visual.configure(text="PyMuPDF für PDF-Vorschau installieren", image="", wraplength=220, justify="center")
             return
@@ -7067,6 +7290,9 @@ class MediaTableFrame(ttk.LabelFrame):
         if cached is not None:
             return Image.open(io.BytesIO(cached))
 
+        pymupdf = _get_pymupdf()
+        if pymupdf is None:
+            raise ValueError("PyMuPDF für PDF-Vorschau installieren")
         pdf_bytes = self._load_preview_bytes(path_or_link)
         document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         try:
@@ -7539,6 +7765,7 @@ class LinkTableFrame(ttk.LabelFrame):
             return Image.open(io.BytesIO(screenshot_bytes)), title
 
         browser_path = detect_browser_path()
+        sync_playwright, _timeout_error = _get_playwright_api()
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 executable_path=str(browser_path) if browser_path else None,
@@ -13148,6 +13375,20 @@ if ($copied) {{
 
         if self.vehicle_catalog_loading:
             return
+
+        # Warmer Cache (siehe load_with_catalog_cache): der fertige Katalog ist in
+        # ~0,3 s da und wird direkt im UI-Thread uebernommen. So sieht schon das
+        # erste Einlesen der Artikelliste beim Start die Fahrzeugdaten und muss
+        # nicht - wie nach dem Thread-Ende - gleich noch einmal komplett neu
+        # geladen werden.
+        cached_catalog = load_vehicle_catalog_from_cache(source_path)
+        if cached_catalog is not None:
+            self._apply_vehicle_catalog(cached_catalog)
+            self.article_browser_cache_signature = None
+            if not initial:
+                self.status_var.set(f"KTyp-Stammdaten geladen: {cached_catalog.count} Datensätze")
+            return
+
         self.vehicle_catalog_loading = True
         self.vehicle_count_var.set("KTyp-Stammdaten werden geladen ...")
         if not initial:
@@ -13177,7 +13418,16 @@ if ($copied) {{
 
             self.root.after(0, finish)
 
-        threading.Thread(target=worker, daemon=True).start()
+        def start_worker() -> None:
+            threading.Thread(target=worker, daemon=True).start()
+
+        if initial:
+            # Erster Start ohne Cache: den ~10 s langen Parse erst anwerfen, wenn
+            # das Fenster steht. Er haelt den GIL und wuerde sonst das synchrone
+            # Einlesen der Artikelliste im Konstruktor um ein Mehrfaches bremsen.
+            self.root.after(0, start_worker)
+        else:
+            start_worker()
 
     def choose_competitor_source_file(self) -> None:
         initial_dir = (
@@ -15269,7 +15519,9 @@ if ($copied) {{
     def _build_claude_client(self) -> ClaudeAttributeClient | None:
         """Erzeugt den Claude-Client für die Attribut-KI oder None (dann rules-only)."""
         api_key = self.anthropic_api_key_var.get().strip() or os.getenv("ANTHROPIC_API_KEY", "").strip()
-        if not api_key or anthropic is None:
+        # Nur die Verfuegbarkeit pruefen - der ~6 s teure SDK-Import passiert im
+        # Arbeits-Thread beim ersten API-Aufruf, nicht hier im UI-Thread.
+        if not api_key or not _anthropic_available():
             return None
         return ClaudeAttributeClient(
             api_key=api_key,
