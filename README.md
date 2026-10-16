@@ -102,6 +102,16 @@ Die bisherige reine Text-Vorschau wurde durch ein `Artikelverzeichnis` ersetzt. 
 - Bilder zeigen ein Thumbnail, Dokumente bei PDFs die erste Seite und sonst eine kompakte Dateivorschau
 - Web Links zeigen Host-Badge und Seitentitel; der Webseiten-Screenshot (Playwright) wird nur noch auf Knopfdruck `Webseiten-Vorschau laden` erzeugt und dann zwischengespeichert
 
+## Leistung, Live-Speichern und Caches
+
+- Live-Speichern laeuft in einem Hintergrund-Thread mit Warteschlange: Aenderungen in der Maske blockieren die Oberflaeche nicht mehr (Statuszeile zeigt `Speichere im Hintergrund ...` und danach `Live gespeichert: <Artikel>`). Geschrieben wird nur, was sich seit dem Laden bzw. letzten Speichern wirklich geaendert hat (Fingerabdruck je Artikel und Bereich); ein Fokusverlust ohne Aenderung schreibt nichts.
+- Scheitert ein Bereich (z. B. Datei in Excel geoeffnet), werden die uebrigen Bereiche trotzdem geschrieben; der gescheiterte wird beim naechsten Anlass nachgeholt und beim Beenden gibt es eine Warnung, falls noch etwas offen ist. Export, Loeschen und Massenimport warten vorher auf die Warteschlange.
+- Excel-Dateien werden immer erst als Temp-Datei geschrieben und dann eingetauscht - eine gesperrte Zieldatei bleibt vollstaendig erhalten.
+- Lesen und Schreiben der Output-Dateien nutzt einen eigenen XLSX-Leser/-Schreiber (Inline-Strings, gleiches Dateiformat wie bisher) plus Zeilen-Cache im Speicher; dadurch dauert z. B. das Schreiben der `Fahrzeugverknuepfungen.xlsx` (16.000 Zeilen) rund 0,1 s statt 2 s.
+- Stammdaten (KTyp, Attribute, Schluesselwerte, GenArten) und die geparsten Output-Dateien werden unter `%LOCALAPPDATA%\Apollo Import GUI\cache` zwischengespeichert; der Cache erkennt geaenderte Quelldateien und neue Programmversionen selbst. Der Ordner darf jederzeit geloescht werden (naechster Start parst dann einmal neu, KTyp ca. 10 s im Hintergrund).
+- Schwere Pakete (Playwright, PyMuPDF, Anthropic) werden erst beim ersten Gebrauch geladen; der Start ist dadurch deutlich schneller.
+- Leistungsprotokoll: UI-Blockaden ueber 250 ms landen mit Name und Dauer in `apollo_import_perf.log` im Arbeitsverzeichnis (neben `apollo_import_gui_state.json`), max. 2 MB mit Rotation - hilfreich, wenn etwas langsam wirkt.
+
 ## Listenimport CSV/XLSX
 
 Ueber `Produktliste CSV/XLSX` kann eine Liste von Produkten importiert werden. Jeder Eintrag wird ueber `kunzer.de` geladen und direkt in den festen Output-Pfad geschrieben.
