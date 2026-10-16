@@ -10490,8 +10490,355 @@ class AttributeSuggestionDialog(tk.Toplevel):
         self.on_apply(rows, learned)
 
 
+# ---------------------------------------------------------------------------
+# Leistungsprotokoll
+# ---------------------------------------------------------------------------
+# UI-blockierende Abschnitte ab PERF_LOG_THRESHOLD_SECONDS landen mit Name und
+# Dauer in apollo_import_perf.log neben der Sitzungsdatei. So laesst sich beim
+# Nutzer nachvollziehen, was in der Praxis wirklich hakt - ohne Profiler.
+PERF_LOG_FILE = Path.cwd() / "apollo_import_perf.log"
+PERF_LOG_THRESHOLD_SECONDS = 0.25
+PERF_LOG_MAX_BYTES = 2_000_000
+_PERF_LOG_LOCK = threading.Lock()
+
+
+def log_perf(name: str, seconds: float, detail: str = "", always: bool = False) -> None:
+    """Protokolliert einen Abschnitt, wenn er laenger als die Schwelle brauchte.
+
+    Fehler beim Schreiben werden geschluckt - das Protokoll darf die App nie
+    ausbremsen oder zum Absturz bringen. Ueberschreitet die Datei die
+    Maximalgroesse, wird sie einmal rotiert (.log.1), aeltere Stufen entfallen.
+    """
+    if not always and seconds < PERF_LOG_THRESHOLD_SECONDS:
+        return
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {seconds * 1000:7.0f} ms  {name}"
+    if detail:
+        line += f"  ({detail})"
+    try:
+        with _PERF_LOG_LOCK:
+            try:
+                if PERF_LOG_FILE.exists() and PERF_LOG_FILE.stat().st_size > PERF_LOG_MAX_BYTES:
+                    rotated = PERF_LOG_FILE.with_name(PERF_LOG_FILE.name + ".1")
+                    rotated.unlink(missing_ok=True)
+                    PERF_LOG_FILE.rename(rotated)
+            except OSError:
+                pass
+            with PERF_LOG_FILE.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+@contextmanager
+def perf_timer(name: str, always: bool = False):
+    """Misst einen Codeabschnitt im UI-Thread und protokolliert ihn ueber log_perf."""
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        log_perf(name, time.perf_counter() - started, always=always)
+
+
+def perf_logged(name: str, always: bool = False):
+    """Dekorator-Variante von perf_timer fuer ganze Methoden (erfasst alle Rueckwege)."""
+
+    def decorate(func):
+        def wrapper(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                log_perf(name, time.perf_counter() - started, always=always)
+
+        wrapper.__name__ = func.__name__
+        wrapper.__qualname__ = getattr(func, "__qualname__", func.__name__)
+        wrapper.__doc__ = func.__doc__
+        wrapper.__wrapped__ = func  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorate
+
+
+# ---------------------------------------------------------------------------
+# Live-Schreiben: Fingerabdruecke, Datei-Sperre und Hintergrund-Schreiber
+# ---------------------------------------------------------------------------
+# Eine Sperre fuer alle Schreibzugriffe auf die Output-Dateien: Hintergrund-
+# Schreiber, Massenimport-Worker und manuelle Exporte/Loeschungen laufen damit
+# serialisiert - nie schreiben zwei Threads gleichzeitig dieselbe Excel-Datei.
+WORKBOOK_WRITE_LOCK = threading.RLock()
+
+# Alle Live-Bereiche in Schreibreihenfolge. "search_terms" raeumt beim
+# Schreiben zusaetzlich Alt-Suchwoerter (9595) aus der Attribute-Datei.
+LIVE_SECTIONS: tuple[str, ...] = (
+    "short_text",
+    "long_text",
+    "genart",
+    "oe_numbers",
+    "comparison_numbers",
+    "search_terms",
+    "vehicle_links",
+    "attributes",
+    "images",
+    "documents",
+    "videos",
+    "web_links",
+)
+LIVE_SECTION_LABELS = {
+    "short_text": "Kurzbezeichnung",
+    "long_text": "Text",
+    "genart": "GenArt",
+    "oe_numbers": "OE-Nummern",
+    "comparison_numbers": "Vergleichsnummern",
+    "search_terms": "Suchwörter",
+    "vehicle_links": "Fahrzeuge",
+    "attributes": "Attribute",
+    "images": "Bilder",
+    "documents": "Dokumente",
+    "videos": "Videos",
+    "web_links": "Web-Links",
+}
+# Abstand, in dem der UI-Thread Ergebnisse des Hintergrund-Schreibers abholt.
+LIVE_WRITE_POLL_INTERVAL_MS = 60
+# Obergrenze fuers Warten auf offene Schreibauftraege (Schliessen, Export, Loeschen).
+LIVE_WRITE_FLUSH_TIMEOUT_SECONDS = 30.0
+
+
+def live_section_export_rows(bundle: ExportBundle, section: str) -> list[list[str]]:
+    """Die Zeilen, die ein Live-Bereich in die Output-Dateien schreibt (ohne Zeitstempel)."""
+    if section == "short_text":
+        return [build_short_text_export_row(bundle), build_short_mapping_export_row(bundle)]
+    if section == "long_text":
+        return [build_long_text_export_row(bundle)]
+    if section == "genart":
+        return build_genart_export_rows(bundle)
+    if section == "oe_numbers":
+        return build_oe_export_rows(bundle)
+    if section == "comparison_numbers":
+        return build_comparison_export_rows(bundle)
+    if section == "search_terms":
+        return build_usage_number_export_rows(bundle)
+    if section == "vehicle_links":
+        return build_vehicle_link_export_rows(bundle)
+    if section == "attributes":
+        return build_attribute_export_rows(bundle)
+    if section == "images":
+        return build_image_export_rows(bundle)
+    if section == "documents":
+        return build_document_export_rows(bundle)
+    if section == "videos":
+        return build_video_export_rows(bundle)
+    if section == "web_links":
+        return build_web_export_rows(bundle)
+    raise ValueError(f"Unbekannter Live-Bereich: {section}")
+
+
+def live_section_fingerprint(bundle: ExportBundle, section: str) -> tuple[str, str]:
+    """Fingerabdruck eines Live-Bereichs: Hash der Export-Zeilen.
+
+    Rueckgabe: (Fingerabdruck, Fehlertext). Wirft der Zeilen-Builder einen
+    Fehler (z. B. OE-Nummer ohne Hersteller), zaehlt der Fehlertext als
+    Fingerabdruck - der Bereich gilt dann als geaendert, und der Aufrufer
+    kann den Fehler sofort melden statt einen Schreibauftrag einzureihen.
+    """
+    import hashlib  # lokal, weil der Import-Block am Dateianfang parallel ueberarbeitet wird
+
+    try:
+        rows = live_section_export_rows(bundle, section)
+    except Exception as exc:
+        error_text = str(exc)
+        payload = f"error:{error_text}"
+    else:
+        error_text = ""
+        payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest(), error_text
+
+
+def live_section_fingerprints(bundle: ExportBundle, sections: tuple[str, ...] | set[str] = LIVE_SECTIONS) -> dict[str, str]:
+    """Fingerabdruecke mehrerer Bereiche (Fehler-Marker inklusive, siehe live_section_fingerprint)."""
+    return {section: live_section_fingerprint(bundle, section)[0] for section in sections}
+
+
+def bundle_from_snapshot(
+    snapshot: StoredArticleSnapshot,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+) -> ExportBundle:
+    """Gegenstueck zu ApolloImportApp._snapshot_from_bundle: der gespeicherte Stand
+    eines Artikels als Bundle, damit sich seine Fingerabdruecke mit dem
+    Formularstand vergleichen lassen."""
+    return ExportBundle(
+        article_number=snapshot.article_number,
+        short_module_id=snapshot.short_module_id,
+        long_module_id=snapshot.long_module_id,
+        short_texts=snapshot.short_texts,
+        short_auto_uni=snapshot.short_auto_uni,
+        long_texts=snapshot.long_texts,
+        long_auto_uni=snapshot.long_auto_uni,
+        genart_selections=list(snapshot.genart_selections),
+        genart_id=snapshot.genart_id,
+        genart_bezeichnung=snapshot.genart_bezeichnung,
+        image_rows=list(snapshot.image_rows),
+        document_rows=list(snapshot.document_rows),
+        video_rows=list(snapshot.video_rows),
+        web_rows=list(snapshot.web_rows),
+        oe_number_rows=list(snapshot.oe_number_rows),
+        comparison_number_rows=list(snapshot.comparison_number_rows),
+        vehicle_link_rows=list(snapshot.vehicle_link_rows),
+        attribute_rows=list(snapshot.attribute_rows),
+        search_terms=list(snapshot.search_terms),
+        attribute_key_values_by_group=attribute_key_values_by_group,
+    )
+
+
+@dataclass
+class LiveWriteJob:
+    """Ein Schreibauftrag fuer den Hintergrund-Schreiber: ein Artikel, ein oder
+    mehrere Bereiche, dazu das im UI-Thread fertig eingesammelte Bundle."""
+
+    article_number: str
+    sections: set[str]
+    bundle: ExportBundle
+    output_root: Path
+    # Fingerabdruecke ALLER Bereiche des Bundles (nicht nur der zu schreibenden):
+    # beim Zusammenfassen mit einem aelteren Auftrag gilt fuer die vereinigten
+    # Bereiche der juengste Stand, und der ist hier vollstaendig vorhanden.
+    fingerprints: dict[str, str]
+    status_message: str | None = None
+    # Vom Schreiber befuellt:
+    error: Exception | None = None
+    duration_seconds: float = 0.0
+
+    def section_labels(self) -> str:
+        return ", ".join(LIVE_SECTION_LABELS.get(section, section) for section in LIVE_SECTIONS if section in self.sections)
+
+
+class LiveWriter:
+    """Daemon-Thread mit Warteschlange fuer das Live-Schreiben der Output-Dateien.
+
+    Die Oberflaeche reiht fertig eingesammelte Bundles ein und ist sofort
+    wieder frei; Excel-Parsen, Mergen, Medien-Download und Schreiben laufen im
+    Hintergrund. Auftraege desselben Artikels (gleicher Ausgabeordner), die
+    noch nicht begonnen haben, werden zusammengefasst: Bereiche vereinigen,
+    das juengste Bundle gewinnt - es enthaelt immer den neuesten Stand aller
+    Bereiche. Fertige Auftraege holt der UI-Thread ueber drain_results() ab;
+    der Thread selbst fasst Tkinter nie an (after() aus Fremd-Threads ist
+    ausserhalb des Mainloops nicht zuverlaessig, siehe Massenimport-Worker).
+    """
+
+    def __init__(self, run_job: Callable[[LiveWriteJob], None]) -> None:
+        self._run_job = run_job
+        self._condition = threading.Condition()
+        self._pending: list[LiveWriteJob] = []
+        self._running: LiveWriteJob | None = None
+        self._results: queue.Queue[LiveWriteJob] = queue.Queue()
+        self._stopping = False
+        self.stats: dict[str, int] = {"jobs_submitted": 0, "jobs_merged": 0, "jobs_run": 0, "jobs_failed": 0}
+        # Bewusst KEIN Daemon-Thread: ein beim Prozessende mitten in
+        # workbook.save() eingefrorener Daemon hinterliesse eine halb
+        # geschriebene (kaputte) Excel-Datei. So wird der laufende Auftrag
+        # immer zu Ende geschrieben; danach beendet sich der Thread selbst
+        # (shutdown() oder Ende des Hauptthreads, siehe _loop).
+        self._thread = threading.Thread(target=self._loop, name="LiveWriter", daemon=False)
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        """Beendet den Thread nach dem laufenden Auftrag; wartende Auftraege verfallen."""
+        with self._condition:
+            self._stopping = True
+            self._pending.clear()
+            self._condition.notify_all()
+
+    def submit(self, job: LiveWriteJob) -> None:
+        with self._condition:
+            if self._stopping:
+                return
+            self.stats["jobs_submitted"] += 1
+            for pending in self._pending:
+                if pending.article_number == job.article_number and pending.output_root == job.output_root:
+                    pending.sections |= job.sections
+                    pending.bundle = job.bundle
+                    pending.fingerprints = job.fingerprints
+                    pending.status_message = job.status_message or pending.status_message
+                    self.stats["jobs_merged"] += 1
+                    return
+            self._pending.append(job)
+            self._condition.notify()
+
+    def drain_results(self) -> list[LiveWriteJob]:
+        finished: list[LiveWriteJob] = []
+        while True:
+            try:
+                finished.append(self._results.get_nowait())
+            except queue.Empty:
+                return finished
+
+    def is_idle(self) -> bool:
+        """True, wenn nichts mehr wartet, nichts laeuft und alle Ergebnisse abgeholt sind."""
+        with self._condition:
+            return not self._pending and self._running is None and self._results.empty()
+
+    def pending_count(self) -> int:
+        with self._condition:
+            return len(self._pending) + (1 if self._running is not None else 0)
+
+    def expected_fingerprints(self, article_number: str) -> dict[str, str]:
+        """Fingerabdruecke der Bereiche, die fuer den Artikel noch geschrieben werden
+        (laufender Auftrag zuerst, wartende danach - der juengste Stand gewinnt)."""
+        expected: dict[str, str] = {}
+        with self._condition:
+            jobs = ([self._running] if self._running is not None else []) + list(self._pending)
+        for job in jobs:
+            if job.article_number != article_number:
+                continue
+            for section in job.sections:
+                if section in job.fingerprints:
+                    expected[section] = job.fingerprints[section]
+        return expected
+
+    def latest_bundle(self, article_number: str) -> ExportBundle | None:
+        """Das juengste noch nicht geschriebene Bundle des Artikels (oder None)."""
+        with self._condition:
+            for job in reversed(self._pending):
+                if job.article_number == article_number:
+                    return job.bundle
+            if self._running is not None and self._running.article_number == article_number:
+                return self._running.bundle
+        return None
+
+    def _loop(self) -> None:
+        # hashlib vorab laden (OpenSSL-Anbindung, beim ersten Import gut 100 ms):
+        # die erste Fingerabdruck-Berechnung im UI-Thread soll nicht darauf warten.
+        import hashlib  # noqa: F401
+
+        while True:
+            with self._condition:
+                while not self._pending and not self._stopping:
+                    # Mit Zeitlimit warten: endet der Hauptthread ohne shutdown()
+                    # (Absturz), darf der Prozess nicht an diesem Thread haengen.
+                    self._condition.wait(0.5)
+                    if not threading.main_thread().is_alive():
+                        self._stopping = True
+                if self._stopping and not self._pending:
+                    return
+                job = self._pending.pop(0)
+                self._running = job
+            started = time.perf_counter()
+            try:
+                self._run_job(job)
+            except Exception as exc:  # pragma: no cover - Fehler werden im UI-Thread gemeldet
+                job.error = exc
+            job.duration_seconds = time.perf_counter() - started
+            with self._condition:
+                self.stats["jobs_run"] += 1
+                if job.error is not None:
+                    self.stats["jobs_failed"] += 1
+                self._running = None
+                self._results.put(job)
+                self._condition.notify_all()
+
+
 class ApolloImportApp:
     def __init__(self, root: tk.Tk) -> None:
+        init_started = time.perf_counter()
         self.root = root
         self.root.title(APP_TITLE)
         screen_width = self.root.winfo_screenwidth()
@@ -10599,6 +10946,20 @@ class ApolloImportApp:
         # Datenstand, den die Artikelliste zuletzt gezeichnet hat (siehe _article_browser_render_key).
         self.article_browser_rendered_key: tuple[tuple[str, int], ...] | None = None
         self.live_write_suspended = False
+        # Hintergrund-Schreiber fuer das Live-Speichern (siehe LiveWriter). Die
+        # Oberflaeche sammelt nur das Bundle ein und reiht den Auftrag ein.
+        self.live_writer = LiveWriter(self._run_live_write_job)
+        self._live_write_poll_after_id: str | None = None
+        # Gespeicherter Stand je Artikel: (Verzeichnis-Snapshot, {Bereich: Fingerabdruck}).
+        # Der Snapshot dient als Gueltigkeitsanker - ersetzt ihn jemand anderes
+        # (Neuladen vom Datentraeger, Batch-Upsert), wird neu vom Eintrag abgeleitet.
+        self._live_fingerprints: dict[str, tuple[StoredArticleSnapshot | None, dict[str, str]]] = {}
+        # Bereiche, deren letzter Schreibversuch scheiterte: beim naechsten Live-
+        # Schreiben des Artikels erneut pruefen, auch wenn ein anderer Bereich ausloest.
+        self._live_failed_sections: dict[str, set[str]] = {}
+        # Fehlerarten, fuer die bereits eine Meldung gezeigt wurde (einmal je Art).
+        self._live_write_reported_errors: set[str] = set()
+        self._closing = False
         self.article_browser_context_menu: tk.Menu | None = None
         self.background_task_running = False
         self.pending_article_browser_selection = ""
@@ -10615,18 +10976,31 @@ class ApolloImportApp:
 
         self._configure_style()
         self._configure_window_icon()
-        self._build_layout()
+        with perf_timer("Start: Oberflaeche aufbauen"):
+            self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self._handle_close)
-        self._restore_session_state()
-        self._load_known_ids(initial=True)
-        self._load_genart_catalog(initial=True)
-        self._load_competitor_catalog(initial=True)
-        self._load_attribute_catalog(initial=True)
-        self._load_attribute_key_value_catalog(initial=True)
-        self._load_vehicle_catalog(initial=True)
-        self._load_attribute_mapping(initial=True)
-        self.refresh_preview()
+        with perf_timer("Start: Sitzung wiederherstellen"):
+            self._restore_session_state()
+        # Nur die Zeit im UI-Thread: Loader, die im Hintergrund weiterarbeiten,
+        # protokollieren ihren Abschluss separat.
+        with perf_timer("Start: IDs laden"):
+            self._load_known_ids(initial=True)
+        with perf_timer("Start: GenArt-Katalog laden"):
+            self._load_genart_catalog(initial=True)
+        with perf_timer("Start: KHer-Katalog laden"):
+            self._load_competitor_catalog(initial=True)
+        with perf_timer("Start: Attributkatalog laden"):
+            self._load_attribute_catalog(initial=True)
+        with perf_timer("Start: Schluesselwerte laden"):
+            self._load_attribute_key_value_catalog(initial=True)
+        with perf_timer("Start: KTyp-Katalog anstossen"):
+            self._load_vehicle_catalog(initial=True)
+        with perf_timer("Start: Attribut-Zuordnung laden"):
+            self._load_attribute_mapping(initial=True)
+        with perf_timer("Start: Artikelverzeichnis laden"):
+            self.refresh_preview()
         self._apply_pending_session_selection()
+        log_perf("ApolloImportApp.__init__ gesamt", time.perf_counter() - init_started, always=True)
 
     def _configure_style(self) -> None:
         style = ttk.Style()
@@ -11688,6 +12062,26 @@ class ApolloImportApp:
         self._update_article_browser_detail(self.article_browser_records[selected_article])
 
     def _handle_close(self) -> None:
+        # Das Live-Speichern laeuft im Hintergrund: offene Auftraege erst zu Ende
+        # schreiben (mit sichtbarem Status), sonst gingen die letzten Aenderungen
+        # beim Schliessen verloren. Waehrend des Wartens laeuft die Ereignis-
+        # schleife weiter - ein zweiter Klick auf Schliessen darf nichts anrichten.
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            completed = self._flush_live_writes(reason="Schließen: ")
+            if not completed and not messagebox.askyesno(
+                APP_TITLE,
+                "Das Speichern der letzten Änderungen ist noch nicht abgeschlossen.\n\n"
+                "Trotzdem beenden? Noch nicht geschriebene Änderungen gehen dann verloren.",
+            ):
+                self._closing = False
+                return
+        except tk.TclError:
+            pass
+        # Laufender Auftrag wird noch zu Ende geschrieben, danach endet der Thread.
+        self.live_writer.shutdown()
         try:
             self._save_session_state()
         except Exception:
@@ -13358,6 +13752,7 @@ if ($copied) {{
         elif not auto and added == 0:
             messagebox.showinfo(APP_TITLE, "Im Text wurden keine neuen Attribute erkannt.")
 
+    @perf_logged("KTyp-Katalog uebernehmen (UI-Thread)")
     def _apply_vehicle_catalog(self, catalog: VehicleCatalog) -> None:
         self.vehicle_catalog = catalog
         if hasattr(self, "vehicle_link_frame"):
@@ -14381,83 +14776,244 @@ if ($copied) {{
             rows,
         )
 
-    def _write_live_section(self, section: str, status_message: str | None = None) -> bool:
-        if self.live_write_suspended:
-            return False
+    def _run_live_write_job(self, job: LiveWriteJob) -> None:
+        """Laeuft im LiveWriter-Thread: schreibt die Bereiche des Auftrags.
 
-        try:
-            output_root = self._resolve_output_root()
-            bundle = self.collect_bundle()
-        except ValueError:
-            return False
-
-        try:
+        Hier darf nichts von Tkinter angefasst werden - nur Bundle, Pfade und
+        die Modulfunktionen. Die Datei-Sperre haelt Massenimport und manuelle
+        Exporte fern, solange ein Auftrag schreibt.
+        """
+        bundle = job.bundle
+        output_root = job.output_root
+        sections = job.sections
+        with WORKBOOK_WRITE_LOCK:
             output_root.mkdir(parents=True, exist_ok=True)
-            if section == "short_text":
+            if "short_text" in sections:
                 self._write_short_text_live(bundle, output_root)
-            elif section == "long_text":
+            if "long_text" in sections:
                 self._write_long_text_live(bundle, output_root)
-            elif section == "genart":
+            if "genart" in sections:
                 self._write_genart_live(bundle, output_root)
-            elif section == "oe_numbers":
+            if "oe_numbers" in sections:
                 self._write_oe_live(bundle, output_root)
-            elif section == "comparison_numbers":
+            if "comparison_numbers" in sections:
                 self._write_comparison_live(bundle, output_root)
-            elif section == "vehicle_links":
-                self._write_vehicle_link_live(bundle, output_root)
-            elif section == "attributes":
-                self._write_attribute_live(bundle, output_root)
-            elif section == "search_terms":
+            if "search_terms" in sections:
                 self._write_usage_number_live(bundle, output_root)
-                # Altbestand: eventuelle 9595-Suchwortzeilen aus der Attribute-Datei räumen.
+            if "vehicle_links" in sections:
+                self._write_vehicle_link_live(bundle, output_root)
+            if "attributes" in sections or "search_terms" in sections:
+                # Suchwoerter: Altbestand (9595-Suchwortzeilen) aus der Attribute-Datei
+                # raeumen - und die Attribute-Datei dabei nur einmal schreiben.
                 self._write_attribute_live(bundle, output_root)
-            elif section == "images":
+            if "images" in sections:
                 bundle.image_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild", kind_tag="")
                 self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
-            elif section == "documents":
+            if "documents" in sections:
                 bundle.document_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.document_rows, output_root, "Dokument", kind_tag="D")
                 self._write_media_section_live(bundle, output_root, DOCUMENT_FILE, DOCUMENT_HEADERS, build_document_export_rows(bundle))
-            elif section == "videos":
+            if "videos" in sections:
                 self._write_media_section_live(bundle, output_root, VIDEO_FILE, VIDEO_HEADERS, build_video_export_rows(bundle))
-            elif section == "web_links":
+            if "web_links" in sections:
                 self._write_media_section_live(bundle, output_root, WEB_LINK_FILE, WEB_HEADERS, build_web_export_rows(bundle))
-            else:
-                raise ValueError(f"Unbekannter Live-Bereich: {section}")
-        except Exception as exc:  # pragma: no cover - defensive UI feedback
-            self.status_var.set(f"Live-Speichern fehlgeschlagen: {exc}")
-            return False
 
-        self.id_registry.remember_article_ids(bundle.article_number, bundle.short_module_id, bundle.long_module_id)
-        self._upsert_article_browser_section(section, bundle, output_root)
-        self._mark_article_browser_in_sync(output_root)
-        self.status_var.set(status_message or f"Live gespeichert: {bundle.article_number}")
-        return True
+    def _live_saved_fingerprints(self, article_number: str, sections: set[str]) -> dict[str, str | None]:
+        """Fingerabdruecke des gespeicherten Standes (Output-Dateien) je Bereich.
 
-    def _write_live_database(self, status_message: str | None = None) -> bool:
+        Quelle ist der beim Laden/Schreiben gemerkte Stand; fehlt er (z. B.
+        nach Sitzungs-Wiederherstellung oder einer getippten Artikelnummer),
+        wird er aus dem Eintrag im Artikelverzeichnis abgeleitet, der den
+        Datentraeger spiegelt. None = unbekannt, der Bereich gilt als geaendert.
+        """
+        record = self.article_browser_records.get(article_number)
+        entry = self._live_fingerprints.get(article_number)
+        if entry is None or entry[0] is not record:
+            entry = (record, {})
+            self._live_fingerprints[article_number] = entry
+        cache = entry[1]
+        missing = [section for section in sections if section not in cache]
+        if missing and record is not None:
+            bundle = bundle_from_snapshot(record, self.attribute_key_values_by_group)
+            for section in missing:
+                cache[section] = live_section_fingerprint(bundle, section)[0]
+        return {section: cache.get(section) for section in sections}
+
+    def _submit_live_write(self, sections: set[str], status_message: str | None, perf_name: str) -> bool:
+        """Gemeinsamer Kern von _write_live_section und _write_live_database.
+
+        Sammelt das Bundle im UI-Thread ein, vergleicht die Fingerabdruecke der
+        gewuenschten Bereiche mit dem gespeicherten bzw. bereits eingereihten
+        Stand und reiht nur die wirklich geaenderten Bereiche beim
+        Hintergrund-Schreiber ein. Rueckgabe: True, wenn ein Auftrag erzeugt wurde.
+        """
         if self.live_write_suspended:
             return False
 
-        try:
-            output_root = self._resolve_output_root()
-            bundle = self.collect_bundle()
-        except ValueError:
-            return False
+        with perf_timer(perf_name):
+            try:
+                output_root = self._resolve_output_root()
+                bundle = self.collect_bundle()
+            except ValueError:
+                return False
 
-        try:
-            export_bundle(bundle, output_root, use_timestamp_subdir=False)
-        except Exception as exc:  # pragma: no cover - defensive UI feedback
-            self.status_var.set(f"Live-Speichern fehlgeschlagen: {exc}")
-            return False
+            article_number = bundle.article_number
+            # Fehlgeschlagene Bereiche des Artikels mit pruefen, damit sie beim
+            # naechsten Anlass nachgeholt werden.
+            sections = set(sections) | self._live_failed_sections.get(article_number, set())
+            fingerprints: dict[str, str] = {}
+            errors: dict[str, str] = {}
+            for section in LIVE_SECTIONS:
+                fingerprints[section], error_text = live_section_fingerprint(bundle, section)
+                if error_text and section in sections:
+                    errors[section] = error_text
 
-        self.id_registry.remember_article_ids(bundle.article_number, bundle.short_module_id, bundle.long_module_id)
-        self._upsert_article_browser_from_bundle(bundle, output_root)
-        self._mark_article_browser_in_sync(output_root)
-        self.status_var.set(status_message or f"Live gespeichert: {bundle.article_number}")
+            saved = self._live_saved_fingerprints(article_number, sections)
+            expected: dict[str, str | None] = dict(saved)
+            expected.update(self.live_writer.expected_fingerprints(article_number))
+            dirty = {section for section in sections if expected.get(section) != fingerprints[section]}
+
+            # Fachliche Fehler (z. B. OE-Nummer ohne Hersteller) sofort melden,
+            # wie bisher - dafuer braucht es keinen Hintergrund-Auftrag.
+            dirty_errors = [errors[section] for section in LIVE_SECTIONS if section in dirty and section in errors]
+            dirty -= set(errors)
+            if dirty_errors:
+                # Der Fehler soll auch nach dem Abschluss der uebrigen Bereiche in
+                # der Statuszeile stehen bleiben, nicht von "Live gespeichert" ueberdeckt werden.
+                status_message = f"Live-Speichern fehlgeschlagen: {dirty_errors[0]}"
+                self.status_var.set(status_message)
+            if not dirty:
+                if status_message and not dirty_errors:
+                    self.status_var.set(status_message)
+                return False
+
+            self.id_registry.remember_article_ids(article_number, bundle.short_module_id, bundle.long_module_id)
+            job = LiveWriteJob(
+                article_number=article_number,
+                sections=dirty,
+                bundle=bundle,
+                output_root=output_root,
+                fingerprints=fingerprints,
+                status_message=status_message,
+            )
+            self.live_writer.submit(job)
+            if not dirty_errors:
+                self.status_var.set(f"Speichere im Hintergrund: {article_number} ({job.section_labels()}) …")
+            self._schedule_live_write_poll()
+            return True
+
+    def _write_live_section(self, section: str, status_message: str | None = None) -> bool:
+        if section not in LIVE_SECTION_LABELS:
+            self.status_var.set(f"Live-Speichern fehlgeschlagen: Unbekannter Live-Bereich: {section}")
+            return False
+        return self._submit_live_write({section}, status_message, f"_write_live_section({section})")
+
+    def _write_live_database(self, status_message: str | None = None) -> bool:
+        # Alle Bereiche pruefen; geschrieben werden nur die geaenderten. Ohne
+        # Aenderung (typisch: Fokusverlust im Artikelnummer-Feld) passiert nichts.
+        return self._submit_live_write(set(LIVE_SECTIONS), status_message, "_write_live_database")
+
+    def _schedule_live_write_poll(self) -> None:
+        if self._live_write_poll_after_id is None:
+            self._live_write_poll_after_id = self.root.after(LIVE_WRITE_POLL_INTERVAL_MS, self._poll_live_write_results)
+
+    def _poll_live_write_results(self) -> None:
+        """Holt fertige Schreibauftraege ab (UI-Thread) und plant sich neu, solange etwas laeuft."""
+        if self._live_write_poll_after_id is not None:
+            # Auch direkt (ausserhalb des after-Timers) aufrufbar, z. B. beim
+            # Warten vor dem Schliessen - dann keinen zweiten Timer laufen lassen.
+            try:
+                self.root.after_cancel(self._live_write_poll_after_id)
+            except tk.TclError:
+                pass
+            self._live_write_poll_after_id = None
+        for job in self.live_writer.drain_results():
+            try:
+                self._on_live_write_done(job)
+            except Exception as exc:  # pragma: no cover - ein Fehler im Nachlauf darf keine weiteren Ergebnisse verschlucken
+                self.status_var.set(f"Live-Speichern: Nachlauf fehlgeschlagen ({job.article_number}): {exc}")
+                print(f"Live-Speichern: Nachlauf fehlgeschlagen ({job.article_number}): {exc!r}", file=sys.stderr)
+        if not self.live_writer.is_idle():
+            self._schedule_live_write_poll()
+
+    def _on_live_write_done(self, job: LiveWriteJob) -> None:
+        article_number = job.article_number
+        log_perf(
+            f"Hintergrund: Live-Schreiben {article_number}",
+            job.duration_seconds,
+            detail=job.section_labels() + (f"; Fehler: {job.error}" if job.error is not None else ""),
+        )
+        if job.error is not None:
+            self._live_failed_sections.setdefault(article_number, set()).update(job.sections)
+            message = f"Live-Speichern fehlgeschlagen ({article_number}, {job.section_labels()}): {job.error}"
+            self.status_var.set(message)
+            # Eine Meldung je Fehlerart - weitere Fehler derselben Art nur in der Statuszeile.
+            error_kind = type(job.error).__name__
+            if error_kind not in self._live_write_reported_errors:
+                self._live_write_reported_errors.add(error_kind)
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Das Live-Speichern in die Output-Dateien ist fehlgeschlagen:\n\n"
+                    f"{job.error}\n\n"
+                    f"Betroffen: {article_number} ({job.section_labels()}).\n"
+                    "Der Bereich wird bei der nächsten Änderung erneut geschrieben. "
+                    "Weitere Fehler dieser Art erscheinen nur noch in der Statuszeile.",
+                )
+            return
+
+        failed = self._live_failed_sections.get(article_number)
+        if failed:
+            failed -= job.sections
+            if not failed:
+                self._live_failed_sections.pop(article_number, None)
+
+        # Jetzt stimmt der Datentraeger: Verzeichnis-Eintrag aus dem geschriebenen
+        # Bundle (inkl. lokal abgelegter Medienpfade) nachziehen und die Ordner-
+        # Signatur merken, damit der naechste refresh_preview() nicht neu laedt.
+        if len(job.sections) == 1:
+            self._upsert_article_browser_section(next(iter(job.sections)), job.bundle, job.output_root)
+        else:
+            self._upsert_article_browser_from_bundle(job.bundle, job.output_root)
+        self._mark_article_browser_in_sync(job.output_root)
+        # Gespeicherter Stand = Formularstand zum Zeitpunkt des Auftrags (vor dem
+        # Medien-Download: die Maske zeigt weiterhin die Links, die Datei die
+        # lokalen Pfade - beides ist derselbe Stand). Die uebrigen Bereiche werden
+        # bei Bedarf aus dem frischen Verzeichnis-Eintrag abgeleitet.
+        record = self.article_browser_records.get(article_number)
+        self._live_fingerprints[article_number] = (
+            record,
+            {section: job.fingerprints[section] for section in job.sections if section in job.fingerprints},
+        )
+        if self.live_writer.is_idle():
+            self.status_var.set(job.status_message or f"Live gespeichert: {article_number} ({job.section_labels()})")
+        else:
+            self.status_var.set(f"Live gespeichert: {article_number} ({job.section_labels()}) – weitere Änderungen werden gespeichert …")
+
+    def _flush_live_writes(self, reason: str = "", timeout_seconds: float = LIVE_WRITE_FLUSH_TIMEOUT_SECONDS) -> bool:
+        """Wartet mit laufender Oberflaeche, bis alle Live-Schreibauftraege fertig sind.
+
+        Rueckgabe False, wenn die Obergrenze erreicht wurde. Wird vor allem
+        gebraucht, was die Output-Dateien selbst anfasst (Schliessen, manueller
+        Export, Loeschen) - sonst koennte ein noch wartender Auftrag das
+        Ergebnis wieder ueberschreiben.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while not self.live_writer.is_idle():
+            if time.monotonic() > deadline:
+                return False
+            self.status_var.set(f"{reason}Speichere noch {self.live_writer.pending_count()} Änderung(en) …")
+            self._poll_live_write_results()
+            try:
+                self.root.update()
+            except tk.TclError:
+                return False
+            time.sleep(0.05)
+        self._poll_live_write_results()
         return True
 
     def _on_live_data_changed(self) -> None:
         self._write_live_database()
 
+    @perf_logged("_on_article_entry_focus_out")
     def _on_article_entry_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
         article_number = normalize_article_number(self.article_number_var.get())
         if not article_number:
@@ -15061,13 +15617,16 @@ if ($copied) {{
                             post(index - 1, f"{identifier}: Übersetzung, Medien-Download & Export ...")
                             bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
                             article_media_warnings: list[str] = []
-                            export_bundle(
-                                bundle,
-                                output_root,
-                                use_timestamp_subdir=False,
-                                refresh_media=refresh_media,
-                                media_warnings=article_media_warnings,
-                            )
+                            # Gleiche Sperre wie der Live-Schreiber: ein vor dem Batch
+                            # eingereihter Live-Auftrag darf nicht parallel in dieselbe Datei schreiben.
+                            with WORKBOOK_WRITE_LOCK:
+                                export_bundle(
+                                    bundle,
+                                    output_root,
+                                    use_timestamp_subdir=False,
+                                    refresh_media=refresh_media,
+                                    media_warnings=article_media_warnings,
+                                )
                             summary["media_warnings"].extend(
                                 (bundle.article_number, warning) for warning in article_media_warnings
                             )
@@ -15640,12 +16199,23 @@ if ($copied) {{
             sources = ", ".join(str(path) for path in loaded_from)
             self.status_var.set(f"IDs erfolgreich geladen aus: {sources}")
 
+    @perf_logged("_refresh_article_browser")
     def _refresh_article_browser(self) -> None:
         records: dict[str, StoredArticleSnapshot] = {}
         output_folder = Path(self.output_dir_var.get().strip())
         signature: tuple[tuple[str, int, int], ...] = ()
 
         if output_folder.exists():
+            if self.article_browser_cache_dir == str(output_folder) and not self.live_writer.is_idle():
+                # Der Hintergrund-Schreiber ist gerade an den Output-Dateien: die
+                # Ordner-Signatur ist absichtlich im Fluss, und eine halb
+                # geschriebene Excel-Datei darf nicht gelesen werden. Eintrag und
+                # Signatur zieht der Abschluss des Auftrags nach (_on_live_write_done).
+                if self._article_browser_render_key() == self.article_browser_rendered_key:
+                    self._sync_article_browser_selection()
+                else:
+                    self._render_article_browser()
+                return
             signature = self._build_output_folder_signature(output_folder)
             if (
                 self.article_browser_cache_dir == str(output_folder)
@@ -15746,7 +16316,16 @@ if ($copied) {{
         )
         self.article_browser_detail.configure(state="disabled")
 
+    @perf_logged("_apply_article_snapshot")
     def _apply_article_snapshot(self, snapshot: StoredArticleSnapshot) -> None:
+        queued_bundle = self.live_writer.latest_bundle(snapshot.article_number)
+        if queued_bundle is not None:
+            # Fuer den Artikel wartet noch ein Schreibauftrag: dieser Stand ist
+            # juenger als der Verzeichnis-Eintrag (der wird erst nach dem
+            # Schreiben nachgezogen). Sonst wuerde die Maske auf den alten Stand
+            # zurueckfallen und die naechste Aenderung ihn auch auf den
+            # Datentraeger zurueckschreiben.
+            snapshot = self._snapshot_from_bundle(queued_bundle, snapshot.source_folder)
         self.article_number_var.set(snapshot.article_number)
         self.current_id_article_number = snapshot.article_number
         self.short_module_id_var.set(snapshot.short_module_id)
@@ -15775,8 +16354,18 @@ if ($copied) {{
             self.kunzer_product_url_var.set(snapshot.web_rows[0].path_or_link)
         else:
             self.kunzer_product_url_var.set("")
+        # Gespeicherter Stand fuer den Dirty-Check des Live-Schreibens: der
+        # Snapshot spiegelt die Output-Dateien (bzw. den eingereihten Auftrag),
+        # nicht irgendeinen Formularstand. Der Snapshot selbst ist der Anker:
+        # wird der Verzeichnis-Eintrag spaeter von anderer Seite ersetzt, leitet
+        # _live_saved_fingerprints neu von dort ab.
+        self._live_fingerprints[snapshot.article_number] = (
+            snapshot,
+            live_section_fingerprints(bundle_from_snapshot(snapshot, self.attribute_key_values_by_group)),
+        )
         self.status_var.set(f"Artikel geladen: {snapshot.article_number} ({snapshot.source_label})")
 
+    @perf_logged("load_selected_article_from_browser")
     def load_selected_article_from_browser(self) -> None:
         selection = self.article_browser_tree.selection()
         if not selection:
@@ -15860,24 +16449,28 @@ if ($copied) {{
         if not confirmed:
             return
 
+        # Offene Live-Auftraege zuerst abschliessen, sonst koennte ein wartender
+        # Auftrag den Artikel direkt nach dem Loeschen wieder anlegen.
+        self._flush_live_writes(reason="Löschen: ")
         try:
             output_root = self._resolve_output_root()
-            for file_spec, headers in [
-                (SHORT_TEXT_FILE, SHORT_TEXT_HEADERS),
-                (SHORT_MAPPING_FILE, SHORT_MAPPING_HEADERS),
-                (LONG_TEXT_FILE, SHORT_TEXT_HEADERS),
-                (GENART_FILE, GENART_HEADERS),
-                (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
-                (OE_FILE, OE_HEADERS),
-                (COMPARISON_FILE, COMPARISON_HEADERS),
-                (USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS),
-                (VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS),
-                (IMAGE_FILE, IMAGE_HEADERS),
-                (DOCUMENT_FILE, DOCUMENT_HEADERS),
-                (VIDEO_FILE, VIDEO_HEADERS),
-                (WEB_LINK_FILE, WEB_HEADERS),
-            ]:
-                remove_article_rows_from_workbook(output_root / file_spec[0], file_spec[1], headers, set(article_numbers))
+            with WORKBOOK_WRITE_LOCK:
+                for file_spec, headers in [
+                    (SHORT_TEXT_FILE, SHORT_TEXT_HEADERS),
+                    (SHORT_MAPPING_FILE, SHORT_MAPPING_HEADERS),
+                    (LONG_TEXT_FILE, SHORT_TEXT_HEADERS),
+                    (GENART_FILE, GENART_HEADERS),
+                    (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
+                    (OE_FILE, OE_HEADERS),
+                    (COMPARISON_FILE, COMPARISON_HEADERS),
+                    (USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS),
+                    (VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS),
+                    (IMAGE_FILE, IMAGE_HEADERS),
+                    (DOCUMENT_FILE, DOCUMENT_HEADERS),
+                    (VIDEO_FILE, VIDEO_HEADERS),
+                    (WEB_LINK_FILE, WEB_HEADERS),
+                ]:
+                    remove_article_rows_from_workbook(output_root / file_spec[0], file_spec[1], headers, set(article_numbers))
         except Exception as exc:  # pragma: no cover - defensive UI feedback
             messagebox.showerror(APP_TITLE, f"Artikel konnten nicht gelöscht werden:\n{exc}")
             self.status_var.set(f"Löschen fehlgeschlagen: {exc}")
@@ -15946,8 +16539,13 @@ if ($copied) {{
             messagebox.showwarning(APP_TITLE, str(exc))
             return False
 
+        # Offene Live-Auftraege zuerst abschliessen, dann unter der Datei-Sperre
+        # exportieren - der manuelle Export soll den juengsten Stand enthalten
+        # und nie gleichzeitig mit dem Hintergrund-Schreiber in eine Datei schreiben.
+        self._flush_live_writes(reason="Export: ")
         try:
-            export_dir = export_bundle(bundle, output_root, use_timestamp_subdir=not self.fixed_export_path_var.get())
+            with WORKBOOK_WRITE_LOCK:
+                export_dir = export_bundle(bundle, output_root, use_timestamp_subdir=not self.fixed_export_path_var.get())
         except Exception as exc:  # pragma: no cover - defensive user feedback
             messagebox.showerror(APP_TITLE, f"Export fehlgeschlagen:\n{exc}")
             self.status_var.set(f"Export fehlgeschlagen: {exc}")
