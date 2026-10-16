@@ -10597,10 +10597,22 @@ LIVE_SECTION_LABELS = {
     "videos": "Videos",
     "web_links": "Web-Links",
 }
+
+
+def format_live_section_labels(sections: set[str] | dict[str, object] | tuple[str, ...]) -> str:
+    """Bereichs-Labels in fester Schreibreihenfolge (fuer Status-/Fehlermeldungen)."""
+    return ", ".join(LIVE_SECTION_LABELS.get(section, section) for section in LIVE_SECTIONS if section in sections)
+
+
 # Abstand, in dem der UI-Thread Ergebnisse des Hintergrund-Schreibers abholt.
 LIVE_WRITE_POLL_INTERVAL_MS = 60
 # Obergrenze fuers Warten auf offene Schreibauftraege (Schliessen, Export, Loeschen).
 LIVE_WRITE_FLUSH_TIMEOUT_SECONDS = 30.0
+# Kurze Obergrenze fuers nicht-blockierende Nehmen der Datei-Sperre im UI-Thread
+# (manueller Export/Loeschen): kann die Sperre nicht rasch genommen werden, laeuft
+# gerade ein Massenimport-Schreibvorgang - dann abbrechen statt die Oberflaeche
+# sekundenlang einzufrieren.
+MANUAL_WRITE_LOCK_WAIT_SECONDS = 0.2
 
 
 def live_section_export_rows(bundle: ExportBundle, section: str) -> list[list[str]]:
@@ -10649,7 +10661,17 @@ def live_section_fingerprint(bundle: ExportBundle, section: str) -> tuple[str, s
         payload = f"error:{error_text}"
     else:
         error_text = ""
-        payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+        # auto_uni mit in den Fingerabdruck nehmen: bei uni == de liefern beide
+        # Einstellungen dieselben Export-Zeilen, das Umschalten der Checkbox soll
+        # aber trotzdem als Aenderung erkannt werden (sonst springt die Maske beim
+        # Neuladen zurueck).
+        if section == "short_text":
+            payload_obj: object = [rows, bool(bundle.short_auto_uni)]
+        elif section == "long_text":
+            payload_obj = [rows, bool(bundle.long_auto_uni)]
+        else:
+            payload_obj = rows
+        payload = json.dumps(payload_obj, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha1(payload.encode("utf-8")).hexdigest(), error_text
 
 
@@ -10705,6 +10727,12 @@ class LiveWriteJob:
     status_message: str | None = None
     # Vom Schreiber befuellt:
     error: Exception | None = None
+    # Fehler je Bereich: erfolgreiche Bereiche werden uebernommen, nur die hier
+    # vermerkten gelten als fehlgeschlagen (Teilweise-Fehlschlag).
+    section_errors: dict[str, Exception] = field(default_factory=dict)
+    # True, wenn der Auftrag nicht geschrieben wurde, weil das Live-Speichern beim
+    # Ausfuehren ausgesetzt war (Massenimport laeuft): der Nachlauf tut dann nichts.
+    skipped: bool = False
     duration_seconds: float = 0.0
 
     def section_labels(self) -> str:
@@ -10790,6 +10818,24 @@ class LiveWriter:
             if job.article_number != article_number:
                 continue
             for section in job.sections:
+                if section in job.fingerprints:
+                    expected[section] = job.fingerprints[section]
+        return expected
+
+    def completed_fingerprints(self, article_number: str) -> dict[str, str]:
+        """Fingerabdruecke bereits fertig geschriebener, aber noch nicht vom UI-Thread
+        abgeholter Auftraege (nur erfolgreich geschriebene Bereiche). Damit reiht ein
+        Fokusverlust in dem schmalen Fenster zwischen Fertigstellung und Abholung
+        denselben Bereich nicht ein zweites Mal ein."""
+        expected: dict[str, str] = {}
+        with self._condition:
+            jobs = list(self._results.queue)
+        for job in jobs:
+            if job.article_number != article_number or job.skipped:
+                continue
+            for section in job.sections:
+                if section in job.section_errors:
+                    continue
                 if section in job.fingerprints:
                     expected[section] = job.fingerprints[section]
         return expected
@@ -10945,6 +10991,14 @@ class ApolloImportApp:
         self.article_browser_cache_signature: tuple[tuple[str, int, int], ...] | None = None
         # Datenstand, den die Artikelliste zuletzt gezeichnet hat (siehe _article_browser_render_key).
         self.article_browser_rendered_key: tuple[tuple[str, int], ...] | None = None
+        # Ein Neuladen des Artikelverzeichnisses ist angefordert (Katalog neu geladen,
+        # KTyp-Parse fertig, Guard hat einen Reload uebersprungen), konnte aber wegen
+        # eines laufenden Live-Schreibens noch nicht ausgefuehrt werden. Der Wunsch
+        # darf nicht verloren gehen: _mark_article_browser_in_sync setzt die Signatur
+        # nicht, solange das Flag steht, und _on_live_write_done holt den Reload nach.
+        self._article_browser_reload_pending = False
+        # Verhindert, dass das verzoegerte Neuladen mehrfach eingeplant wird.
+        self._article_browser_reload_scheduled = False
         self.live_write_suspended = False
         # Hintergrund-Schreiber fuer das Live-Speichern (siehe LiveWriter). Die
         # Oberflaeche sammelt nur das Bundle ein und reiht den Auftrag ein.
@@ -12071,13 +12125,29 @@ class ApolloImportApp:
         self._closing = True
         try:
             completed = self._flush_live_writes(reason="Schließen: ")
-            if not completed and not messagebox.askyesno(
-                APP_TITLE,
-                "Das Speichern der letzten Änderungen ist noch nicht abgeschlossen.\n\n"
-                "Trotzdem beenden? Noch nicht geschriebene Änderungen gehen dann verloren.",
-            ):
-                self._closing = False
-                return
+            # Zuvor gescheiterte Bereiche (z. B. Datei war in Excel geoeffnet und ist
+            # jetzt frei) ein letztes Mal schreiben - fuer den aktuell geladenen Artikel.
+            if self._live_failed_sections:
+                try:
+                    self._write_live_database()
+                except Exception:
+                    pass
+                completed = self._flush_live_writes(reason="Schließen: ") and completed
+            if not completed or self._live_failed_sections:
+                if self._live_failed_sections:
+                    details = "; ".join(
+                        f"{article} ({format_live_section_labels(sections)})"
+                        for article, sections in self._live_failed_sections.items()
+                    )
+                    warning = f"Einige Änderungen konnten nicht gespeichert werden:\n\n{details}"
+                else:
+                    warning = "Das Speichern der letzten Änderungen ist noch nicht abgeschlossen."
+                if not messagebox.askyesno(
+                    APP_TITLE,
+                    warning + "\n\nTrotzdem beenden? Noch nicht geschriebene Änderungen gehen dann verloren.",
+                ):
+                    self._closing = False
+                    return
         except tk.TclError:
             pass
         # Laufender Auftrag wird noch zu Ende geschrieben, danach endet der Thread.
@@ -13779,7 +13849,10 @@ if ($copied) {{
         cached_catalog = load_vehicle_catalog_from_cache(source_path)
         if cached_catalog is not None:
             self._apply_vehicle_catalog(cached_catalog)
-            self.article_browser_cache_signature = None
+            self._request_article_browser_reload()
+            if hasattr(self, "article_browser_tree") and self.live_writer.is_idle():
+                # Fahrzeugnamen sofort ins Verzeichnis ziehen, sobald der Katalog da ist.
+                self._refresh_article_browser()
             if not initial:
                 self.status_var.set(f"KTyp-Stammdaten geladen: {cached_catalog.count} Datensätze")
             return
@@ -13807,7 +13880,13 @@ if ($copied) {{
                         messagebox.showwarning(APP_TITLE, f"KTyp-Datei konnte nicht geladen werden:\n{error}")
                     return
                 self._apply_vehicle_catalog(catalog)
-                self.article_browser_cache_signature = None
+                # Kaltstart: der KTyp-Parse war beim ersten Einlesen der Artikelliste
+                # noch nicht fertig, die Fahrzeugzeilen im Verzeichnis sind daher ohne
+                # Hersteller/Modell. Neuladen anfordern (Flag ueberlebt ein gerade
+                # laufendes Live-Schreiben) und - wenn moeglich - sofort nachziehen.
+                self._request_article_browser_reload()
+                if hasattr(self, "article_browser_tree") and self.live_writer.is_idle():
+                    self._refresh_article_browser()
                 if not initial:
                     self.status_var.set(f"KTyp-Stammdaten geladen: {catalog.count} Datensätze")
 
@@ -13937,7 +14016,7 @@ if ($copied) {{
             self.oe_frame.set_manufacturer_catalog(manufacturer_options)
         if hasattr(self, "comparison_frame"):
             self.comparison_frame.set_competitor_catalog(competitor_options)
-        self.article_browser_cache_signature = None
+        self._request_article_browser_reload()
         if not initial:
             self.status_var.set(
                 f"KHer-CSV geladen: {len(manufacturer_options)} Hersteller, {len(competitor_options)} Mitbewerber für Vergleichsnummern"
@@ -13974,7 +14053,7 @@ if ($copied) {{
         self.attribute_count_var.set(f"{len(options)} Attribute geladen")
         if hasattr(self, "attribute_frame"):
             self.attribute_frame.set_attribute_catalog(options)
-        self.article_browser_cache_signature = None
+        self._request_article_browser_reload()
         if not initial:
             self.status_var.set(f"Attributkatalog geladen: {len(options)} Einträge")
             self.refresh_preview()
@@ -14015,7 +14094,7 @@ if ($copied) {{
         )
         if hasattr(self, "attribute_frame"):
             self.attribute_frame.set_attribute_key_value_catalog(self.attribute_key_values_by_group)
-        self.article_browser_cache_signature = None
+        self._request_article_browser_reload()
         if not initial:
             self.status_var.set(f"Schlüsselwertkatalog geladen: {len(options)} Einträge")
             self.refresh_preview()
@@ -14786,36 +14865,71 @@ if ($copied) {{
         bundle = job.bundle
         output_root = job.output_root
         sections = job.sections
+        if self.live_write_suspended:
+            # Waehrend eines Massenimports darf kein Live-Schreiben in dieselben
+            # Output-Dateien greifen (siehe live_write_suspended). Ein beim Aussetzen
+            # bereits laufender oder wartender Auftrag wird deshalb verworfen - der
+            # Massenimport liefert den maszgeblichen Stand. Im Normalbetrieb werden
+            # offene Auftraege vor dem Aussetzen per _flush_live_writes abgeschlossen,
+            # dieser Fall tritt dort also nicht ein.
+            job.skipped = True
+            return
+        errors: dict[str, Exception] = {}
+
+        def attempt(section: str, write: Callable[[], None]) -> None:
+            # Jeder Bereich schreibt fuer sich: eine gesperrte Datei (z. B. in Excel
+            # geoeffnet) laesst nur ihren Bereich scheitern, die uebrigen Bereiche
+            # desselben Auftrags werden weiter geschrieben.
+            if section not in sections:
+                return
+            try:
+                write()
+            except Exception as exc:  # pragma: no cover - im UI-Thread gemeldet
+                errors[section] = exc
+
         with WORKBOOK_WRITE_LOCK:
-            output_root.mkdir(parents=True, exist_ok=True)
-            if "short_text" in sections:
-                self._write_short_text_live(bundle, output_root)
-            if "long_text" in sections:
-                self._write_long_text_live(bundle, output_root)
-            if "genart" in sections:
-                self._write_genart_live(bundle, output_root)
-            if "oe_numbers" in sections:
-                self._write_oe_live(bundle, output_root)
-            if "comparison_numbers" in sections:
-                self._write_comparison_live(bundle, output_root)
-            if "search_terms" in sections:
-                self._write_usage_number_live(bundle, output_root)
-            if "vehicle_links" in sections:
-                self._write_vehicle_link_live(bundle, output_root)
+            try:
+                output_root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:  # pragma: no cover - Ordner nicht anlegbar: alle Bereiche scheitern
+                job.section_errors = {section: exc for section in sections}
+                job.error = exc
+                return
+            attempt("short_text", lambda: self._write_short_text_live(bundle, output_root))
+            attempt("long_text", lambda: self._write_long_text_live(bundle, output_root))
+            attempt("genart", lambda: self._write_genart_live(bundle, output_root))
+            attempt("oe_numbers", lambda: self._write_oe_live(bundle, output_root))
+            attempt("comparison_numbers", lambda: self._write_comparison_live(bundle, output_root))
+            attempt("search_terms", lambda: self._write_usage_number_live(bundle, output_root))
+            attempt("vehicle_links", lambda: self._write_vehicle_link_live(bundle, output_root))
             if "attributes" in sections or "search_terms" in sections:
                 # Suchwoerter: Altbestand (9595-Suchwortzeilen) aus der Attribute-Datei
-                # raeumen - und die Attribute-Datei dabei nur einmal schreiben.
-                self._write_attribute_live(bundle, output_root)
-            if "images" in sections:
+                # raeumen - und die Attribute-Datei dabei nur einmal schreiben. Scheitert
+                # das, gelten beide beteiligten Bereiche als fehlgeschlagen.
+                try:
+                    self._write_attribute_live(bundle, output_root)
+                except Exception as exc:  # pragma: no cover - im UI-Thread gemeldet
+                    if "attributes" in sections:
+                        errors["attributes"] = exc
+                    if "search_terms" in sections:
+                        errors["search_terms"] = exc
+
+            def write_images() -> None:
                 bundle.image_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild", kind_tag="")
                 self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
-            if "documents" in sections:
+
+            def write_documents() -> None:
                 bundle.document_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.document_rows, output_root, "Dokument", kind_tag="D")
                 self._write_media_section_live(bundle, output_root, DOCUMENT_FILE, DOCUMENT_HEADERS, build_document_export_rows(bundle))
-            if "videos" in sections:
-                self._write_media_section_live(bundle, output_root, VIDEO_FILE, VIDEO_HEADERS, build_video_export_rows(bundle))
-            if "web_links" in sections:
-                self._write_media_section_live(bundle, output_root, WEB_LINK_FILE, WEB_HEADERS, build_web_export_rows(bundle))
+
+            attempt("images", write_images)
+            attempt("documents", write_documents)
+            attempt("videos", lambda: self._write_media_section_live(bundle, output_root, VIDEO_FILE, VIDEO_HEADERS, build_video_export_rows(bundle)))
+            attempt("web_links", lambda: self._write_media_section_live(bundle, output_root, WEB_LINK_FILE, WEB_HEADERS, build_web_export_rows(bundle)))
+
+        if errors:
+            job.section_errors = errors
+            # Repraesentativer Fehler fuer die Writer-Statistik (jobs_failed).
+            job.error = next(iter(errors.values()))
 
     def _live_saved_fingerprints(self, article_number: str, sections: set[str]) -> dict[str, str | None]:
         """Fingerabdruecke des gespeicherten Standes (Output-Dateien) je Bereich.
@@ -14869,8 +14983,16 @@ if ($copied) {{
 
             saved = self._live_saved_fingerprints(article_number, sections)
             expected: dict[str, str | None] = dict(saved)
+            # Fertige, aber noch nicht abgeholte Auftraege spiegeln ebenfalls den
+            # Platten-Stand; danach die noch laufenden/wartenden (juengster Stand gewinnt).
+            expected.update(self.live_writer.completed_fingerprints(article_number))
             expected.update(self.live_writer.expected_fingerprints(article_number))
             dirty = {section for section in sections if expected.get(section) != fingerprints[section]}
+            # Zuvor gescheiterte Bereiche immer erneut versuchen - unabhaengig vom
+            # Vergleich: der Verzeichnis-Eintrag kann den noch nicht geschriebenen
+            # Stand bereits anzeigen, der Fingerabdruck-Cache haelt aber den echten
+            # Platten-Stand, und ein Nachholen darf nie uebersprungen werden.
+            dirty |= self._live_failed_sections.get(article_number, set())
 
             # Fachliche Fehler (z. B. OE-Nummer ohne Hersteller) sofort melden,
             # wie bisher - dafuer braucht es keinen Hintergrund-Auftrag.
@@ -14937,56 +15059,153 @@ if ($copied) {{
 
     def _on_live_write_done(self, job: LiveWriteJob) -> None:
         article_number = job.article_number
+        if job.skipped:
+            # Auftrag wurde wegen eines laufenden Massenimports verworfen: nichts
+            # nachziehen (der Batch-Abschluss aktualisiert Eintrag und Maske).
+            return
+        section_errors = dict(job.section_errors)
+        if job.error is not None and not section_errors:
+            # Unerwarteter Gesamtfehler (z. B. Ordner nicht anlegbar): alle Bereiche.
+            section_errors = {section: job.error for section in job.sections}
+        succeeded = {section for section in job.sections if section not in section_errors}
+
         log_perf(
             f"Hintergrund: Live-Schreiben {article_number}",
             job.duration_seconds,
-            detail=job.section_labels() + (f"; Fehler: {job.error}" if job.error is not None else ""),
+            detail=job.section_labels() + (f"; Fehler: {format_live_section_labels(section_errors)}" if section_errors else ""),
         )
-        if job.error is not None:
-            self._live_failed_sections.setdefault(article_number, set()).update(job.sections)
-            message = f"Live-Speichern fehlgeschlagen ({article_number}, {job.section_labels()}): {job.error}"
-            self.status_var.set(message)
+
+        # Ausgabeordner inzwischen gewechselt? Dann nur melden - Eintrag und
+        # Fingerabdruecke gehoeren zum alten Ordner und wuerden die Liste des neuen
+        # Ordners verfaelschen (kein Upsert/Sync, kein Umstellen der Signatur).
+        try:
+            current_output = str(Path(self.output_dir_var.get().strip()))
+        except Exception:
+            current_output = self.article_browser_cache_dir
+        if str(job.output_root) != current_output:
+            if section_errors:
+                self.status_var.set(
+                    f"Live-Speichern fehlgeschlagen ({article_number}, {format_live_section_labels(section_errors)}) – anderer Ausgabeordner."
+                )
+            else:
+                self.status_var.set(
+                    f"Live gespeichert: {article_number} ({format_live_section_labels(succeeded)}) – anderer Ausgabeordner."
+                )
+            return
+
+        # Auswahl/Fokus/Detail des Nutzers merken: der Abschluss kommt asynchron und
+        # darf die (ggf. mehrfache) Auswahl nicht auf den geschriebenen Artikel umstellen.
+        tree = self.article_browser_tree
+        prev_selection = tuple(tree.selection())
+        prev_focus = tree.focus()
+
+        # Bisher bekannten Fingerabdruck-Cache sichern (mergen statt ersetzen) und als
+        # Rueckfalle den Platten-Stand des bisherigen Eintrags - BEVOR dieser mit dem
+        # Formularstand ueberschrieben wird. So kennt der Cache fuer jeden Bereich den
+        # echten Platten-Stand, auch fuer die nicht geschriebenen.
+        prev_entry = self._live_fingerprints.get(article_number)
+        prev_cache = dict(prev_entry[1]) if prev_entry is not None else {}
+        old_record = self.article_browser_records.get(article_number)
+        if old_record is not None:
+            base_fingerprints = live_section_fingerprints(
+                bundle_from_snapshot(old_record, self.attribute_key_values_by_group)
+            )
+        else:
+            base_fingerprints = {}
+
+        # Nur die erfolgreich geschriebenen Bereiche in den Verzeichnis-Eintrag
+        # uebernehmen und die Ordner-Signatur merken.
+        if succeeded:
+            if len(succeeded) == 1:
+                self._upsert_article_browser_section(next(iter(succeeded)), job.bundle, job.output_root)
+            else:
+                self._upsert_article_browser_from_bundle(job.bundle, job.output_root)
+            self._mark_article_browser_in_sync(job.output_root)
+
+        # Fehlgeschlagene Bereiche vormerken, erfolgreiche austragen.
+        if section_errors:
+            self._live_failed_sections.setdefault(article_number, set()).update(section_errors)
+        failed = self._live_failed_sections.get(article_number)
+        if failed:
+            failed -= succeeded
+            if not failed:
+                self._live_failed_sections.pop(article_number, None)
+
+        # Fingerabdruck-Cache vollstaendig halten, damit der Dirty-Check nicht vom
+        # Verzeichnis-Eintrag (der den Formularstand zeigt) in die Irre gefuehrt wird:
+        #  - frisch geschriebene Bereiche: Formular-Fingerabdruck vom Auftrag (= Platte),
+        #  - nicht geschriebene Bereiche: bisher bekannten Platten-Fingerabdruck behalten
+        #    (wichtig fuer Medien, deren Eintrag lokale Pfade, die Maske aber Links fuehrt),
+        #  - sonst (z. B. nach Sitzungs-Wiederherstellung) aus dem bisherigen Eintrag ableiten.
+        record = self.article_browser_records.get(article_number)
+        cache: dict[str, str] = {}
+        for section in LIVE_SECTIONS:
+            if section in succeeded and section in job.fingerprints:
+                cache[section] = job.fingerprints[section]
+            elif section in prev_cache:
+                cache[section] = prev_cache[section]
+            elif section in base_fingerprints:
+                cache[section] = base_fingerprints[section]
+        self._live_fingerprints[article_number] = (record, cache)
+
+        # Fahrzeugverknuepfungen tragen die GenArt je Zeile (build_vehicle_link_export_rows):
+        # nach einem ERFOLGREICHEN GenArt-Schreiben die Fahrzeugzeilen desselben Artikels
+        # nachziehen. Bewusst als eigener Folgeauftrag mit dem Bundle DIESES Auftrags
+        # (nicht dem aktuellen Formular - der Nutzer koennte inzwischen gewechselt haben),
+        # damit der GenArt-Auftrag selbst nur "genart" umfasst und bei fehlgeschlagener
+        # GenArt keine abweichenden Fahrzeugzeilen entstehen.
+        if "genart" in succeeded and not self.live_write_suspended:
+            vehicle_fp = job.fingerprints.get("vehicle_links")
+            if vehicle_fp is not None and cache.get("vehicle_links") != vehicle_fp:
+                self.live_writer.submit(
+                    LiveWriteJob(
+                        article_number=article_number,
+                        sections={"vehicle_links"},
+                        bundle=job.bundle,
+                        output_root=job.output_root,
+                        fingerprints=job.fingerprints,
+                    )
+                )
+                self._schedule_live_write_poll()
+
+        if section_errors:
+            representative = next(iter(section_errors.values()))
+            failed_labels = format_live_section_labels(section_errors)
+            self.status_var.set(f"Live-Speichern fehlgeschlagen ({article_number}, {failed_labels}): {representative}")
             # Eine Meldung je Fehlerart - weitere Fehler derselben Art nur in der Statuszeile.
-            error_kind = type(job.error).__name__
+            error_kind = type(representative).__name__
             if error_kind not in self._live_write_reported_errors:
                 self._live_write_reported_errors.add(error_kind)
                 messagebox.showerror(
                     APP_TITLE,
                     "Das Live-Speichern in die Output-Dateien ist fehlgeschlagen:\n\n"
-                    f"{job.error}\n\n"
-                    f"Betroffen: {article_number} ({job.section_labels()}).\n"
+                    f"{representative}\n\n"
+                    f"Betroffen: {article_number} ({failed_labels}).\n"
                     "Der Bereich wird bei der nächsten Änderung erneut geschrieben. "
                     "Weitere Fehler dieser Art erscheinen nur noch in der Statuszeile.",
                 )
-            return
-
-        failed = self._live_failed_sections.get(article_number)
-        if failed:
-            failed -= job.sections
-            if not failed:
-                self._live_failed_sections.pop(article_number, None)
-
-        # Jetzt stimmt der Datentraeger: Verzeichnis-Eintrag aus dem geschriebenen
-        # Bundle (inkl. lokal abgelegter Medienpfade) nachziehen und die Ordner-
-        # Signatur merken, damit der naechste refresh_preview() nicht neu laedt.
-        if len(job.sections) == 1:
-            self._upsert_article_browser_section(next(iter(job.sections)), job.bundle, job.output_root)
+        elif self.live_writer.is_idle():
+            self.status_var.set(job.status_message or f"Live gespeichert: {article_number} ({format_live_section_labels(succeeded)})")
         else:
-            self._upsert_article_browser_from_bundle(job.bundle, job.output_root)
-        self._mark_article_browser_in_sync(job.output_root)
-        # Gespeicherter Stand = Formularstand zum Zeitpunkt des Auftrags (vor dem
-        # Medien-Download: die Maske zeigt weiterhin die Links, die Datei die
-        # lokalen Pfade - beides ist derselbe Stand). Die uebrigen Bereiche werden
-        # bei Bedarf aus dem frischen Verzeichnis-Eintrag abgeleitet.
-        record = self.article_browser_records.get(article_number)
-        self._live_fingerprints[article_number] = (
-            record,
-            {section: job.fingerprints[section] for section in job.sections if section in job.fingerprints},
-        )
-        if self.live_writer.is_idle():
-            self.status_var.set(job.status_message or f"Live gespeichert: {article_number} ({job.section_labels()})")
-        else:
-            self.status_var.set(f"Live gespeichert: {article_number} ({job.section_labels()}) – weitere Änderungen werden gespeichert …")
+            self.status_var.set(
+                f"Live gespeichert: {article_number} ({format_live_section_labels(succeeded)}) – weitere Änderungen werden gespeichert …"
+            )
+
+        # Auswahl/Detail des Nutzers nach dem Baumneuaufbau wiederherstellen.
+        self._restore_article_browser_selection(prev_selection, prev_focus)
+
+        # Ausstehendes Neuladen des Verzeichnisses nachholen, sobald nichts mehr laeuft
+        # (z. B. Katalog neu geladen / KTyp-Parse fertig, waehrend ein Auftrag lief).
+        # Nicht inline: der komplette Neuaufbau vom Netzlaufwerk darf _on_live_write_done
+        # nicht sekundenlang aufhalten - deshalb im naechsten Leerlauf-Tick.
+        if self.live_writer.is_idle() and self._article_browser_reload_pending and not self._article_browser_reload_scheduled:
+            self._article_browser_reload_scheduled = True
+            self.root.after(0, self._run_deferred_article_browser_reload)
+
+    def _run_deferred_article_browser_reload(self) -> None:
+        self._article_browser_reload_scheduled = False
+        if self._article_browser_reload_pending and self.live_writer.is_idle():
+            self._refresh_article_browser()
 
     def _flush_live_writes(self, reason: str = "", timeout_seconds: float = LIVE_WRITE_FLUSH_TIMEOUT_SECONDS) -> bool:
         """Wartet mit laufender Oberflaeche, bis alle Live-Schreibauftraege fertig sind.
@@ -15008,6 +15227,28 @@ if ($copied) {{
                 return False
             time.sleep(0.05)
         self._poll_live_write_results()
+        return True
+
+    def _acquire_workbook_lock_pumping(self, reason: str, timeout_seconds: float = MANUAL_WRITE_LOCK_WAIT_SECONDS) -> bool:
+        """Nimmt WORKBOOK_WRITE_LOCK ohne den UI-Thread hart zu blockieren.
+
+        Statt blockierend zu warten (waehrend ein Massenimport die Sperre ueber
+        einen ganzen export_bundle inkl. Medien-Download haelt, Sekunden bis
+        Minuten), wird in kurzen Schritten nicht-blockierend versucht und dazwischen
+        die Ereignisschleife bedient (wie in _flush_live_writes). Liefert True, wenn
+        die Sperre genommen wurde (dann MUSS der Aufrufer sie wieder freigeben),
+        sonst False (Obergrenze erreicht - der Aufrufer bricht mit Hinweis ab).
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while not WORKBOOK_WRITE_LOCK.acquire(blocking=False):
+            if time.monotonic() > deadline:
+                return False
+            self.status_var.set(f"{reason}Warte auf Dateizugriff (Hintergrundvorgang laeuft) …")
+            try:
+                self.root.update()
+            except tk.TclError:
+                return False
+            time.sleep(0.02)
         return True
 
     def _on_live_data_changed(self) -> None:
@@ -15386,6 +15627,20 @@ if ($copied) {{
         attribute_options_worker = list(self.attribute_options)
         attribute_options_by_id_worker = dict(self.attribute_options_by_id)
         attribute_key_values_worker = dict(self.attribute_key_values_by_group)
+
+        # Offene Live-Auftraege zuerst abschliessen: sonst laeuft ein noch wartender
+        # Auftrag NACH dem Batch-Export desselben Artikels und ueberschreibt dessen
+        # frisch abgerufene Daten (gleiche Datei-Sperre, FIFO). live_write_suspended
+        # verhindert nur NEUE Auftraege, nicht bereits eingereihte.
+        if not self._flush_live_writes(reason=f"{run_label}: "):
+            if not messagebox.askyesno(
+                APP_TITLE,
+                "Es sind noch nicht alle Live-Speicherungen abgeschlossen.\n\n"
+                f"{run_label} trotzdem starten? Noch nicht geschriebene Änderungen könnten "
+                "vom Massenimport überschrieben werden.",
+            ):
+                self.status_var.set(f"{run_label} abgebrochen: Live-Speichern noch nicht abgeschlossen.")
+                return
 
         if output_root.exists():
             self.id_registry.load_from_folder(output_root, clear_existing=False)
@@ -16211,6 +16466,11 @@ if ($copied) {{
                 # Ordner-Signatur ist absichtlich im Fluss, und eine halb
                 # geschriebene Excel-Datei darf nicht gelesen werden. Eintrag und
                 # Signatur zieht der Abschluss des Auftrags nach (_on_live_write_done).
+                if self.article_browser_cache_signature is None:
+                    # Ein Neuladen wurde angefordert (Katalog/KTyp), kann jetzt aber
+                    # nicht ausgefuehrt werden: Wunsch merken, der Auftrags-Abschluss
+                    # holt ihn nach - sonst bliebe die Liste dauerhaft veraltet.
+                    self._article_browser_reload_pending = True
                 if self._article_browser_render_key() == self.article_browser_rendered_key:
                     self._sync_article_browser_selection()
                 else:
@@ -16220,11 +16480,12 @@ if ($copied) {{
             if (
                 self.article_browser_cache_dir == str(output_folder)
                 and self.article_browser_cache_signature == signature
+                and not self._article_browser_reload_pending
             ):
-                # Auf der Platte hat sich nichts geaendert. Die Liste nur neu
-                # aufbauen, wenn sich die Datensaetze seit dem letzten Aufbau
-                # geaendert haben (z. B. Live-Upsert); sonst reicht der Abgleich
-                # von Auswahl und Detailansicht. Der komplette Neuaufbau der
+                # Auf der Platte hat sich nichts geaendert und kein Neuladen steht
+                # aus. Die Liste nur neu aufbauen, wenn sich die Datensaetze seit dem
+                # letzten Aufbau geaendert haben (z. B. Live-Upsert); sonst reicht der
+                # Abgleich von Auswahl und Detailansicht. Der komplette Neuaufbau der
                 # ~3.800 Zeilen kostete sonst bei jedem Artikelwechsel ~0,5 s.
                 if self._article_browser_render_key() == self.article_browser_rendered_key:
                     self._sync_article_browser_selection()
@@ -16244,6 +16505,8 @@ if ($copied) {{
         self.article_browser_records = records
         self.article_browser_cache_dir = str(output_folder)
         self.article_browser_cache_signature = signature
+        # Das angeforderte Neuladen ist erledigt.
+        self._article_browser_reload_pending = False
         self._render_article_browser()
 
     def _article_browser_render_key(self) -> tuple[tuple[str, int], ...]:
@@ -16282,11 +16545,41 @@ if ($copied) {{
         reicht es, die jetzt gueltige Signatur zu merken. Aenderungen von aussen
         erkennt die Signatur weiterhin.
         """
+        if self._article_browser_reload_pending:
+            # Ein angefordertes Neuladen (Katalog/KTyp) steht aus: die Signatur
+            # NICHT setzen, sonst gilt die Liste als aktuell und der Reload-Wunsch
+            # geht verloren. _on_live_write_done holt den Reload nach.
+            self.article_browser_cache_signature = None
+            return
         try:
             self.article_browser_cache_dir = str(output_root)
             self.article_browser_cache_signature = self._build_output_folder_signature(output_root)
         except OSError:
             self.article_browser_cache_signature = None
+
+    def _request_article_browser_reload(self) -> None:
+        """Markiert, dass das Artikelverzeichnis neu von der Platte geladen werden
+        muss (z. B. nach dem Neuladen eines Katalogs). Setzt die Signatur auf None
+        und merkt den Wunsch, damit er nicht von einem gleichzeitig laufenden
+        Live-Schreiben verworfen wird."""
+        self.article_browser_cache_signature = None
+        self._article_browser_reload_pending = True
+
+    def _restore_article_browser_selection(self, selection: tuple[str, ...], focus_item: str) -> None:
+        """Stellt die (ggf. mehrfache) Auswahl und die Detailansicht des Nutzers
+        wieder her, ohne sie auf einen vom Hintergrund-Schreiber beruehrten Artikel
+        umzustellen."""
+        tree = self.article_browser_tree
+        valid = [article for article in selection if tree.exists(article)]
+        if not valid:
+            return
+        tree.selection_set(valid)
+        if focus_item and tree.exists(focus_item):
+            tree.focus(focus_item)
+        if len(valid) == 1:
+            self._update_article_browser_detail(self.article_browser_records.get(valid[0]))
+        else:
+            self._update_article_browser_multi_detail(list(valid))
 
     def _update_article_browser_detail(self, snapshot: StoredArticleSnapshot | None) -> None:
         self.article_browser_detail.configure(state="normal")
@@ -16454,27 +16747,43 @@ if ($copied) {{
         self._flush_live_writes(reason="Löschen: ")
         try:
             output_root = self._resolve_output_root()
-            with WORKBOOK_WRITE_LOCK:
-                for file_spec, headers in [
-                    (SHORT_TEXT_FILE, SHORT_TEXT_HEADERS),
-                    (SHORT_MAPPING_FILE, SHORT_MAPPING_HEADERS),
-                    (LONG_TEXT_FILE, SHORT_TEXT_HEADERS),
-                    (GENART_FILE, GENART_HEADERS),
-                    (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
-                    (OE_FILE, OE_HEADERS),
-                    (COMPARISON_FILE, COMPARISON_HEADERS),
-                    (USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS),
-                    (VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS),
-                    (IMAGE_FILE, IMAGE_HEADERS),
-                    (DOCUMENT_FILE, DOCUMENT_HEADERS),
-                    (VIDEO_FILE, VIDEO_HEADERS),
-                    (WEB_LINK_FILE, WEB_HEADERS),
-                ]:
-                    remove_article_rows_from_workbook(output_root / file_spec[0], file_spec[1], headers, set(article_numbers))
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        # Sperre nicht hart blockierend nehmen (siehe export_current_bundle): laeuft
+        # gerade ein Massenimport, die Oberflaeche nicht sekundenlang einfrieren.
+        if not self._acquire_workbook_lock_pumping("Löschen: "):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Das Löschen ist gerade nicht möglich, weil die Output-Dateien von einem "
+                "Hintergrundvorgang (z. B. Massenimport) geschrieben werden.\n\n"
+                "Bitte kurz warten und erneut löschen.",
+            )
+            self.status_var.set("Löschen abgebrochen: Output-Dateien sind gerade belegt.")
+            return
+        try:
+            for file_spec, headers in [
+                (SHORT_TEXT_FILE, SHORT_TEXT_HEADERS),
+                (SHORT_MAPPING_FILE, SHORT_MAPPING_HEADERS),
+                (LONG_TEXT_FILE, SHORT_TEXT_HEADERS),
+                (GENART_FILE, GENART_HEADERS),
+                (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
+                (OE_FILE, OE_HEADERS),
+                (COMPARISON_FILE, COMPARISON_HEADERS),
+                (USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS),
+                (VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS),
+                (IMAGE_FILE, IMAGE_HEADERS),
+                (DOCUMENT_FILE, DOCUMENT_HEADERS),
+                (VIDEO_FILE, VIDEO_HEADERS),
+                (WEB_LINK_FILE, WEB_HEADERS),
+            ]:
+                remove_article_rows_from_workbook(output_root / file_spec[0], file_spec[1], headers, set(article_numbers))
         except Exception as exc:  # pragma: no cover - defensive UI feedback
             messagebox.showerror(APP_TITLE, f"Artikel konnten nicht gelöscht werden:\n{exc}")
             self.status_var.set(f"Löschen fehlgeschlagen: {exc}")
             return
+        finally:
+            WORKBOOK_WRITE_LOCK.release()
 
         for article_number in article_numbers:
             self.article_browser_records.pop(article_number, None)
@@ -16543,13 +16852,26 @@ if ($copied) {{
         # exportieren - der manuelle Export soll den juengsten Stand enthalten
         # und nie gleichzeitig mit dem Hintergrund-Schreiber in eine Datei schreiben.
         self._flush_live_writes(reason="Export: ")
+        # Sperre nicht hart blockierend nehmen: laeuft gerade ein Massenimport
+        # (export_bundle inkl. Medien-Download unter der Sperre), bliebe die
+        # Oberflaeche sonst sekundenlang stehen.
+        if not self._acquire_workbook_lock_pumping("Export: "):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Der Export ist gerade nicht möglich, weil die Output-Dateien von einem "
+                "Hintergrundvorgang (z. B. Massenimport) geschrieben werden.\n\n"
+                "Bitte kurz warten und erneut exportieren.",
+            )
+            self.status_var.set("Export abgebrochen: Output-Dateien sind gerade belegt.")
+            return False
         try:
-            with WORKBOOK_WRITE_LOCK:
-                export_dir = export_bundle(bundle, output_root, use_timestamp_subdir=not self.fixed_export_path_var.get())
+            export_dir = export_bundle(bundle, output_root, use_timestamp_subdir=not self.fixed_export_path_var.get())
         except Exception as exc:  # pragma: no cover - defensive user feedback
             messagebox.showerror(APP_TITLE, f"Export fehlgeschlagen:\n{exc}")
             self.status_var.set(f"Export fehlgeschlagen: {exc}")
             return False
+        finally:
+            WORKBOOK_WRITE_LOCK.release()
 
         self.refresh_preview()
         if self.fixed_export_path_var.get():
