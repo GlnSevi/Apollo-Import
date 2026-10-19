@@ -216,6 +216,24 @@ Suchwoerter sind in Apollo Referenzen vom Typ `Gebrauchsnummer` (Reiter `Referen
 
 Bis v0.1.31 wurden Suchwoerter faelschlich als Attribut `Zusatzbezeichnung` (Kriterien ID `9595`) in die `Attribute.xlsx` geschrieben. Solche Altzeilen werden beim Laden aus den Output-Dateien weiterhin als Suchwoerter erkannt und beim naechsten Speichern des Artikels nach `Gebrauchsnummern.xlsx` ueberfuehrt; aus der `Attribute.xlsx` verschwinden sie dabei.
 
+### Import aus Excel/CSV
+
+Ueber `Aus Datei importieren…` im Tab `Suchwoerter` lassen sich Suchwoerter fuer viele Artikel auf einmal aus einer XLSX- (Blatt 1) oder CSV-Datei (Trennzeichen automatisch, utf-8 oder Windows-1252) uebernehmen. Nach der Dateiauswahl zeigt ein Dialog die Vorschau (Anzahl Artikel und Suchwoerter, uebersprungene Eintraege, Artikel, die noch nicht im Verzeichnis stehen) und fragt den Modus ab:
+
+- `Ergaenzen`: vorhandene Suchwoerter der betroffenen Artikel bleiben, neue kommen dazu (Duplikate ohne Gross-/Kleinschreibung werden ignoriert)
+- `Ersetzen`: die Suchwoerter der in der Datei genannten Artikel werden komplett durch die Datei ersetzt
+- Artikel, die nicht in der Datei stehen, bleiben in beiden Faellen unberuehrt; Artikel, die noch nicht im Verzeichnis sind, werden nur mit ihren Suchwoertern angelegt
+
+Akzeptierte Spalten (Kopfzeile Pflicht, Gross-/Kleinschreibung egal):
+
+- Artikelspalte: `Artikelnummer`, `ArtikelNr`, `ArtNr`, `Produktnummer`, `SKU` oder `Article`; numerische Zellen (z. B. `14100501`) werden als Text uebernommen
+- Suchwortspalte(n): `Suchwort`, `Suchwoerter`, `Suchbegriff(e)`, `Gebrauchsnummer(n)`, `Keyword(s)` oder `Nummer` - auch mehrere Spalten wie `Suchwort 1`, `Suchwort 2`, `Keyword 3`, die zusammengefuehrt werden; eine exportierte `Gebrauchsnummern.xlsx` laesst sich damit direkt wieder einlesen
+- eine Zelle darf mehrere Suchwoerter enthalten, getrennt durch `;`, `,`, `|` oder Zeilenumbruch
+- fehlt die Artikelspalte, gelten alle Suchwoerter fuer den Artikel, der gerade in der Maske steht (ohne Artikelnummer in der Maske bricht der Import mit Hinweis ab); fehlt die Suchwortspalte bei genau zwei Spalten, gilt die Spalte neben der Artikelnummer als Suchwortspalte
+- leere Eintraege und Suchwoerter ueber 50 Zeichen werden uebersprungen und in der Zusammenfassung aufgefuehrt
+
+Der Import schreibt die `Gebrauchsnummern.xlsx` in einem Zug (Zeitstempel unveraenderter Zeilen bleiben erhalten) und aktualisiert Artikelverzeichnis und Maske direkt, ohne alle Output-Dateien neu zu laden.
+
 ## TecDoc Anhangsformattyp ID
 
 Die Exportdateien fuer Bilder, Dokumente, Videos und Web Links enthalten zusaetzlich die Spalte `TecDoc Anhangsformattyp ID`.
