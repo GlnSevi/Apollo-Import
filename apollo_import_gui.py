@@ -3432,9 +3432,11 @@ SEARCH_TERM_IMPORT_HEADER_ALIASES = {
     "nummer",
 }
 SEARCH_TERM_IMPORT_HEADER_PREFIXES = ("suchwort", "suchbegriff", "keyword", "gebrauchsnummer")
-# Mehrere Suchwoerter in einer Zelle: ; , | Zeilenumbruch oder Tab. Bewusst
-# nicht split_code_list_input - das trennt nur an ; bzw. Zeilenumbruch.
-_SEARCH_TERM_CELL_SPLIT_RE = re.compile(r"[;,|\r\n\t]+")
+# Mehrere Suchwoerter in einer Zelle: ; | Zeilenumbruch oder Tab, dazu Komma -
+# aber nicht zwischen zwei Ziffern, damit Masse wie "10,5 mm" oder "1,5 Zoll"
+# ein Suchwort bleiben (wie in der Maske, die nur an ; trennt). Bewusst nicht
+# split_code_list_input - das trennt nur an ; bzw. Zeilenumbruch.
+_SEARCH_TERM_CELL_SPLIT_RE = re.compile(r"[;|\r\n\t]+|,(?!\d)|(?<!\d),")
 
 
 def normalize_import_header(value: object) -> str:
@@ -3491,7 +3493,12 @@ def read_import_table(path: Path) -> tuple[list[object], list[list[object]], str
             with path.open("r", encoding=encoding, newline="") as handle:
                 sample = handle.read(4096)
                 handle.seek(0)
-                delimiter = _choose_csv_delimiter(sample)
+                # Trennzeichen nur aus der Kopfzeile bestimmen: die Datenzellen
+                # enthalten Suchwortlisten ("Bremse;Scheibe") oder Dezimalkommas
+                # ("10,5 mm"), die ueber das ganze Sample gezaehlt das falsche
+                # Zeichen gewinnen lassen. Eine Kopfzeile ohne Kandidaten
+                # (einspaltige Datei) faellt auf ; zurueck.
+                delimiter = _choose_csv_delimiter(next(iter(sample.splitlines()), ""))
                 # csv.reader statt DictReader: gleichnamige Spalten (zweimal
                 # "Suchwort") duerfen nicht zusammenfallen.
                 rows = [list(row) for row in csv.reader(handle, delimiter=delimiter)]
@@ -3577,6 +3584,13 @@ def read_search_term_import(path: Path, fallback_article: str = "") -> SearchTer
         article_header=headers[article_index] if article_index is not None else "",
         term_headers=[headers[index] for index in term_indexes],
     )
+    # Breite der Kopfzeile = letzte beschriftete Spalte. Zellen dahinter kommen
+    # vor allem aus CSV-Zeilen ohne Anfuehrungszeichen ("14100501;Bremse;Scheibe"
+    # bei zwei Kopfzeilen): sie gehoeren zur letzten Suchwortspalte, wenn diese
+    # die letzte Kopfzeilenspalte ist - sonst werden sie sichtbar uebersprungen,
+    # damit nichts still verschwindet.
+    header_width = max((index + 1 for index, header in enumerate(headers) if header), default=0)
+    extra_cells_are_terms = bool(term_indexes) and term_indexes[-1] == header_width - 1
     seen_by_article: dict[str, set[str]] = {}
     for row_number, row in enumerate(data_rows, start=2):
         article_text = ""
@@ -3586,9 +3600,17 @@ def read_search_term_import(path: Path, fallback_article: str = "") -> SearchTer
         for index in term_indexes:
             if index < len(row):
                 raw_terms.extend(split_search_term_cell(row[index]))
-        if not article_text and not raw_terms:
+        extra_cells = [text for text in (import_cell_text(cell) for cell in row[header_width:]) if text]
+        if extra_cells and extra_cells_are_terms:
+            for cell in extra_cells:
+                raw_terms.extend(split_search_term_cell(cell))
+            extra_cells = []
+        if not article_text and not raw_terms and not extra_cells:
             continue
         result.row_count += 1
+        if extra_cells:
+            preview = "; ".join(extra_cells)
+            result.skipped.append(f"Zeile {row_number}: {len(extra_cells)} Zelle(n) ohne Spaltenkopf ({preview[:60]})")
 
         article_number = normalize_article_number(article_text) if article_index is not None else fallback
         if not article_number:
@@ -3641,7 +3663,9 @@ def format_search_term_import_preview(
     lines.append(f"Suchwörter: {imported.term_count}")
     if imported.duplicate_count:
         lines.append(f"Doppelte Einträge in der Datei (zusammengeführt): {imported.duplicate_count}")
-    lines.append(f"Übersprungene Einträge (leer oder länger als {SEARCH_TERM_MAX_LENGTH} Zeichen): {len(imported.skipped)}")
+    lines.append(
+        f"Übersprungene Einträge (leer, ohne Spaltenkopf oder länger als {SEARCH_TERM_MAX_LENGTH} Zeichen): {len(imported.skipped)}"
+    )
     for entry in imported.skipped[:example_limit]:
         lines.append(f"  - {entry}")
     if len(imported.skipped) > example_limit:
@@ -6204,8 +6228,7 @@ def apply_search_term_import(
     output_root: Path,
     imported_terms: dict[str, list[str]],
     mode: str,
-    known_terms: dict[str, list[str]] | None = None,
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], str]:
     """Schreibt einen Suchwort-Import in EINEM Schreibvorgang in die Gebrauchsnummern.xlsx.
 
     mode "append": vorhandene Suchwoerter der betroffenen Artikel bleiben (in
@@ -6213,23 +6236,29 @@ def apply_search_term_import(
     schreibung entfallen. mode "replace": die Suchwoerter der genannten Artikel
     werden komplett durch die Datei ersetzt. Andere Artikel bleiben unberuehrt.
 
-    `known_terms` sind die Suchwoerter laut Artikelverzeichnis: enthaelt es fuer
-    einen Artikel Woerter, die nicht in der Gebrauchsnummern.xlsx stehen, sind das
     Alt-Suchwoerter (9595-Zeilen der Attribute.xlsx, siehe
-    LEGACY_SEARCH_TERM_CRITERIA_ID). Beim Ergaenzen wandern sie mit in die
-    Referenzdatei, beim Ersetzen entfallen sie - in beiden Faellen werden ihre
-    Altzeilen aus der Attribute.xlsx geraeumt, so wie es das Live-Speichern tut.
+    LEGACY_SEARCH_TERM_CRITERIA_ID) werden direkt aus der Attribute.xlsx gelesen
+    (read_legacy_search_terms) - bewusst nicht aus dem Artikelverzeichnis, dessen
+    Eintrag aelter sein kann als die Datei: extern oder nach einem gescheiterten
+    Live-Schreiben entfernte Suchwoerter kaemen sonst beim Ergaenzen zurueck. Beim
+    Ergaenzen wandern die Alt-Suchwoerter mit in die Referenzdatei, beim Ersetzen
+    entfallen sie; in beiden Faellen werden ihre Altzeilen danach aus der
+    Attribute.xlsx geraeumt.
 
-    Rueckgabe: die geschriebene Suchwortliste je betroffenem Artikel. Der
-    Aufrufer haelt WORKBOOK_WRITE_LOCK; das Schreiben selbst ist atomar
-    (write_workbook), eine gesperrte Datei laesst die Ausnahme durch.
+    Rueckgabe: (geschriebene Suchwortliste je betroffenem Artikel, Warnungstext
+    oder ''). Der Aufrufer haelt WORKBOOK_WRITE_LOCK; das Schreiben der
+    Gebrauchsnummern.xlsx ist atomar (write_workbook), eine gesperrte Datei laesst
+    die Ausnahme durch - dann ist nichts geschrieben. Scheitert erst die Raeumung
+    der Altzeilen (Attribute.xlsx gesperrt), ist der Import in der
+    Gebrauchsnummern.xlsx trotzdem vollstaendig: die Warnung benennt es, ein
+    erneuter Import derselben Datei holt die Raeumung nach.
     """
     if mode not in {"append", "replace"}:
         raise ValueError(f"Unbekannter Import-Modus: {mode}")
     path = output_root / USAGE_NUMBER_FILE[0]
     written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    legacy_terms, legacy_articles = read_legacy_search_terms(output_root, set(imported_terms))
     final_terms: dict[str, list[str]] = {}
-    legacy_articles: set[str] = set()
     with _workbook_file_lock(_workbook_cache_key(path)):
         existing_rows = prepare_existing_rows_for_write(path, USAGE_NUMBER_FILE[1], USAGE_NUMBER_HEADERS)
         file_terms: dict[str, list[str]] = {article: [] for article in imported_terms}
@@ -6238,22 +6267,53 @@ def apply_search_term_import(
             if article_key in file_terms and str(row[2]).strip():
                 file_terms[article_key].append(str(row[2]).strip())
         for article, new_terms in imported_terms.items():
-            base_terms = normalize_search_terms(file_terms[article])
-            base_keys = {term.casefold() for term in base_terms}
-            legacy_terms = [term for term in (known_terms or {}).get(article, []) if term.casefold() not in base_keys]
-            if legacy_terms:
-                legacy_articles.add(article)
             if mode == "append":
-                final_terms[article] = normalize_search_terms(base_terms + legacy_terms + list(new_terms))
+                # Reihenfolge wie beim Laden eines Artikels: Datei, dann Altbestand,
+                # dann die neuen Woerter; bei Duplikaten bleibt die Datei-Schreibweise.
+                final_terms[article] = normalize_search_terms(
+                    file_terms[article] + legacy_terms.get(article, []) + list(new_terms)
+                )
             else:
                 final_terms[article] = normalize_search_terms(list(new_terms))
         merged_rows = merge_usage_number_import_rows(existing_rows, final_terms, written_at)
         if not _workbook_already_holds(path, USAGE_NUMBER_FILE[1], USAGE_NUMBER_HEADERS, merged_rows):
             output_root.mkdir(parents=True, exist_ok=True)
             write_workbook(path, USAGE_NUMBER_FILE[1], USAGE_NUMBER_HEADERS, merged_rows)
+    warning = ""
     if legacy_articles:
-        remove_legacy_search_term_attribute_rows(output_root, legacy_articles)
-    return final_terms
+        try:
+            remove_legacy_search_term_attribute_rows(output_root, legacy_articles)
+        except Exception as exc:
+            warning = (
+                f"Die Alt-Suchwortzeilen (Kriterien-ID {LEGACY_SEARCH_TERM_CRITERIA_ID}) von "
+                f"{len(legacy_articles)} Artikel(n) konnten nicht aus der {ATTRIBUTE_FILE[0]} entfernt werden "
+                f"(Datei in Excel geöffnet?):\n{exc}\n"
+                f"Die Suchwörter sind vollständig in die {USAGE_NUMBER_FILE[0]} geschrieben. "
+                "Ein erneuter Import derselben Datei räumt die Altzeilen nach, sobald die Datei frei ist."
+            )
+    return final_terms, warning
+
+
+def read_legacy_search_terms(output_root: Path, article_numbers: set[str]) -> tuple[dict[str, list[str]], set[str]]:
+    """Alt-Suchwoerter (Kriterien-ID 9595, Spalte Wert) der Artikel aus der Attribute.xlsx.
+
+    Rueckgabe: (Suchwoerter je Artikel in Dateireihenfolge, Artikel mit
+    mindestens einer Altzeile - auch mit leerem Wert, damit sie geraeumt wird).
+    """
+    path = output_root / ATTRIBUTE_FILE[0]
+    terms: dict[str, list[str]] = {}
+    articles: set[str] = set()
+    if not article_numbers or not path.exists():
+        return terms, articles
+    for row in prepare_existing_rows_for_write(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS):
+        article_key = normalize_article_number(str(row[0]))
+        if article_key not in article_numbers or str(row[1]).strip() != LEGACY_SEARCH_TERM_CRITERIA_ID:
+            continue
+        articles.add(article_key)
+        value = str(row[4]).strip()
+        if value:
+            terms.setdefault(article_key, []).append(value)
+    return terms, articles
 
 
 def remove_legacy_search_term_attribute_rows(output_root: Path, article_numbers: set[str]) -> None:
@@ -9619,7 +9679,8 @@ class SearchTermFrame(ttk.LabelFrame):
                 f"Suchwort als Freitext in 'Nummer'). Der Export schreibt sie in die {USAGE_NUMBER_FILE[0]} - "
                 f"eine Zeile pro Suchwort, maximal {SEARCH_TERM_MAX_LENGTH} Zeichen. Mehrere Suchwörter mit ; trennen; "
                 "mit 'Aus Datei importieren…' lassen sich Suchwörter für viele Artikel aus einer Excel-/CSV-Liste "
-                "(Spalten Artikelnummer + Suchwort) ergänzen oder ersetzen."
+                "(Spalten Artikelnummer + Suchwort; mehrere je Zelle mit ; oder Komma - außer in Zahlen wie 10,5 mm) "
+                "ergänzen oder ersetzen."
             ),
             foreground="#5E6472",
             wraplength=980,
@@ -17422,9 +17483,23 @@ if ($copied) {{
             self.status_var.set(f"Suchwort-Import abgebrochen: {exc}")
             return
 
+        # Laufende Live-Auftraege abschliessen, dann das Verzeichnis auf den
+        # Plattenstand bringen (Signaturpruefung; ohne Aenderung von aussen kostet
+        # das nichts): nur so stimmt "noch nicht im Verzeichnis" in Vorschau und
+        # Zusammenfassung. Bewusst VOR dem Sichern der Maske: ein erfolgreicher
+        # Live-Auftrag stempelt die Ordner-Signatur (_mark_article_browser_in_sync),
+        # und Aenderungen anderer Nutzer an anderen Artikeln, die vor dem Import
+        # auf der Platte gelandet sind, blieben sonst im Verzeichnis unsichtbar.
+        self._flush_live_writes(reason="Suchwort-Import: ")
+        self._refresh_article_browser()
+        # Offene Aenderungen der Maske sichern und abschliessen - sonst koennte ein
+        # wartender Auftrag den Import gleich wieder ueberschreiben.
+        if current_article:
+            self._write_live_database()
+        self._flush_live_writes(reason="Suchwort-Import: ")
         # Das Verzeichnis spiegelt nur dann den Ausgabeordner, wenn es daraus
-        # geladen wurde - sonst ist "unbekannter Artikel" nicht bestimmbar und
-        # nach dem Schreiben wird komplett neu geladen.
+        # geladen wurde (nach dem Refresh der Regelfall) - sonst ist "unbekannter
+        # Artikel" nicht bestimmbar und nach dem Schreiben wird komplett neu geladen.
         records_in_sync = self.article_browser_cache_dir == str(output_root)
         unknown_articles = (
             sorted(article for article in imported.terms_by_article if article not in self.article_browser_records)
@@ -17436,11 +17511,9 @@ if ($copied) {{
             self.status_var.set("Suchwort-Import abgebrochen.")
             return
 
-        # Offene Aenderungen der Maske erst sichern und alle Live-Auftraege
-        # abschliessen - sonst koennte ein wartender Auftrag den Import gleich
-        # wieder ueberschreiben bzw. "Ergaenzen" von einem veralteten Stand ausgehen.
-        if current_article:
-            self._write_live_database()
+        # Der Dialog hat die Ereignisschleife bedient (z. B. Fokusverlust der
+        # Maske): einen dabei entstandenen Auftrag noch abschliessen - im
+        # Leerlauf kostet das nichts.
         self._flush_live_writes(reason="Suchwort-Import: ")
         if not self._acquire_workbook_lock_pumping("Suchwort-Import: "):
             messagebox.showwarning(
@@ -17453,16 +17526,11 @@ if ($copied) {{
             return
         started = time.perf_counter()
         try:
-            known_terms = (
-                {
-                    article: list(self.article_browser_records[article].search_terms)
-                    for article in imported.terms_by_article
-                    if article in self.article_browser_records
-                }
-                if records_in_sync
-                else {}
-            )
-            final_terms = apply_search_term_import(output_root, imported.terms_by_article, mode, known_terms)
+            # Wirft nur, wenn die Gebrauchsnummern.xlsx selbst nicht geschrieben
+            # werden konnte (dann ist nichts geschrieben). Eine gescheiterte
+            # Raeumung der 9595-Altzeilen kommt als Warnung zurueck - der Import
+            # ist dann trotzdem vollstaendig und wird unten normal nachgezogen.
+            final_terms, legacy_warning = apply_search_term_import(output_root, imported.terms_by_article, mode)
         except Exception as exc:  # pragma: no cover - defensive UI feedback (z. B. Datei in Excel geoeffnet)
             messagebox.showerror(APP_TITLE, f"Die Suchwörter konnten nicht geschrieben werden:\n{exc}")
             self.status_var.set(f"Suchwort-Import fehlgeschlagen: {exc}")
@@ -17507,7 +17575,15 @@ if ($copied) {{
             summary.append("  " + ", ".join(unknown_articles[:20]))
             if len(unknown_articles) > 20:
                 summary.append(f"  … und {len(unknown_articles) - 20} weitere")
-        messagebox.showinfo(APP_TITLE, "\n".join(summary))
+        if legacy_warning:
+            summary.extend(["", f"Hinweis: {legacy_warning}"])
+            self.status_var.set(
+                f"Suchwörter importiert ({mode_label}): {len(final_terms)} Artikel - "
+                f"Altzeilen in {ATTRIBUTE_FILE[0]} konnten nicht entfernt werden (Datei gesperrt?)."
+            )
+            messagebox.showwarning(APP_TITLE, "\n".join(summary))
+        else:
+            messagebox.showinfo(APP_TITLE, "\n".join(summary))
 
     def _apply_search_term_import_to_memory(self, final_terms: dict[str, list[str]], output_root: Path) -> None:
         """Zieht nach apply_search_term_import Verzeichnis, Fingerabdruecke und Maske nach.

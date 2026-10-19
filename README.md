@@ -228,11 +228,12 @@ Akzeptierte Spalten (Kopfzeile Pflicht, Gross-/Kleinschreibung egal):
 
 - Artikelspalte: `Artikelnummer`, `ArtikelNr`, `ArtNr`, `Produktnummer`, `SKU` oder `Article`; numerische Zellen (z. B. `14100501`) werden als Text uebernommen
 - Suchwortspalte(n): `Suchwort`, `Suchwoerter`, `Suchbegriff(e)`, `Gebrauchsnummer(n)`, `Keyword(s)` oder `Nummer` - auch mehrere Spalten wie `Suchwort 1`, `Suchwort 2`, `Keyword 3`, die zusammengefuehrt werden; eine exportierte `Gebrauchsnummern.xlsx` laesst sich damit direkt wieder einlesen
-- eine Zelle darf mehrere Suchwoerter enthalten, getrennt durch `;`, `,`, `|` oder Zeilenumbruch
+- eine Zelle darf mehrere Suchwoerter enthalten, getrennt durch `;`, `|`, Zeilenumbruch oder Komma - ein Komma zwischen zwei Ziffern trennt nicht, `10,5 mm` oder `1,5 Zoll` bleiben ein Suchwort
+- bei CSV-Dateien bestimmt die Kopfzeile das Trennzeichen (`;`, `,`, Tab oder `|`); ueberzaehlige Zellen einer Datenzeile (z. B. `14100501;Bremse;Scheibe` ohne Anfuehrungszeichen) zaehlen zur letzten Suchwortspalte, wenn diese die letzte Spalte der Kopfzeile ist - sonst werden sie als "ohne Spaltenkopf" uebersprungen und in Vorschau und Zusammenfassung genannt
 - fehlt die Artikelspalte, gelten alle Suchwoerter fuer den Artikel, der gerade in der Maske steht (ohne Artikelnummer in der Maske bricht der Import mit Hinweis ab); fehlt die Suchwortspalte bei genau zwei Spalten, gilt die Spalte neben der Artikelnummer als Suchwortspalte
 - leere Eintraege und Suchwoerter ueber 50 Zeichen werden uebersprungen und in der Zusammenfassung aufgefuehrt
 
-Der Import schreibt die `Gebrauchsnummern.xlsx` in einem Zug (Zeitstempel unveraenderter Zeilen bleiben erhalten) und aktualisiert Artikelverzeichnis und Maske direkt, ohne alle Output-Dateien neu zu laden.
+Der Import schreibt die `Gebrauchsnummern.xlsx` in einem Zug (Zeitstempel unveraenderter Zeilen bleiben erhalten) und aktualisiert Artikelverzeichnis und Maske direkt, ohne alle Output-Dateien neu zu laden; vorher gleicht er das Verzeichnis einmal mit dem Ausgabeordner ab, damit die Vorschau die noch nicht vorhandenen Artikel richtig zaehlt. Alt-Suchwoerter (Kriterien-ID `9595` in der `Attribute.xlsx`) liest der Import direkt aus der Datei: beim Ergaenzen wandern sie mit in die `Gebrauchsnummern.xlsx`, beim Ersetzen entfallen sie, ihre Altzeilen verschwinden in beiden Faellen aus der `Attribute.xlsx`. Ist die `Attribute.xlsx` dabei gesperrt (z. B. in Excel geoeffnet), bleiben die Suchwoerter trotzdem vollstaendig importiert; die Zusammenfassung weist darauf hin, und ein erneuter Import derselben Datei raeumt die Altzeilen nach.
 
 ## TecDoc Anhangsformattyp ID
 
