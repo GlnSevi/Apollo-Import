@@ -12029,6 +12029,9 @@ class ApolloImportApp:
         self.deepl_base_url_var = tk.StringVar(value=os.getenv("DEEPL_API_BASE_URL", DEEPL_DEFAULT_BASE_URL))
         self.anthropic_api_key_var = tk.StringVar(value=os.getenv("ANTHROPIC_API_KEY", ""))
         self.claude_model_var = tk.StringVar(value=CLAUDE_DEFAULT_MODEL)
+        # Marke (Attribut 8988): kanonische Markenliste mit Aliassen fuer die
+        # Erkennung aus den Kunzer-Abrufsignalen (Einstellungen, Sitzungszustand).
+        self.brand_list_var = tk.StringVar(value=DEFAULT_BRAND_LIST)
         self.kunzer_product_url_var = tk.StringVar()
         self.genart_display_var = tk.StringVar()
         self.genart_suggestion_var = tk.StringVar(value="Keine GenArt geladen.")
@@ -12897,6 +12900,7 @@ class ApolloImportApp:
                 "batch_web": self.batch_web_var.get(),
                 "batch_attribute": self.batch_attribute_var.get(),
                 "batch_attribute_dry_run": self.batch_attribute_dry_run_var.get(),
+                "brand_list": self.brand_list_var.get(),
             },
             "article": {
                 "article_number": self.article_number_var.get(),
@@ -13063,6 +13067,10 @@ class ApolloImportApp:
                 self.batch_attribute_var.set(bool(options.get("batch_attribute", self.batch_attribute_var.get())))
                 self.batch_attribute_dry_run_var.set(
                     bool(options.get("batch_attribute_dry_run", self.batch_attribute_dry_run_var.get()))
+                )
+                # Aeltere Sitzungsdateien ohne Markenliste behalten den Standard.
+                self.brand_list_var.set(
+                    str(options.get("brand_list", self.brand_list_var.get()) or "").strip() or DEFAULT_BRAND_LIST
                 )
 
             article = payload.get("article")
@@ -13805,6 +13813,35 @@ if ($copied) {{
             row=25, column=1, columnspan=2, sticky="w"
         )
 
+        # Marke (Attribut 8988): Markenliste fuer die automatische Erkennung.
+        ttk.Separator(parent, orient="horizontal").grid(row=26, column=0, columnspan=3, sticky="ew", pady=(14, 12))
+        ttk.Label(parent, text="Marke (Attribut 8988)", font=("Segoe UI Semibold", 10)).grid(
+            row=27, column=0, columnspan=2, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(parent, text="Markenliste").grid(row=28, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.brand_list_var).grid(row=28, column=1, sticky="ew", pady=6)
+        brand_actions = ttk.Frame(parent)
+        brand_actions.grid(row=28, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(
+            brand_actions,
+            text="Standard",
+            command=lambda: self.brand_list_var.set(DEFAULT_BRAND_LIST),
+        ).grid(row=0, column=0)
+        ttk.Label(
+            parent,
+            text=(
+                "Beim Kunzer-Abruf (Einzelartikel und Massenimport) wird die Marke jedes Artikels automatisch als "
+                "Attribut 8988 'Marke' gesetzt - erkannt aus Medienordner, Kategoriepfad, Shop-Suchwoertern, "
+                "Texten und Link-Labels der Produktseite; ohne Treffer gilt 'Kunzer'. Eine bereits gepflegte Marke "
+                "wird nie ueberschrieben. Die Liste nennt die erlaubten Markennamen (max. 20 Zeichen) und ihre "
+                "Schreibweisen: Eintraege mit ';' trennen, Aliasse nach '=' mit ',' (Gross-/Kleinschreibung egal), "
+                "z. B. 'TDL=T D L,tdl; Weber Hydraulik=weber-hydraulik'. Leerzeichen und Bindestriche in "
+                "Aliassen sind beliebig ('T D L' trifft auch 'TDL')."
+            ),
+            foreground="#5E6472",
+            wraplength=760,
+        ).grid(row=29, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
     def _toggle_article_browser_section(self) -> None:
         self.article_browser_collapsed = not self.article_browser_collapsed
         self._apply_article_browser_visibility()
@@ -14087,7 +14124,9 @@ if ($copied) {{
             text=(
                 "Attribute werden nur ergänzt, nie überschrieben. Im Testlauf wird ausschließlich der "
                 "Attribut-Testbericht.xlsx erzeugt - ideal zum Prüfen vor einem großen Lauf. "
-                "Unsichere Treffer landen zusätzlich in der Attribute_Pruefliste.xlsx."
+                "Unsichere Treffer landen zusätzlich in der Attribute_Pruefliste.xlsx. "
+                "Die Marke (Attribut 8988) wird bei jedem Abruf automatisch ergänzt - auch ohne 'Attribute' "
+                "und im Testlauf (Markenliste in den Einstellungen)."
             ),
             wraplength=500,
             foreground="#5E6472",
@@ -14929,6 +14968,47 @@ if ($copied) {{
         elif not auto and added == 0:
             messagebox.showinfo(APP_TITLE, "Im Text wurden keine neuen Attribute erkannt.")
 
+    def _existing_attribute_rows_for_fetch(self, article_number: str) -> list[AttributeRow]:
+        """Attributzeilen, die der Artikel beim Kunzer-Abruf behalten soll.
+
+        Bis v0.1.35 wurden die Attribute der Maske beim Abruf hart geleert und
+        dieser Leerstand live geschrieben - manuell gepflegte Zeilen (z. B. eine
+        Marke) gingen damit auf der Platte verloren. Jetzt zaehlt der
+        gespeicherte Stand DES ARTIKELS: ein noch wartender Schreibauftrag,
+        sonst der Eintrag im Artikelverzeichnis (spiegelt die Output-Dateien).
+        Die Maske selbst ist keine Quelle: sie kann noch die Zeilen eines zuvor
+        geladenen anderen Artikels zeigen, wenn nur die Artikelnummer getippt
+        wurde - die duerfen nicht auf den neuen Artikel uebergehen.
+        """
+        article_key = normalize_article_number(article_number)
+        if not article_key:
+            return []
+        queued_bundle = self.live_writer.latest_bundle(article_key)
+        if queued_bundle is not None:
+            return list(queued_bundle.attribute_rows)
+        record = self.article_browser_records.get(article_key)
+        if record is not None:
+            return list(record.attribute_rows)
+        return []
+
+    def _apply_brand_attribute_after_fetch(self, result: KunzerScrapeResult) -> str:
+        """Marke (Attribut 8988) nach dem Kunzer-Abruf in die Maske setzen.
+
+        Rein lokal (keine Netz-/KI-Aufrufe): die Marke wird aus den Signalen
+        des Abruf-Ergebnisses erkannt (detect_article_brand, Markenliste aus
+        den Einstellungen). Grundlage sind die gespeicherten Attributzeilen des
+        Artikels (_existing_attribute_rows_for_fetch): eine vorhandene
+        8988-Zeile mit Wert gewinnt immer, die uebrigen Zeilen bleiben
+        erhalten. Wird innerhalb von _suspend_live_write aufgerufen - das
+        Schreiben uebernimmt der Aufrufer. Rueckgabe: der Markenwert der Maske.
+        """
+        existing = self._existing_attribute_rows_for_fetch(self.article_number_var.get())
+        option = brand_attribute_option(self.attribute_options_by_id)
+        brand, _source = detect_article_brand_with_source(result, self.brand_list_var.get())
+        rows, _changed = merge_brand_attribute_row(existing, build_brand_attribute_row(brand, option))
+        self.attribute_frame.set_rows(rows)
+        return find_brand_attribute_value(rows)
+
     @perf_logged("KTyp-Katalog uebernehmen (UI-Thread)")
     def _apply_vehicle_catalog(self, catalog: VehicleCatalog) -> None:
         self.vehicle_catalog = catalog
@@ -15758,6 +15838,11 @@ if ($copied) {{
             snapshot.vehicle_link_rows = list(bundle.vehicle_link_rows)
             snapshot.attribute_rows = list(bundle.attribute_rows)
             snapshot.search_terms = list(bundle.search_terms)
+        elif bundle.attribute_rows:
+            # Marke: im Batch add-only ergaenzte Attributzeilen (8988 bzw.
+            # Attribut-Findung) in den Eintrag uebernehmen, damit die Liste den
+            # Platten-Stand zeigt, ohne auf das Neuladen zu warten.
+            snapshot.attribute_rows = merge_attribute_rows_add_only(snapshot.attribute_rows, bundle.attribute_rows)
         self.article_browser_records[bundle.article_number] = snapshot
         self._article_search_blob_cache.pop(bundle.article_number, None)
         self.article_browser_cache_dir = str(output_root)
@@ -16555,8 +16640,17 @@ if ($copied) {{
             self.document_frame.set_rows(document_rows)
             self.video_frame.set_rows(video_rows)
             self.web_frame.set_rows(web_rows)
-            self.attribute_frame.set_rows([])
-            self.search_term_frame.set_terms([])
+            # Marke: Attribut 8988 aus den Abruf-Signalen setzen. Vorhandene
+            # Attributzeilen des Artikels (Maske bzw. Verzeichnis) bleiben
+            # erhalten, eine bereits gepflegte Marke wird nicht ueberschrieben.
+            self._apply_brand_attribute_after_fetch(result)
+            # Suchwoerter: Hook (eigener Schritt), die Marke ist zu diesem
+            # Zeitpunkt bereits als 8988-Zeile in der Maske gesetzt.
+            hook = getattr(self, "_apply_auto_search_terms_after_fetch", None)
+            if hook is not None:
+                hook(result, scrape_options)
+            else:
+                self.search_term_frame.set_terms([])
             self.oe_frame.set_rows([])
             self.comparison_frame.set_rows([])
             self.vehicle_link_frame.set_rows([])
@@ -16581,6 +16675,11 @@ if ($copied) {{
                 ):
                     if enabled:
                         self._write_live_section(section)
+                # Marke: die 8988-Zeile auch ohne Text-Abruf sichern (geschrieben
+                # wird nur, wenn sich der Bereich wirklich geaendert hat).
+                self._write_live_section("attributes")
+                # Suchwoerter: Ergebnis des Hooks ebenfalls sichern.
+                self._write_live_section("search_terms")
                 self.status_var.set(f"Live gespeichert: {normalize_article_number(result.article_number)}")
         # Nach dem Laden automatisch die Attribut-Findung starten (Regeln + KI).
         self.root.after(200, lambda: self._start_attribute_autofill(auto=True))
@@ -16734,6 +16833,9 @@ if ($copied) {{
         attribute_options_worker = list(self.attribute_options)
         attribute_options_by_id_worker = dict(self.attribute_options_by_id)
         attribute_key_values_worker = dict(self.attribute_key_values_by_group)
+        # Marke: Markenliste und Katalogeintrag 8988 fuer den Worker.
+        brand_list_worker = parse_brand_list(self.brand_list_var.get())
+        brand_option_worker = brand_attribute_option(self.attribute_options_by_id)
 
         # Offene Live-Auftraege zuerst abschliessen: sonst laeuft ein noch wartender
         # Auftrag NACH dem Batch-Export desselben Artikels und ueberschreibt dessen
@@ -16796,18 +16898,79 @@ if ($copied) {{
                 "ai_usage_out": 0,
                 "ai_model": "",
                 "learned_mappings": [],
+                # Marke: je Artikel genau eine 8988-Zeile (add-only).
+                "brand_added_count": 0,
+                "brand_existing_count": 0,
             }
             started_at = time.monotonic()
             ai_disabled = False
             attributes_dry_run = bool(options.get("attributes_dry_run"))
             attribute_ids_by_article: dict[str, set[str]] = {}
             article_product_groups: dict[str, str] = {}
+            # Marke: vorhandene Kriterien-IDs je Artikel immer einlesen (nicht nur
+            # mit Attribute-Option), damit die 8988-Zeile add-only ergaenzt wird.
+            try:
+                attribute_ids_by_article = read_article_attribute_ids(output_root / ATTRIBUTE_FILE[0])
+            except Exception:  # pragma: no cover - defekte Datei darf den Lauf nicht kippen
+                attribute_ids_by_article = {}
             if options.get("attributes"):
-                try:
-                    attribute_ids_by_article = read_article_attribute_ids(output_root / ATTRIBUTE_FILE[0])
-                except Exception:  # pragma: no cover - defekte Datei darf den Lauf nicht kippen
-                    attribute_ids_by_article = {}
                 article_product_groups = load_article_product_groups(find_latest_article_list_source())
+
+            def run_brand_step(result: KunzerScrapeResult, bundle: ExportBundle) -> None:
+                """Marke: Attribut 8988 fuer den Artikel add-only ergaenzen.
+
+                Laeuft fuer jeden Artikel - unabhaengig von der Attribute-Option
+                und vom Testlauf. Eine vorhandene 8988-Zeile (auch manuell
+                gepflegt) bleibt unveraendert; es wird nie ueberschrieben.
+                """
+                article_key = normalize_article_number(bundle.article_number)
+                known_ids = attribute_ids_by_article.setdefault(article_key, set())
+                product_group = article_product_groups.get(article_key, "")
+                brand, source = detect_article_brand_with_source(result, brand_list_worker)
+                source_label = BRAND_SIGNAL_LABELS.get(source, source)
+
+                def report(status: str, note: str) -> None:
+                    summary["attribute_report_rows"].append(
+                        [
+                            bundle.article_number,
+                            product_group,
+                            BRAND_CRITERIA_ID,
+                            brand_option_worker.label or "Marke",
+                            brand_option_worker.value_format or "Alphanumerisch",
+                            brand,
+                            "",
+                            status,
+                            "Marke",
+                            note,
+                        ]
+                    )
+
+                if BRAND_CRITERIA_ID in known_ids:
+                    summary["brand_existing_count"] = int(summary["brand_existing_count"]) + 1
+                    report("vorhanden", f"Marke bereits gepflegt, nicht ueberschrieben (erkannt: {brand}, {source_label})")
+                    return
+                row = build_brand_attribute_row(brand, brand_option_worker)
+                if row is None:
+                    summary["media_warnings"].append(
+                        (bundle.article_number, f"Marke '{brand}' konnte nicht als Attribut 8988 gesetzt werden (Format/Laenge).")
+                    )
+                    return
+                with WORKBOOK_WRITE_LOCK:
+                    added_ids = append_attribute_rows_add_only(
+                        output_root / ATTRIBUTE_FILE[0],
+                        bundle.article_number,
+                        [row],
+                        attribute_key_values_worker,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                known_ids.add(BRAND_CRITERIA_ID)
+                if added_ids:
+                    summary["brand_added_count"] = int(summary["brand_added_count"]) + 1
+                    bundle.attribute_rows = list(bundle.attribute_rows) + [row]
+                    report("automatisch", f"Marke aus {source_label}")
+                else:
+                    summary["brand_existing_count"] = int(summary["brand_existing_count"]) + 1
+                    report("vorhanden", f"Marke bereits gepflegt, nicht ueberschrieben (erkannt: {brand}, {source_label})")
 
             # Ab dieser Groesse laufen die KI-Aufrufe gesammelt ueber die
             # Anthropic Batch API (50 % Rabatt, gleiche Qualitaet).
@@ -16992,6 +17155,14 @@ if ($copied) {{
                             summary["media_warnings"].extend(
                                 (bundle.article_number, warning) for warning in article_media_warnings
                             )
+                            # Marke: Attribut 8988 fuer jeden Artikel (add-only), unabhaengig
+                            # von der Attribute-Option und vom Testlauf.
+                            try:
+                                run_brand_step(result, bundle)
+                            except Exception as brand_exc:  # pragma: no cover - Marken-Schritt darf den Artikel nie kippen
+                                summary["media_warnings"].append(
+                                    (bundle.article_number, f"Marke (Attribut 8988) fehlgeschlagen: {brand_exc}")
+                                )
                             if options.get("attributes"):
                                 post(index - 1, f"{identifier}: Attribute ermitteln ...")
                                 try:
@@ -17363,6 +17534,8 @@ if ($copied) {{
         attribute_review_rows = list(summary.get("attribute_review_rows") or [])
         attribute_review_path = str(summary.get("attribute_review_path") or "")
         attribute_report_path = str(summary.get("attribute_report_path") or "")
+        brand_added_count = int(summary.get("brand_added_count") or 0)
+        brand_existing_count = int(summary.get("brand_existing_count") or 0)
         if attribute_would_count or attribute_added_count or attribute_review_rows:
             if attribute_would_count:
                 error_list_hint += (
@@ -17373,6 +17546,14 @@ if ($copied) {{
                 error_list_hint += f"\n\nAttribute: {attribute_added_count} automatisch ergänzt"
                 if attribute_review_rows:
                     error_list_hint += f", {len(attribute_review_rows)} Zeilen zur Prüfung"
+        if brand_added_count or brand_existing_count:
+            # Marke: unabhaengig von Attribute-Option und Testlauf immer geschrieben.
+            error_list_hint += f"\n\nMarke (Attribut 8988): {brand_added_count} Artikel ergänzt"
+            if brand_existing_count:
+                error_list_hint += f", {brand_existing_count} hatten bereits eine Marke"
+            if attribute_would_count:
+                error_list_hint += " (auch im Testlauf)"
+        if attribute_would_count or attribute_added_count or attribute_review_rows or brand_added_count or brand_existing_count:
             if attribute_report_path:
                 error_list_hint += f"\nAttribut-Bericht: {attribute_report_path}"
             if attribute_review_path:
