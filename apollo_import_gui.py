@@ -13800,48 +13800,79 @@ if ($copied) {{
             lambda *_args: self.claude_model_hint_var.set(claude_model_hints.get(self.claude_model_var.get(), "")),
         )
 
+        # Suchwoerter: KI-Optionen fuer die automatische Suchwort-Erzeugung.
+        ttk.Checkbutton(
+            parent,
+            text="Suchwörter per KI vorschlagen (Einzelartikel)",
+            variable=self.search_term_ai_var,
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(
+            parent,
+            text=(
+                "Nach dem Kunzer-Laden und über 'Suchwörter automatisch' im Tab Suchwörter: zusätzlich zu Marke, "
+                "Shop-Suchwörtern und Titelwörtern bis zu 10 KI-Vorschläge (Synonyme, Umgangssprache, Einsatzzweck). "
+                "Ein Aufruf je Artikel mit dem oben gewählten Modell; ohne API Key laufen nur die Regeln."
+            ),
+            foreground="#5E6472",
+            wraplength=320,
+        ).grid(row=9, column=2, sticky="w", padx=(10, 0), pady=(10, 0))
+        ttk.Checkbutton(
+            parent,
+            text="Suchwörter per KI auch im Massenimport",
+            variable=self.batch_search_term_ai_var,
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 14))
+        ttk.Label(
+            parent,
+            text=(
+                "Standard aus: im Massenimport werden Suchwörter nur regelbasiert ergänzt. Mit Häkchen je Artikel ein "
+                "KI-Aufruf (Kostenschätzung vor dem Start); für große Läufe das Modell Haiku wählen."
+            ),
+            foreground="#5E6472",
+            wraplength=320,
+        ).grid(row=10, column=2, sticky="w", padx=(10, 0), pady=(6, 14))
+
         ttk.Label(parent, text="Datenstämme", font=("Segoe UI Semibold", 10)).grid(
-            row=9, column=0, sticky="w", pady=(0, 4)
+            row=11, column=0, sticky="w", pady=(0, 4)
         )
-        ttk.Label(parent, text="GenArt XLSX").grid(row=10, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(parent, textvariable=self.genart_source_path_var).grid(row=10, column=1, sticky="ew", pady=6)
+        ttk.Label(parent, text="GenArt XLSX").grid(row=12, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.genart_source_path_var).grid(row=12, column=1, sticky="ew", pady=6)
         genart_actions = ttk.Frame(parent)
-        genart_actions.grid(row=10, column=2, sticky="w", padx=(10, 0), pady=6)
+        genart_actions.grid(row=12, column=2, sticky="w", padx=(10, 0), pady=6)
         ttk.Button(genart_actions, text="Datei wählen", command=self.choose_genart_source_file).grid(row=0, column=0)
         ttk.Button(genart_actions, text="Neu laden", command=self._reload_genart_catalog).grid(row=0, column=1, padx=(8, 0))
         ttk.Label(parent, textvariable=self.genart_count_var, foreground="#5E6472").grid(
-            row=11, column=1, columnspan=2, sticky="w"
+            row=13, column=1, columnspan=2, sticky="w"
         )
 
-        ttk.Label(parent, text="KHer CSV").grid(row=12, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(parent, text="KHer CSV").grid(row=14, column=0, sticky="w", padx=(0, 10), pady=6)
         kher_actions = ttk.Frame(parent)
-        kher_actions.grid(row=12, column=2, sticky="w", padx=(10, 0), pady=6)
+        kher_actions.grid(row=14, column=2, sticky="w", padx=(10, 0), pady=6)
         ttk.Button(kher_actions, text="Datei wählen", command=self.choose_competitor_source_file).grid(row=0, column=0)
         ttk.Button(kher_actions, text="Neu laden", command=self._reload_competitor_catalog).grid(row=0, column=1, padx=(8, 0))
-        ttk.Entry(parent, textvariable=self.competitor_source_path_var).grid(row=12, column=1, sticky="ew", pady=6)
+        ttk.Entry(parent, textvariable=self.competitor_source_path_var).grid(row=14, column=1, sticky="ew", pady=6)
         ttk.Label(
             parent,
             text="Diese Datei wird für OE-Nummern und Vergleichsnummern verwendet. OE nutzt alle Hersteller, Vergleichsnummern nur Einträge mit VGL-Flag.",
             foreground="#5E6472",
             wraplength=760,
-        ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=15, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(parent, textvariable=self.competitor_count_var, foreground="#5E6472").grid(
-            row=14, column=1, columnspan=2, sticky="w"
+            row=16, column=1, columnspan=2, sticky="w"
         )
 
-        ttk.Label(parent, text="Attribute XLSX").grid(row=15, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(parent, textvariable=self.attribute_source_path_var).grid(row=15, column=1, sticky="ew", pady=6)
+        ttk.Label(parent, text="Attribute XLSX").grid(row=17, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.attribute_source_path_var).grid(row=17, column=1, sticky="ew", pady=6)
         attribute_actions = ttk.Frame(parent)
-        attribute_actions.grid(row=15, column=2, sticky="w", padx=(10, 0), pady=6)
+        attribute_actions.grid(row=17, column=2, sticky="w", padx=(10, 0), pady=6)
         ttk.Button(attribute_actions, text="Datei wählen", command=self.choose_attribute_source_file).grid(row=0, column=0)
         ttk.Button(attribute_actions, text="Neu laden", command=self._reload_attribute_catalog).grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(parent, text="Schlüsselwerte XLSX").grid(row=16, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Label(parent, text="Schlüsselwerte XLSX").grid(row=18, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Entry(parent, textvariable=self.attribute_key_value_source_path_var).grid(
-            row=16, column=1, sticky="ew", pady=6
+            row=18, column=1, sticky="ew", pady=6
         )
         key_value_actions = ttk.Frame(parent)
-        key_value_actions.grid(row=16, column=2, sticky="w", padx=(10, 0), pady=6)
+        key_value_actions.grid(row=18, column=2, sticky="w", padx=(10, 0), pady=6)
         ttk.Button(key_value_actions, text="Datei wählen", command=self.choose_attribute_key_value_source_file).grid(row=0, column=0)
         ttk.Button(key_value_actions, text="Neu laden", command=self._reload_attribute_key_value_catalog).grid(row=0, column=1, padx=(8, 0))
         ttk.Label(
@@ -13849,18 +13880,18 @@ if ($copied) {{
             text="Die Attributliste liefert TecDoc Kriterien, Formate und Bezeichnungen; Schlüsselwerte liefern die möglichen Auswahlwerte.",
             foreground="#5E6472",
             wraplength=760,
-        ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=19, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(parent, textvariable=self.attribute_count_var, foreground="#5E6472").grid(
-            row=18, column=1, columnspan=2, sticky="w"
+            row=20, column=1, columnspan=2, sticky="w"
         )
         ttk.Label(parent, textvariable=self.attribute_key_value_count_var, foreground="#5E6472").grid(
-            row=19, column=1, columnspan=2, sticky="w"
+            row=21, column=1, columnspan=2, sticky="w"
         )
 
-        ttk.Label(parent, text="KTyp XLSX").grid(row=20, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(parent, textvariable=self.vehicle_source_path_var).grid(row=20, column=1, sticky="ew", pady=6)
+        ttk.Label(parent, text="KTyp XLSX").grid(row=22, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.vehicle_source_path_var).grid(row=22, column=1, sticky="ew", pady=6)
         vehicle_actions = ttk.Frame(parent)
-        vehicle_actions.grid(row=20, column=2, sticky="w", padx=(10, 0), pady=6)
+        vehicle_actions.grid(row=22, column=2, sticky="w", padx=(10, 0), pady=6)
         ttk.Button(vehicle_actions, text="Datei wählen", command=self.choose_vehicle_source_file).grid(row=0, column=0)
         ttk.Button(vehicle_actions, text="Neu laden", command=self._reload_vehicle_catalog).grid(row=0, column=1, padx=(8, 0))
         ttk.Label(
@@ -13871,15 +13902,15 @@ if ($copied) {{
             ),
             foreground="#5E6472",
             wraplength=760,
-        ).grid(row=21, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=23, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(parent, textvariable=self.vehicle_count_var, foreground="#5E6472").grid(
-            row=22, column=1, columnspan=2, sticky="w"
+            row=24, column=1, columnspan=2, sticky="w"
         )
 
-        ttk.Label(parent, text="Attribut-Zuordnung XLSX").grid(row=23, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(parent, textvariable=self.attribute_mapping_source_path_var).grid(row=23, column=1, sticky="ew", pady=6)
+        ttk.Label(parent, text="Attribut-Zuordnung XLSX").grid(row=25, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.attribute_mapping_source_path_var).grid(row=25, column=1, sticky="ew", pady=6)
         mapping_actions = ttk.Frame(parent)
-        mapping_actions.grid(row=23, column=2, sticky="w", padx=(10, 0), pady=6)
+        mapping_actions.grid(row=25, column=2, sticky="w", padx=(10, 0), pady=6)
         ttk.Button(mapping_actions, text="Datei wählen", command=self.choose_attribute_mapping_source_file).grid(row=0, column=0)
         ttk.Button(mapping_actions, text="Neu laden", command=self._reload_attribute_mapping).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(mapping_actions, text="Labels per KI zuordnen", command=self.start_label_mining).grid(row=0, column=2, padx=(8, 0))
@@ -13893,9 +13924,9 @@ if ($copied) {{
             ),
             foreground="#5E6472",
             wraplength=760,
-        ).grid(row=24, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=26, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(parent, textvariable=self.attribute_mapping_count_var, foreground="#5E6472").grid(
-            row=25, column=1, columnspan=2, sticky="w"
+            row=27, column=1, columnspan=2, sticky="w"
         )
 
     def _toggle_article_browser_section(self) -> None:
@@ -17105,6 +17136,32 @@ if ($copied) {{
         attribute_options_worker = list(self.attribute_options)
         attribute_options_by_id_worker = dict(self.attribute_options_by_id)
         attribute_key_values_worker = dict(self.attribute_key_values_by_group)
+        # Suchwoerter: GenArt-Bezeichnungen je Artikel aus dem Verzeichnis (Kopie fuer
+        # den Worker) und optional ein KI-Client mit Kostenschaetzung vor dem Start.
+        genart_labels_by_article: dict[str, list[str]] = {
+            article: [sel.bezeichnung for sel in snapshot.genart_selections if sel.bezeichnung.strip()]
+            for article, snapshot in self.article_browser_records.items()
+            if snapshot.genart_selections
+        }
+        search_term_client: ClaudeAttributeClient | None = None
+        if self.batch_search_term_ai_var.get():
+            search_term_client = claude_client if claude_client is not None else self._build_claude_client()
+            if search_term_client is None:
+                self.status_var.set("Suchwort-KI im Massenimport übersprungen: kein Claude API Key - nur Regeln.")
+            else:
+                estimated_cost = estimate_claude_cost_usd(
+                    search_term_client.model,
+                    SEARCH_TERM_AI_ESTIMATED_INPUT_TOKENS * len(items),
+                    SEARCH_TERM_AI_ESTIMATED_OUTPUT_TOKENS * len(items),
+                )
+                if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"Suchwörter per KI für {len(items)} Artikel ({search_term_client.model}):\n"
+                    f"geschätzte Kosten ca. {estimated_cost:.2f} $ "
+                    f"(je Artikel ca. {SEARCH_TERM_AI_ESTIMATED_INPUT_TOKENS + SEARCH_TERM_AI_ESTIMATED_OUTPUT_TOKENS} Token).\n\n"
+                    "Mit KI-Suchwörtern starten?\n(Nein = Lauf ohne KI-Suchwörter starten, Suchwörter nur regelbasiert)",
+                ):
+                    search_term_client = None
 
         # Offene Live-Auftraege zuerst abschliessen: sonst laeuft ein noch wartender
         # Auftrag NACH dem Batch-Export desselben Artikels und ueberschreibt dessen
@@ -17167,9 +17224,89 @@ if ($copied) {{
                 "ai_usage_out": 0,
                 "ai_model": "",
                 "learned_mappings": [],
+                # Suchwoerter: Zaehler und Ergebnis des einen Schreibvorgangs am Ende.
+                "search_term_articles": 0,
+                "search_term_candidate_count": 0,
+                "search_term_ai_count": 0,
+                "search_term_final": {},
             }
             started_at = time.monotonic()
             ai_disabled = False
+            # Suchwoerter: je Artikel Regel-Kandidaten (+ optional KI) sammeln, am Ende
+            # EIN Schreibvorgang ueber apply_search_term_import(..., "append").
+            search_terms_by_article: dict[str, list[str]] = {}
+            search_term_ai_disabled = False
+            try:
+                existing_search_terms = read_article_search_terms(output_root / USAGE_NUMBER_FILE[0])
+            except Exception:  # pragma: no cover - defekte Datei darf den Lauf nicht kippen
+                existing_search_terms = {}
+            try:
+                brand_values_by_article = read_article_attribute_values(
+                    output_root / ATTRIBUTE_FILE[0], SEARCH_TERM_BRAND_CRITERIA_ID
+                )
+            except Exception:  # pragma: no cover - defekte Datei darf den Lauf nicht kippen
+                brand_values_by_article = {}
+
+            def run_search_term_step(result: KunzerScrapeResult, bundle: ExportBundle) -> None:
+                """Suchwoerter: Regel-Kandidaten je Artikel sammeln (Marke aus der
+                8988-Zeile des Bundles bzw. der Attribute.xlsx, Shop-Suchwoerter,
+                GenArt, Titel), optional KI-Vorschlaege - geschrieben wird erst am Ende."""
+                nonlocal search_term_ai_disabled
+                article = normalize_article_number(bundle.article_number)
+                if not article:
+                    return
+                brand = ""
+                for row in bundle.attribute_rows:
+                    if row.criteria_id.strip() == SEARCH_TERM_BRAND_CRITERIA_ID and row.value.strip():
+                        brand = row.value.strip()
+                        break
+                if not brand:
+                    brand = brand_values_by_article.get(article, "")
+                if not brand:
+                    detect = globals().get("detect_article_brand")
+                    if detect is not None:
+                        try:
+                            brand = str(detect(result) or "").strip()
+                        except Exception:  # pragma: no cover - Markenerkennung darf den Schritt nie kippen
+                            brand = ""
+                existing_terms = list(existing_search_terms.get(article, []))
+                candidates = generate_search_term_candidates(
+                    article,
+                    brand,
+                    str(result.short_text_de or "") or str(result.title or ""),
+                    str(result.long_text_de or ""),
+                    genart_labels_by_article.get(article, []),
+                    getattr(result, "shop_search_terms", []),
+                    existing_terms,
+                )
+                terms = [candidate.term for candidate in candidates]
+                if search_term_client is not None and not search_term_ai_disabled and (
+                    str(result.short_text_de or "").strip() or str(result.long_text_de or "").strip()
+                ):
+                    known_terms = existing_terms + terms + clean_shop_search_terms(getattr(result, "shop_search_terms", []))
+                    user_message = build_search_term_user_message(
+                        article,
+                        brand,
+                        genart_labels_by_article.get(article, [""])[0] if genart_labels_by_article.get(article) else "",
+                        str(result.short_text_de or "") or str(result.title or ""),
+                        str(result.long_text_de or ""),
+                        known_terms,
+                    )
+                    try:
+                        suggestions = search_term_client.suggest_search_terms(user_message)
+                        ai_candidates = filter_ai_search_terms(
+                            list(suggestions), article, brand, known_terms, limit=SEARCH_TERM_AI_LIMIT
+                        )
+                        terms.extend(candidate.term for candidate in ai_candidates)
+                        summary["search_term_ai_count"] = int(summary["search_term_ai_count"]) + len(ai_candidates)
+                    except ClaudeExtractionError as exc:
+                        summary["media_warnings"].append((article, f"Suchwort-KI: {exc}"))
+                        if "Key" in str(exc):
+                            # Ungueltiger Key betrifft alle Artikel: Rest des Laufs nur regelbasiert.
+                            search_term_ai_disabled = True
+                if terms:
+                    search_terms_by_article[article] = normalize_search_terms(search_terms_by_article.get(article, []) + terms)
+                    summary["search_term_candidate_count"] = int(summary["search_term_candidate_count"]) + len(terms)
             attributes_dry_run = bool(options.get("attributes_dry_run"))
             attribute_ids_by_article: dict[str, set[str]] = {}
             article_product_groups: dict[str, str] = {}
@@ -17371,6 +17508,15 @@ if ($copied) {{
                                     summary["media_warnings"].append(
                                         (bundle.article_number, f"Attribut-Schritt fehlgeschlagen: {attribute_exc}")
                                     )
+                            # Suchwoerter: Kandidaten sammeln (Schreiben erst am Ende des Laufs).
+                            try:
+                                if search_term_client is not None:
+                                    post(index - 1, f"{identifier}: Suchwörter (Regeln + KI) ...")
+                                run_search_term_step(result, bundle)
+                            except Exception as search_term_exc:  # pragma: no cover - Suchwort-Schritt darf den Artikel nie kippen
+                                summary["media_warnings"].append(
+                                    (bundle.article_number, f"Suchwort-Schritt fehlgeschlagen: {search_term_exc}")
+                                )
                             summary["success_count"] = int(summary["success_count"]) + 1
                             summary["last_result"] = result
                             summary["last_bundle"] = bundle
@@ -17434,6 +17580,27 @@ if ($copied) {{
                     summary["error_messages"].append(f"KI-Batch unerwartet beendet: {exc}")
 
             summary["cancelled"] = cancel_event.is_set()
+
+            # Suchwoerter: EIN Schreibvorgang fuer alle gesammelten Artikel (auch nach
+            # Abbruch - die verarbeiteten Artikel sind fertig). Gleiche Sperre wie der
+            # Live-Schreiber; eine gesperrte Gebrauchsnummern.xlsx wird zur Fehlermeldung.
+            if search_terms_by_article:
+                post(int(summary["processed"]), f"Suchwörter für {len(search_terms_by_article)} Artikel schreiben ...")
+                try:
+                    with WORKBOOK_WRITE_LOCK:
+                        final_terms, legacy_warning = apply_search_term_import(
+                            output_root, search_terms_by_article, "append"
+                        )
+                    summary["search_term_final"] = final_terms
+                    summary["search_term_articles"] = len(final_terms)
+                    if legacy_warning:
+                        summary["error_messages"].append(f"Suchwörter: {legacy_warning}")
+                except Exception as exc:  # pragma: no cover - gesperrte Datei o. ae.
+                    summary["error_messages"].append(
+                        f"Suchwörter konnten nicht in die {USAGE_NUMBER_FILE[0]} geschrieben werden: {exc}"
+                    )
+                    summary["search_term_candidate_count"] = 0
+                    summary["search_term_ai_count"] = 0
 
             def write_result_list(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> str:
                 """Ergebnisliste schreiben; bei gesperrter Datei Ausweichname
@@ -17500,11 +17667,16 @@ if ($copied) {{
                 except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
                     pass
 
-            if claude_client is not None:
-                summary["ai_usage_in"] = claude_client.total_input_tokens
-                summary["ai_usage_out"] = claude_client.total_output_tokens
-                summary["ai_model"] = claude_client.model
-                summary["ai_cost_usd"] = claude_client.total_cost_usd
+            # Suchwoerter: der Suchwort-Client kann derselbe wie der Attribut-Client sein
+            # (dann nur einmal zaehlen) oder ein eigener.
+            usage_clients = [client for client in (claude_client, search_term_client) if client is not None]
+            if len(usage_clients) == 2 and usage_clients[0] is usage_clients[1]:
+                usage_clients = usage_clients[:1]
+            if usage_clients:
+                summary["ai_usage_in"] = sum(client.total_input_tokens for client in usage_clients)
+                summary["ai_usage_out"] = sum(client.total_output_tokens for client in usage_clients)
+                summary["ai_model"] = usage_clients[0].model
+                summary["ai_cost_usd"] = sum(client.total_cost_usd for client in usage_clients)
 
             progress_queue.put(("finish", summary))
 
@@ -17693,6 +17865,21 @@ if ($copied) {{
         # Bewusst kein refresh_preview(): das würde für den geladenen Artikel
         # sofort Text-IDs generieren, auch wenn Texte nicht im Abrufumfang waren.
         self._refresh_article_browser()
+        # Suchwoerter: der Worker hat die Gebrauchsnummern.xlsx direkt geschrieben; das
+        # Verzeichnis ist durch das Neuladen oben aktuell, die Maske des geladenen
+        # Artikels aber noch auf dem Stand vor dem Schreiben - Suchwoerter und
+        # Fingerabdruck-Anker auf den neu geladenen Snapshot ziehen.
+        search_term_final = summary.get("search_term_final") or {}
+        if isinstance(search_term_final, dict) and search_term_final:
+            current_article = normalize_article_number(self.article_number_var.get())
+            current_snapshot = self.article_browser_records.get(current_article)
+            if current_article in search_term_final and current_snapshot is not None:
+                with self._suspend_live_write():
+                    self.search_term_frame.set_terms(current_snapshot.search_terms)
+                self._live_fingerprints[current_article] = (
+                    current_snapshot,
+                    live_section_fingerprints(bundle_from_snapshot(current_snapshot, self.attribute_key_values_by_group)),
+                )
         run_label = self.batch_run_label
         error_list_path = str(summary.get("error_list_path") or "")
         error_list_hint = (
@@ -17748,6 +17935,15 @@ if ($copied) {{
                 error_list_hint += f"\nAttribut-Bericht: {attribute_report_path}"
             if attribute_review_path:
                 error_list_hint += f"\nPrüfliste: {attribute_review_path}"
+        # Suchwoerter: Zusammenfassung des einen Schreibvorgangs.
+        search_term_articles = int(summary.get("search_term_articles") or 0)
+        search_term_candidate_count = int(summary.get("search_term_candidate_count") or 0)
+        search_term_ai_count = int(summary.get("search_term_ai_count") or 0)
+        if search_term_articles or search_term_candidate_count:
+            error_list_hint += (
+                f"\n\nSuchwörter: {search_term_candidate_count} automatisch ergänzt bei {search_term_articles} Artikeln"
+                + (f" (davon {search_term_ai_count} per KI)" if search_term_ai_count else "")
+            )
         ai_usage_in = int(summary.get("ai_usage_in") or 0)
         ai_usage_out = int(summary.get("ai_usage_out") or 0)
         if ai_usage_in or ai_usage_out:
