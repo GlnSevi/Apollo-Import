@@ -204,6 +204,32 @@ Grundlage ist die pflegbare Zuordnungsdatei `Attribut_Zuordnung.xlsx` (Standard 
 
 Die KI erhaelt den Produkttext als reinen Inhalt und darf nur Attribute aus der mitgeschickten Kandidatenliste waehlen; alles andere wird verworfen. Ohne API Key (oder bei API-Fehlern) laeuft die Findung vollstaendig regelbasiert weiter.
 
+## Marke (Attribut 8988)
+
+Die Marke eines Artikels wird in Apollo als Attribut `8988 Marke` (Format `Alphanumerisch`, max. 20 Zeichen) gepflegt. Bei jedem Kunzer-Abruf - im Einzelartikel (`Artikel anlegen`) wie im Massenimport (`Liste importieren`, `Artikelliste aktualisieren`) - setzt die App diese Zeile automatisch, rein lokal und ohne KI-Aufruf. Die Marke steht auf kunzer.de nicht im Seitentext, sondern wird aus den Signalen der Produktseite erkannt, in dieser Reihenfolge (der erste Treffer gewinnt):
+
+1. **Medienordner**: erstes Pfadsegment der `restapi.kunzer.de`-Links von Bildern und Dokumenten, z. B. `airman`, `tdl`, `weber hydraulik`, `moto meter`, `norma`, `oetiker`, `suprabeam`, `handschuhe` (Tiger Grip) oder `kunzer werkzeuge`
+2. **Kategoriepfad** der Produktseite (Breadcrumb), z. B. `Produkte > Werkzeuge > Rad und Reifen > airMAN` oder `Produkte > Hebetechnik > Lufthydraulische Heber T D L`
+3. **Shop-Suchwoerter** des Artikels (Feld `SUCHWOERTER` der Produktdaten, z. B. `Dichtmilch;Pannenpilot;Airman`)
+4. **Titel, Kurzbezeichnung, Text** - Treffer nur an Wortgrenzen (`Norma` trifft nicht `normal`); `Kunzer` zaehlt in Texten nicht als Treffer, weil es ohnehin der Standard ist
+5. **Link-Labels** der Produktseite (z. B. `AIRMAN - 71-051-011`)
+6. ohne Treffer: `Kunzer` (Kunzer-Eigenartikel tragen zudem EAN mit GS1-Praefix `4260174`)
+
+Erkannt werden nur Marken aus der **Markenliste** (Einstellungen, Tab `API & Datenstaemme`, Block `Marke (Attribut 8988)`). Jeder Eintrag nennt den kanonischen Namen, der in die `Attribute.xlsx` geschrieben wird, und optional Schreibweisen (Aliasse): Eintraege mit `;` trennen, Aliasse nach `=` mit `,` - Gross-/Kleinschreibung spielt keine Rolle, Leerzeichen und Bindestriche in Aliassen sind beliebig (`T D L` trifft auch `TDL`, `weber hydraulik` auch `Weber-Hydraulik`). Standard:
+
+```
+Kunzer; Airman=airman,airMAN,air man; TDL=T D L,tdl; Weber Hydraulik=weber hydraulik,weber-hydraulik; MotoMeter=moto meter,motometer,moto-meter; Norma; Oetiker; Suprabeam; Gefo; Tiger Grip=handschuhe,tigergrip,tiger-grip; Argus
+```
+
+Die Liste wird mit dem Sitzungszustand gespeichert; `Standard` stellt die eingebaute Liste wieder her. Kanonische Namen muessen in 20 Zeichen passen (laengere werden abgeschnitten).
+
+Verhalten:
+
+- **Manuelle Pflege gewinnt:** Hat der Artikel bereits eine `8988`-Zeile mit Wert (in der `Attribute.xlsx` bzw. im Artikelverzeichnis), bleibt sie unveraendert - die erkannte Marke wird nie darueber geschrieben. Nur eine leere `8988`-Zeile wird ersetzt. Pro Artikel gibt es genau eine `8988`-Zeile; die automatische Attribut-Findung legt keine zweite an.
+- **Einzelabruf:** Bis v0.1.35 wurden beim `Artikel anlegen` alle Attribute der Maske geleert und dieser Leerstand live geschrieben - vorhandene Attributzeilen des Artikels gingen damit verloren. Jetzt bleiben die gespeicherten Attributzeilen des Artikels erhalten (Grundlage ist der gespeicherte Stand des Artikels, nicht die Maske: zeigt die Maske noch einen zuvor geladenen anderen Artikel, gehen dessen Zeilen nicht auf den neuen Artikel ueber), die Marke wird ergaenzt und zusammen mit den uebrigen Daten live gespeichert - auch wenn nur Medien im Abrufumfang sind.
+- **Massenimport:** Die Marke wird fuer jeden Artikel ergaenzt (add-only in die `Attribute.xlsx`), unabhaengig von der Option `Attribute (automatisch, Regeln + KI)` und auch im Testlauf. Der Abschlussdialog nennt, wie viele Artikel eine Marke bekommen haben und wie viele schon eine hatten; der `Attribut-Testbericht.xlsx` enthaelt je Artikel die erkannte Marke mit Signal (Status `automatisch` bzw. `vorhanden`, Quelle `Marke`).
+- Die Werkzeuge mit Kunzer-Artikelnummer im Medienordner `kunzer werkzeuge` (z. B. die Oetiker-Zangen 14100392/14100501, bei denen nur der Titel `Oetiker` nennt) bekommen ueber den Medienordner `Kunzer`; soll der Titel Vorrang haben, muss die Zeile manuell gepflegt werden.
+
 ## Suchwoerter
 
 Suchwoerter sind in Apollo Referenzen vom Typ `Gebrauchsnummer` (Reiter `Referenzen`, Typ mit TecDoc ID `2`); das Suchwort steht als Freitext in der Spalte `Nummer`. Im Tab `Suchwoerter` koennen deshalb pro Artikel freie Suchbegriffe gepflegt werden, die beim Export in eine eigene Referenzdatei geschrieben werden:
