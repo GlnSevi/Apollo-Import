@@ -111,7 +111,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.35"
+APP_VERSION = "0.1.36"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -1187,6 +1187,12 @@ SEARCH_TERM_STOPWORDS = frozenset(
         "wie", "nicht", "sowie", "plus", "inkl", "inklusive", "incl", "ca", "set", "sets", "stück",
         "stueck", "stk", "kit", "teilig", "tlg", "paar", "typ", "art", "nr", "the", "and", "for", "with",
         "pcs", "pc", "neu", "new", "version",
+        # Einheiten und Mengen (Titel wie 'Rangierheber 22 Tonnen 2-stufig')
+        "tonne", "tonnen", "liter", "meter", "zoll", "stufen", "stufig", "watt", "volt", "bar",
+        "mm", "cm", "kg", "nm", "ampere", "grad",
+        # Titel-Adjektive und Farben ohne eigenen Suchwert
+        "lang", "kurz", "extra", "flach", "max", "min", "groß", "gross", "klein", "mini",
+        "schwarz", "rot", "blau", "gelb", "grün", "gruen", "weiß", "weiss", "grau",
     }
 )
 
@@ -1350,8 +1356,9 @@ def filter_ai_search_terms(
     limit: int = 10,
 ) -> list[SearchTermCandidate]:
     """Lokale Nachvalidierung der KI-Vorschlaege: Strings, keine Saetze (max. 5
-    Woerter), max. SEARCH_TERM_MAX_LENGTH Zeichen, keine Artikelnummer, keine
-    Marke (die kommt als eigener Kandidat), Dedupe gegen known_terms."""
+    Woerter), max. SEARCH_TERM_MAX_LENGTH Zeichen, keine Ziffern (Masse,
+    Mengen, Codes), keine Artikelnummer, keine Marke (die kommt als eigener
+    Kandidat), Dedupe gegen known_terms."""
     article_key = _article_number_key(article_number)
     brand_key = search_term_dedupe_key(brand)
     seen = {search_term_dedupe_key(term) for term in known_terms or []}
@@ -1364,6 +1371,10 @@ def filter_ai_search_terms(
         if not cleaned or len(cleaned) > SEARCH_TERM_MAX_LENGTH or len(cleaned.split()) > 5:
             continue
         if _search_term_letter_count(cleaned) < 3:
+            continue
+        if re.search(r"\d", cleaned):
+            # Der Prompt verbietet Zahlenangaben; KI-Terme werden im Nachlauf ohne
+            # Dialog gespeichert, deshalb hier hart pruefen.
             continue
         key = search_term_dedupe_key(cleaned)
         if not key or key in seen:
@@ -2402,7 +2413,24 @@ def detect_article_brand_with_source(
         )
     if folder:
         name = _brand_match_in_text(folder, brands)
+        if name and name.casefold() != DEFAULT_BRAND_NAME.casefold():
+            return finish(name, "medienordner")
         if name:
+            # Ordner 'Kunzer ...': auch Fremdmarken mit Kunzer-Artikelnummer liegen
+            # dort (z. B. Oetiker-Zangen 14100392/14100501). Eine Fremdmarke in der
+            # Kategorie oder am Anfang von Titel/Kurzbezeichnung gewinnt deshalb;
+            # Shop-Suchwoerter und Langtext zaehlen hier nicht - dort stehen
+            # Gattungsnamen wie 'Oetiker-Zange' oder 'Motometer' auch bei
+            # Kunzer-Produkten.
+            for segment in _brand_signal_list(signals, "category_path"):
+                foreign = _brand_match_in_text(segment, brands, skip_default=True)
+                if foreign:
+                    return finish(foreign, "kategorie")
+            for field_name, source in (("title", "titel"), ("short_text_de", "kurztext")):
+                lead = " ".join(_brand_signal_text(signals, field_name).split()[:3])
+                foreign = _brand_match_in_text(lead, brands, skip_default=True)
+                if foreign:
+                    return finish(foreign, source)
             return finish(name, "medienordner")
 
     for segment in _brand_signal_list(signals, "category_path"):
@@ -5372,6 +5400,46 @@ def _iter_flight_rows(data: bytes) -> Iterator[tuple[str, bytes]]:
         position = newline + 1
 
 
+def repair_double_encoded_utf8(data: bytes) -> bytes:
+    """Macht eine windows-1252 -> UTF-8 doppelt kodierte Antwort wieder zu UTF-8.
+
+    Die Detail-Action von kunzer.de antwortet als 'text/x-component' ohne
+    charset. Chromium dekodiert den Body dann als windows-1252 und Playwright
+    liefert diesen Text in response.body() erneut UTF-8-kodiert: aus 'ü'
+    (C3 BC) wird 'Ã¼' (C3 83 C2 BC). Folgen: Shop-Suchwoerter mit Mojibake und -
+    weil die Laengenangabe der Flight-Textbloecke (T<hex>) in Server-Bytes
+    zaehlt - abgeschnittene Bloecke, hinter denen die Artikelzeile verloren
+    geht. Rueckweg: jedes Zeichen zurueck auf sein windows-1252-Byte (die dort
+    undefinierten Bytes 81/8D/8F/90/9D reicht Chromium als U+0081 usw. durch).
+    Nur wenn das Ergebnis gueltiges UTF-8 ist, wird es verwendet - korrekt
+    kodierter Text mit Umlauten ergibt dabei nie gueltiges UTF-8 und bleibt
+    unveraendert.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    if text.isascii():
+        return data
+    repaired = bytearray()
+    for char in text:
+        code = ord(char)
+        if code < 0x80:
+            repaired.append(code)
+            continue
+        try:
+            repaired += char.encode("cp1252")
+        except UnicodeEncodeError:
+            if code > 0xFF:
+                return data
+            repaired.append(code)
+    try:
+        bytes(repaired).decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    return bytes(repaired)
+
+
 def parse_kunzer_detail_payload(payload: bytes | str) -> dict[str, object] | None:
     """Liest aus der Flight-Antwort der Detail-Server-Action von kunzer.de den
     ersten Artikel-Datensatz ('article': [...]). Bytes werden immer als UTF-8
@@ -5591,12 +5659,17 @@ class KunzerScraper:
                 body = response.body()
             except Exception:
                 continue
-            try:
-                detail = parse_kunzer_detail_payload(body)
-            except Exception:
-                detail = None
-            if detail:
-                return detail
+            # Playwright liefert den Body doppelt kodiert (siehe
+            # repair_double_encoded_utf8) - erst die reparierte Fassung, dann
+            # zur Sicherheit die unveraenderten Bytes versuchen.
+            repaired = repair_double_encoded_utf8(body) if isinstance(body, bytes) else body
+            for candidate in (repaired, body) if repaired != body else (body,):
+                try:
+                    detail = parse_kunzer_detail_payload(candidate)
+                except Exception:
+                    detail = None
+                if detail:
+                    return detail
         return {}
 
     def _load_sitemap_index(self) -> dict[str, str]:
@@ -7340,19 +7413,35 @@ def append_attribute_rows_add_only(
     new_rows: list[AttributeRow],
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
     written_at: str,
+    fill_empty_ids: set[str] | None = None,
 ) -> list[str]:
     """Ergänzt Attribute.xlsx add-only um neue Kriterien-IDs eines Artikels.
 
     Bestehende Zeilen (auch manuell gepflegte) bleiben unverändert; es werden
     nur Zeilen für Kriterien-IDs angehängt, die der Artikel noch nicht hat.
+    Für Kriterien-IDs in fill_empty_ids gilt eine vorhandene Zeile OHNE Wert
+    als fehlend und wird ersetzt (Marke 8988: leere Zeile = nicht gepflegt).
     Rückgabe: die tatsächlich hinzugefügten Kriterien-IDs.
     """
     existing_rows = prepare_existing_rows_for_write(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS)
     article_key = normalize_article_number(article_number)
+    fill_empty = {str(criteria_id).strip() for criteria_id in (fill_empty_ids or ()) if str(criteria_id).strip()}
+
+    def is_empty_fill_row(row: list[str]) -> bool:
+        return (
+            len(row) >= 5
+            and normalize_article_number(str(row[0] or "")) == article_key
+            and str(row[1] or "").strip() in fill_empty
+            and not str(row[4] or "").strip()
+        )
+
     existing_ids = {
         str(row[1] or "").strip()
         for row in existing_rows
-        if len(row) >= 2 and normalize_article_number(str(row[0] or "")) == article_key and str(row[1] or "").strip()
+        if len(row) >= 2
+        and normalize_article_number(str(row[0] or "")) == article_key
+        and str(row[1] or "").strip()
+        and not is_empty_fill_row(row)
     }
     added_ids: list[str] = []
     appended_rows: list[list[str]] = []
@@ -7372,6 +7461,8 @@ def append_attribute_rows_add_only(
         existing_ids.add(criteria_id)
         added_ids.append(criteria_id)
     if appended_rows:
+        if fill_empty & set(added_ids):
+            existing_rows = [row for row in existing_rows if not (is_empty_fill_row(row) and str(row[1]).strip() in added_ids)]
         write_workbook(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS, existing_rows + appended_rows)
     return added_ids
 
@@ -12281,6 +12372,25 @@ def live_section_export_rows(bundle: ExportBundle, section: str) -> list[list[st
     raise ValueError(f"Unbekannter Live-Bereich: {section}")
 
 
+# Eingabefelder je Live-Bereich: bilden den Fingerabdruck, wenn der Zeilen-Builder
+# scheitert - sonst saehen ein fehlerhafter gespeicherter Stand und eine geaenderte
+# Maske mit demselben Fehler gleich aus (z. B. ungueltige Attributzeile + neue Marke).
+LIVE_SECTION_INPUT_FIELDS: dict[str, tuple[str, ...]] = {
+    "short_text": ("short_texts", "short_auto_uni", "short_module_id"),
+    "long_text": ("long_texts", "long_auto_uni", "long_module_id"),
+    "genart": ("genart_selections",),
+    "oe_numbers": ("oe_number_rows",),
+    "comparison_numbers": ("comparison_number_rows",),
+    "search_terms": ("search_terms",),
+    "vehicle_links": ("vehicle_link_rows", "genart_selections"),
+    "attributes": ("attribute_rows",),
+    "images": ("image_rows",),
+    "documents": ("document_rows",),
+    "videos": ("video_rows",),
+    "web_links": ("web_rows",),
+}
+
+
 def live_section_fingerprint(bundle: ExportBundle, section: str) -> tuple[str, str]:
     """Fingerabdruck eines Live-Bereichs: Hash der Export-Zeilen.
 
@@ -12295,7 +12405,8 @@ def live_section_fingerprint(bundle: ExportBundle, section: str) -> tuple[str, s
         rows = live_section_export_rows(bundle, section)
     except Exception as exc:
         error_text = str(exc)
-        payload = f"error:{error_text}"
+        raw_input = tuple(getattr(bundle, name, None) for name in LIVE_SECTION_INPUT_FIELDS.get(section, ()))
+        payload = f"error:{error_text}|{raw_input!r}"
     else:
         error_text = ""
         # auto_uni mit in den Fingerabdruck nehmen: bei uni == de liefern beide
@@ -12538,6 +12649,10 @@ class ApolloImportApp:
         # Letztes Einzel-Scrape-Ergebnis: erspart der Attribut-Findung direkt
         # nach dem Kunzer-Laden einen zweiten Abruf derselben Produktseite.
         self.last_kunzer_scrape: KunzerScrapeResult | None = None
+        # Waehrend _apply_kunzer_result: gespeicherter Stand je Bereich (siehe _resolve_fetch_sources).
+        self._fetch_sources: dict[str, object | None] | None = None
+        # Fehlertext einer ungueltigen vorhandenen Attributzeile beim Abruf (siehe _finish_kunzer_result).
+        self._fetch_attribute_warning = ""
         # Produktgruppen aus der Gesamtliste (lazy geladen, Fach-Kontext für die KI).
         self._article_product_groups_cache: dict[str, str] | None = None
 
@@ -12585,6 +12700,8 @@ class ApolloImportApp:
         self.batch_search_term_ai_var = tk.BooleanVar(value=False)
         # Suchwoerter: Artikel, fuer den nach dem Kunzer-Laden noch der KI-Nachlauf aussteht.
         self._search_term_ai_followup_article = ""
+        # Suchwoerter: True, solange ein KI-Lauf fuer den Button laeuft.
+        self._search_term_ai_running = False
         self.batch_progress_var = tk.StringVar()
         self.batch_refresh_media_var = tk.BooleanVar(value=False)
         self.batch_cancel_event = threading.Event()
@@ -15564,6 +15681,11 @@ if ($copied) {{
         article_key = normalize_article_number(article_number)
         if not article_key:
             return []
+        if getattr(self, "_fetch_sources", None) is not None:
+            # Waehrend _apply_kunzer_result: gemeinsame Quelle aller Bereiche
+            # (inkl. Maske bei fehlgeschlagenem Live-Schreiben).
+            source = self._fetch_source("attributes")
+            return list(source.attribute_rows) if source is not None else []
         queued_bundle = self.live_writer.latest_bundle(article_key)
         if queued_bundle is not None:
             return list(queued_bundle.attribute_rows)
@@ -15584,6 +15706,12 @@ if ($copied) {{
         Schreiben uebernimmt der Aufrufer. Rueckgabe: der Markenwert der Maske.
         """
         existing = self._existing_attribute_rows_for_fetch(self.article_number_var.get())
+        # Eine ungueltige vorhandene Zeile bricht den ganzen Attribut-Export des
+        # Artikels ab - dann wird auch die Marke nicht gespeichert. Merken und
+        # nach dem Abruf deutlich melden (die Statuszeile wird sofort ueberschrieben).
+        self._fetch_attribute_warning = next(
+            (error for error in (attribute_row_format_error(row) for row in existing) if error), ""
+        )
         option = brand_attribute_option(self.attribute_options_by_id)
         brand, _source = detect_article_brand_with_source(result, self.brand_list_var.get())
         rows, _changed = merge_brand_attribute_row(existing, build_brand_attribute_row(brand, option))
@@ -15628,9 +15756,21 @@ if ($copied) {{
         """
         del options  # Abrufumfang betrifft Texte/Medien, Suchwoerter kommen immer mit.
         article = normalize_article_number(result.article_number)
-        stored = self.article_browser_records.get(article)
+        if getattr(self, "_fetch_sources", None) is not None:
+            # Gespeicherter Stand inkl. wartender Schreibauftraege bzw. Maske nach
+            # fehlgeschlagenem Live-Schreiben - ein gerade erst ergaenztes Suchwort
+            # darf durch den Abruf nicht verloren gehen.
+            stored = self._fetch_source("search_terms")
+            genart_stored = self._fetch_source("genart")
+        else:
+            stored = self.article_browser_records.get(article)
+            genart_stored = stored
         stored_terms = list(stored.search_terms) if stored is not None else []
-        genart_labels = [sel.bezeichnung for sel in (stored.genart_selections if stored is not None else []) if sel.bezeichnung.strip()]
+        genart_labels = [
+            sel.bezeichnung
+            for sel in (genart_stored.genart_selections if genart_stored is not None else [])
+            if sel.bezeichnung.strip()
+        ]
         brand = self._search_term_brand_value(result)
         candidates = generate_search_term_candidates(
             article,
@@ -15711,6 +15851,14 @@ if ($copied) {{
         elif not article:
             messagebox.showinfo(APP_TITLE, "Bitte zuerst eine Artikelnummer eingeben oder einen Artikel laden.")
             return
+        elif self.batch_import_running or self.live_write_suspended:
+            # Waehrend des Massenimports ist Live-Speichern ausgesetzt - uebernommene
+            # Vorschlaege wuerden nur in der Maske landen und am Ende verloren gehen.
+            messagebox.showinfo(APP_TITLE, "Während eines Massenimports bitte warten, bis er abgeschlossen ist.")
+            return
+        elif self._search_term_ai_running:
+            self.status_var.set("Suchwörter: Die KI-Vorschläge werden bereits geholt - bitte kurz warten.")
+            return
 
         context = self._collect_search_term_context(article)
         brand = str(context["brand"])
@@ -15781,21 +15929,29 @@ if ($copied) {{
                 suggestions = client.suggest_search_terms(user_message)
             except ClaudeExtractionError as exc:
                 return [], "", str(exc)
+            except Exception as exc:  # pragma: no cover - Netz/SDK: wie ein KI-Fehler melden
+                return [], "", str(exc)
             return suggestions, client.last_usage_text, ""
 
         def on_success(payload: object) -> None:
+            self._search_term_ai_running = False
             suggestions, usage_text, ai_error = payload  # type: ignore[misc]
             ai_candidates = filter_ai_search_terms(
                 list(suggestions), article, brand, known_terms, limit=SEARCH_TERM_AI_LIMIT
             )
             self._finish_search_term_autofill(article, rule_candidates, ai_candidates, auto, str(usage_text), str(ai_error))
 
+        # Doppelklick waehrend des KI-Laufs: keinen zweiten Dialog stapeln.
+        self._search_term_ai_running = True
         self._run_background_task(
             f"Suchwörter werden per KI vorgeschlagen ({client.model}) ...",
             worker,
             on_success,
             "Suchwort-KI fehlgeschlagen",
         )
+        if not self.background_task_running:
+            # _run_background_task hat den Lauf nicht gestartet.
+            self._search_term_ai_running = False
 
     def _finish_search_term_autofill(
         self,
@@ -16947,17 +17103,23 @@ if ($copied) {{
             attempt("comparison_numbers", lambda: self._write_comparison_live(bundle, output_root))
             attempt("search_terms", lambda: self._write_usage_number_live(bundle, output_root))
             attempt("vehicle_links", lambda: self._write_vehicle_link_live(bundle, output_root))
-            if "attributes" in sections or "search_terms" in sections:
-                # Suchwoerter: Altbestand (9595-Suchwortzeilen) aus der Attribute-Datei
-                # raeumen - und die Attribute-Datei dabei nur einmal schreiben. Scheitert
-                # das, gelten beide beteiligten Bereiche als fehlgeschlagen.
+            if "attributes" in sections:
+                # Der Attribut-Export ersetzt alle Zeilen des Artikels und raeumt dabei
+                # auch Alt-Suchwortzeilen (9595) mit ab.
                 try:
                     self._write_attribute_live(bundle, output_root)
                 except Exception as exc:  # pragma: no cover - im UI-Thread gemeldet
-                    if "attributes" in sections:
-                        errors["attributes"] = exc
-                    if "search_terms" in sections:
-                        errors["search_terms"] = exc
+                    errors["attributes"] = exc
+            elif "search_terms" in sections:
+                # Nur Suchwoerter: Alt-Suchwortzeilen (9595) gezielt entfernen, ohne den
+                # Attribut-Export zu bauen - eine ungueltige Attributzeile des Artikels
+                # darf die Suchwoerter nicht als fehlgeschlagen markieren.
+                try:
+                    remove_legacy_search_term_attribute_rows(
+                        output_root, {normalize_article_number(bundle.article_number)}
+                    )
+                except Exception as exc:  # pragma: no cover - im UI-Thread gemeldet
+                    errors["search_terms"] = exc
 
             def write_images() -> None:
                 bundle.image_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild", kind_tag="")
@@ -17443,6 +17605,66 @@ if ($copied) {{
             "web_links": True,
         }
         self.last_kunzer_scrape = result
+        # Fertige Schreibauftraege zuerst abholen, damit der gespeicherte Stand
+        # des Artikels (Verzeichnis-Eintrag) aktuell ist.
+        self._poll_live_write_results()
+        fetch_article = normalize_article_number(result.article_number) or normalize_article_number(
+            self.article_number_var.get()
+        )
+        self._fetch_sources = self._resolve_fetch_sources(fetch_article)
+        try:
+            self._apply_kunzer_result_to_form(result, scrape_options, short_translations, long_translations)
+        finally:
+            self._fetch_sources = None
+
+        if translate_after_load and self.auto_translate_after_scrape_var.get() and self.deepl_api_key_var.get().strip():
+            self._translate_loaded_texts()
+
+        self._finish_kunzer_result(result, scrape_options, write_live)
+
+    def _resolve_fetch_sources(self, article_key: str) -> dict[str, object | None]:
+        """Gespeicherter Stand je Bereich fuer einen Kunzer-Abruf.
+
+        Bis v0.1.35 wurden beim Abruf GenArt, OE-, Vergleichsnummern,
+        Fahrzeuge und alle nicht abgerufenen Texte/Medien in der Maske geleert
+        und dieser Leerstand anschliessend live geschrieben - ein erneutes
+        'Artikel anlegen' loeschte damit gepflegte Daten des Artikels. Jetzt
+        kommen diese Bereiche aus dem gespeicherten Stand: ein noch wartender
+        Schreibauftrag, sonst der Verzeichnis-Eintrag (spiegelt die Dateien).
+        Bereiche, deren Live-Schreiben fehlgeschlagen ist, stehen nur in der
+        Maske - dann gilt die Maske, sofern sie diesen Artikel zeigt.
+        """
+        sources: dict[str, object | None] = {section: None for section in LIVE_SECTIONS}
+        if not article_key:
+            return sources
+        stored: object | None = self.live_writer.latest_bundle(article_key)
+        if stored is None:
+            stored = self.article_browser_records.get(article_key)
+        for section in sources:
+            sources[section] = stored
+        failed = set(self._live_failed_sections.get(article_key, set()))
+        if failed and normalize_article_number(self.article_number_var.get()) == article_key:
+            try:
+                mask_bundle = self.collect_bundle(ensure_ids=False)
+            except Exception:  # Maske nicht auswertbar -> gespeicherter Stand
+                mask_bundle = None
+            if mask_bundle is not None:
+                for section in failed:
+                    if section in sources:
+                        sources[section] = mask_bundle
+        return sources
+
+    def _fetch_source(self, section: str) -> object | None:
+        sources = getattr(self, "_fetch_sources", None)
+        return sources.get(section) if sources else None
+
+    def _apply_kunzer_result_to_form(
+        self,
+        result: KunzerScrapeResult,
+        scrape_options: dict[str, bool],
+        short_translations: dict[str, str] | None,
+        long_translations: dict[str, str] | None,
+    ) -> None:
         with self._suspend_live_write():
             if not self.article_number_var.get().strip():
                 self.article_number_var.set(result.article_number)
@@ -17460,35 +17682,61 @@ if ($copied) {{
                 self.long_module_id_var.set(long_id)
             self.kunzer_product_url_var.set(result.product_url)
 
-            short_text_de = result.short_text_de if scrape_options["short_text"] else ""
-            long_text_de = result.long_text_de if scrape_options["long_text"] else ""
-            self.short_text_frame.set_value(
-                TranslationSet(de=short_text_de, uni=short_text_de),
-                auto_uni=True,
-            )
-            self.long_text_frame.set_value(
-                TranslationSet(de=long_text_de, uni=long_text_de),
-                auto_uni=True,
-            )
-            self._set_selected_genart_selections([])
+            # Nicht abgerufene Bereiche kommen aus dem gespeicherten Stand des
+            # Artikels (siehe _resolve_fetch_sources), statt sie zu leeren.
+            short_source = self._fetch_source("short_text")
+            long_source = self._fetch_source("long_text")
+            if scrape_options["short_text"]:
+                self.short_text_frame.set_value(
+                    TranslationSet(de=result.short_text_de, uni=result.short_text_de),
+                    auto_uni=True,
+                )
+            elif short_source is not None:
+                self.short_text_frame.set_value(short_source.short_texts, auto_uni=short_source.short_auto_uni)
+            else:
+                self.short_text_frame.set_value(TranslationSet(), auto_uni=True)
+            if scrape_options["long_text"]:
+                self.long_text_frame.set_value(
+                    TranslationSet(de=result.long_text_de, uni=result.long_text_de),
+                    auto_uni=True,
+                )
+            elif long_source is not None:
+                self.long_text_frame.set_value(long_source.long_texts, auto_uni=long_source.long_auto_uni)
+            else:
+                self.long_text_frame.set_value(TranslationSet(), auto_uni=True)
+            genart_source = self._fetch_source("genart")
+            stored_genarts = list(genart_source.genart_selections) if genart_source is not None else []
+            self._set_selected_genart_selections(stored_genarts)
             self.genart_display_var.set("")
             if short_translations and scrape_options["short_text"]:
                 self.short_text_frame.apply_translations(short_translations)
             if long_translations and scrape_options["long_text"]:
                 self.long_text_frame.apply_translations(long_translations)
 
+            def stored_rows(section: str, field_name: str) -> list[MediaRow]:
+                source = self._fetch_source(section)
+                return list(getattr(source, field_name)) if source is not None else []
+
             image_rows = (
                 [MediaRow(link, art="5", sprache="255") for link in result.image_links]
                 if scrape_options["images"]
-                else []
+                else stored_rows("images", "image_rows")
             )
             document_rows = (
                 [MediaRow(link, art=infer_document_art(link), sprache="255") for link in result.document_links]
                 if scrape_options["documents"]
-                else []
+                else stored_rows("documents", "document_rows")
             )
-            video_rows = [MediaRow(link) for link in result.video_links] if scrape_options["videos"] else []
-            web_rows = [MediaRow(result.product_url)] if scrape_options["web_links"] else []
+            video_rows = (
+                [MediaRow(link) for link in result.video_links]
+                if scrape_options["videos"]
+                else stored_rows("videos", "video_rows")
+            )
+            web_rows = (
+                [MediaRow(result.product_url)]
+                if scrape_options["web_links"]
+                else stored_rows("web_links", "web_rows")
+            )
 
             self.image_frame.set_rows(image_rows)
             self.document_frame.set_rows(document_rows)
@@ -17505,14 +17753,24 @@ if ($copied) {{
                 hook(result, scrape_options)
             else:
                 self.search_term_frame.set_terms([])
-            self.oe_frame.set_rows([])
-            self.comparison_frame.set_rows([])
-            self.vehicle_link_frame.set_rows([])
-            self.genart_suggestion_var.set("GenArt bitte über das Suchfeld oder 'Suchen...' auswählen.")
+            # GenArt, OE-, Vergleichsnummern und Fahrzeuge liefert kunzer.de nicht:
+            # immer der gespeicherte Stand des Artikels (neuer Artikel: leer).
+            oe_source = self._fetch_source("oe_numbers")
+            comparison_source = self._fetch_source("comparison_numbers")
+            vehicle_source = self._fetch_source("vehicle_links")
+            self.oe_frame.set_rows(list(oe_source.oe_number_rows) if oe_source is not None else [])
+            self.comparison_frame.set_rows(
+                list(comparison_source.comparison_number_rows) if comparison_source is not None else []
+            )
+            self.vehicle_link_frame.set_rows(list(vehicle_source.vehicle_link_rows) if vehicle_source is not None else [])
+            if stored_genarts:
+                self.genart_suggestion_var.set(
+                    f"Gespeicherte GenArten: {summarize_genart_selections(stored_genarts, empty_label='-', limit=3)}"
+                )
+            else:
+                self.genart_suggestion_var.set("GenArt bitte über das Suchfeld oder 'Suchen...' auswählen.")
 
-        if translate_after_load and self.auto_translate_after_scrape_var.get() and self.deepl_api_key_var.get().strip():
-            self._translate_loaded_texts()
-
+    def _finish_kunzer_result(self, result: KunzerScrapeResult, scrape_options: dict[str, bool], write_live: bool) -> None:
         self.refresh_preview()
         if write_live:
             if scrape_options["short_text"] or scrape_options["long_text"]:
@@ -17535,6 +17793,17 @@ if ($copied) {{
                 # Suchwoerter: Ergebnis des Hooks ebenfalls sichern.
                 self._write_live_section("search_terms")
                 self.status_var.set(f"Live gespeichert: {normalize_article_number(result.article_number)}")
+        attribute_warning = getattr(self, "_fetch_attribute_warning", "")
+        self._fetch_attribute_warning = ""
+        if attribute_warning and write_live:
+            article = normalize_article_number(result.article_number)
+            self.status_var.set(f"Attribute von {article} nicht gespeichert: {attribute_warning}")
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Die Attribute von {article} - auch die Marke (8988) - konnten nicht gespeichert werden, "
+                f"weil eine vorhandene Attributzeile ungültig ist:\n\n{attribute_warning}\n\n"
+                "Bitte im Tab 'Attribute' korrigieren; danach wird automatisch gespeichert.",
+            )
         # Nach dem Laden automatisch die Attribut-Findung starten (Regeln + KI).
         # Suchwoerter: ueber den Wrapper, der danach den KI-Nachlauf fuer Suchwoerter anstoesst.
         self.root.after(200, self._start_autofill_after_fetch)
@@ -17782,6 +18051,9 @@ if ($copied) {{
                 # Marke: je Artikel genau eine 8988-Zeile (add-only).
                 "brand_added_count": 0,
                 "brand_existing_count": 0,
+                "brand_failed_count": 0,
+                "brand_failed_reason": "",
+                "brand_disabled": False,
                 # Suchwoerter: Zaehler und Ergebnis des einen Schreibvorgangs am Ende.
                 "search_term_articles": 0,
                 "search_term_candidate_count": 0,
@@ -17870,8 +18142,11 @@ if ($copied) {{
             article_product_groups: dict[str, str] = {}
             # Marke: vorhandene Kriterien-IDs je Artikel immer einlesen (nicht nur
             # mit Attribute-Option), damit die 8988-Zeile add-only ergaenzt wird.
+            brand_values_by_article: dict[str, str] = {}
             try:
                 attribute_ids_by_article = read_article_attribute_ids(output_root / ATTRIBUTE_FILE[0])
+                # Marke: Artikel mit leerer 8988-Zeile gelten als 'ohne Marke'.
+                brand_values_by_article = read_article_attribute_values(output_root / ATTRIBUTE_FILE[0], BRAND_CRITERIA_ID)
             except Exception:  # pragma: no cover - defekte Datei darf den Lauf nicht kippen
                 attribute_ids_by_article = {}
             if options.get("attributes"):
@@ -17885,6 +18160,11 @@ if ($copied) {{
                 gepflegt) bleibt unveraendert; es wird nie ueberschrieben.
                 """
                 article_key = normalize_article_number(bundle.article_number)
+                if summary["brand_disabled"]:
+                    # Attribute.xlsx war gesperrt: nicht fuer jeden weiteren Artikel
+                    # erneut die ganze Datei lesen und scheitern.
+                    summary["brand_failed_count"] = int(summary["brand_failed_count"]) + 1
+                    return
                 known_ids = attribute_ids_by_article.setdefault(article_key, set())
                 product_group = article_product_groups.get(article_key, "")
                 brand, source = detect_article_brand_with_source(result, brand_list_worker)
@@ -17906,7 +18186,7 @@ if ($copied) {{
                         ]
                     )
 
-                if BRAND_CRITERIA_ID in known_ids:
+                if BRAND_CRITERIA_ID in known_ids and brand_values_by_article.get(article_key):
                     summary["brand_existing_count"] = int(summary["brand_existing_count"]) + 1
                     report("vorhanden", f"Marke bereits gepflegt, nicht ueberschrieben (erkannt: {brand}, {source_label})")
                     return
@@ -17923,9 +18203,11 @@ if ($copied) {{
                         [row],
                         attribute_key_values_worker,
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        fill_empty_ids={BRAND_CRITERIA_ID},
                     )
                 known_ids.add(BRAND_CRITERIA_ID)
                 if added_ids:
+                    brand_values_by_article[article_key] = row.value
                     summary["brand_added_count"] = int(summary["brand_added_count"]) + 1
                     bundle.attribute_rows = list(bundle.attribute_rows) + [row]
                     report("automatisch", f"Marke aus {source_label}")
@@ -18121,6 +18403,12 @@ if ($copied) {{
                             try:
                                 run_brand_step(result, bundle)
                             except Exception as brand_exc:  # pragma: no cover - Marken-Schritt darf den Artikel nie kippen
+                                summary["brand_failed_count"] = int(summary["brand_failed_count"]) + 1
+                                if not summary["brand_failed_reason"]:
+                                    summary["brand_failed_reason"] = str(brand_exc)
+                                if isinstance(brand_exc, OSError):
+                                    # Gesperrte/unerreichbare Datei: fuer den Rest des Laufs aussetzen.
+                                    summary["brand_disabled"] = True
                                 summary["media_warnings"].append(
                                     (bundle.article_number, f"Marke (Attribut 8988) fehlgeschlagen: {brand_exc}")
                                 )
@@ -18517,7 +18805,7 @@ if ($copied) {{
         if warning_list_path:
             warning_articles = len({article_number for article_number, _warning in media_warnings})
             error_list_hint += (
-                f"\n\nHinweis: Bei {warning_articles} Artikeln wurden tote Medien-Links übersprungen (Server liefert die Datei nicht mehr)."
+                f"\n\nHinweis: Bei {warning_articles} Artikeln gab es Warnungen (z. B. übersprungene tote Medien-Links)."
                 f"\nDetails: {warning_list_path}"
             )
 
@@ -18547,6 +18835,14 @@ if ($copied) {{
         attribute_report_path = str(summary.get("attribute_report_path") or "")
         brand_added_count = int(summary.get("brand_added_count") or 0)
         brand_existing_count = int(summary.get("brand_existing_count") or 0)
+        brand_failed_count = int(summary.get("brand_failed_count") or 0)
+        if brand_failed_count:
+            reason = str(summary.get("brand_failed_reason") or "").strip()
+            error_list_hint += (
+                f"\n\nACHTUNG Marke (Attribut 8988): bei {brand_failed_count} Artikeln NICHT geschrieben"
+                + (f" - {reason}" if reason else "")
+                + "\n(Attribute.xlsx geöffnet? Datei schließen und die Artikel erneut abrufen.)"
+            )
         if attribute_would_count or attribute_added_count or attribute_review_rows:
             if attribute_would_count:
                 error_list_hint += (
