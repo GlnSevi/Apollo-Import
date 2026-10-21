@@ -14390,14 +14390,14 @@ if ($copied) {{
         )
 
         # Marke (Attribut 8988): Markenliste fuer die automatische Erkennung.
-        ttk.Separator(parent, orient="horizontal").grid(row=26, column=0, columnspan=3, sticky="ew", pady=(14, 12))
+        ttk.Separator(parent, orient="horizontal").grid(row=28, column=0, columnspan=3, sticky="ew", pady=(14, 12))
         ttk.Label(parent, text="Marke (Attribut 8988)", font=("Segoe UI Semibold", 10)).grid(
-            row=27, column=0, columnspan=2, sticky="w", pady=(0, 4)
+            row=29, column=0, columnspan=2, sticky="w", pady=(0, 4)
         )
-        ttk.Label(parent, text="Markenliste").grid(row=28, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(parent, textvariable=self.brand_list_var).grid(row=28, column=1, sticky="ew", pady=6)
+        ttk.Label(parent, text="Markenliste").grid(row=30, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.brand_list_var).grid(row=30, column=1, sticky="ew", pady=6)
         brand_actions = ttk.Frame(parent)
-        brand_actions.grid(row=28, column=2, sticky="w", padx=(10, 0), pady=6)
+        brand_actions.grid(row=30, column=2, sticky="w", padx=(10, 0), pady=6)
         ttk.Button(
             brand_actions,
             text="Standard",
@@ -14416,7 +14416,7 @@ if ($copied) {{
             ),
             foreground="#5E6472",
             wraplength=760,
-        ).grid(row=29, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=31, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def _toggle_article_browser_section(self) -> None:
         self.article_browser_collapsed = not self.article_browser_collapsed
