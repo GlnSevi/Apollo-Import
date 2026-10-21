@@ -27,7 +27,7 @@ import tkinter as tk
 import unicodedata
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Iterator, TypeVar
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
@@ -159,6 +159,25 @@ def estimate_claude_cost_usd(model: str, input_tokens: int, output_tokens: int, 
     price_in, price_out = CLAUDE_MODEL_PRICES.get(model, CLAUDE_MODEL_PRICES[CLAUDE_DEFAULT_MODEL])
     cost = input_tokens / 1_000_000 * price_in + output_tokens / 1_000_000 * price_out
     return cost * (0.5 if batch else 1.0)
+
+
+# Marke (Attribut 8988 'Marke', Alphanumerisch, max. 20 Zeichen): Die Marke
+# steht auf kunzer.de nicht im HTML, sondern wird aus Signalen des Abrufs
+# erkannt (Medienordner, Kategoriepfad, Shop-Suchwoerter, Texte, Link-Labels).
+# Die Liste der kanonischen Marken mit Aliassen ist in den Einstellungen
+# pflegbar: Eintraege mit ';' trennen, Aliasse nach '=' mit ',' trennen
+# (Gross-/Kleinschreibung egal; Leerzeichen und Bindestriche im Alias sind
+# beliebig, 'T D L' trifft also auch 'TDL').
+BRAND_CRITERIA_ID = "8988"
+BRAND_ATTRIBUTE_MAX_LENGTH = 20
+DEFAULT_BRAND_NAME = "Kunzer"
+# GS1-Basisnummer der Kunzer GmbH: EAN mit diesem Praefix = Kunzer-Eigenartikel.
+KUNZER_EAN_PREFIX = "4260174"
+DEFAULT_BRAND_LIST = (
+    "Kunzer; Airman=airman,airMAN,air man; TDL=T D L,tdl; "
+    "Weber Hydraulik=weber hydraulik,weber-hydraulik; MotoMeter=moto meter,motometer,moto-meter; "
+    "Norma; Oetiker; Suprabeam; Gefo; Tiger Grip=handschuhe,tigergrip,tiger-grip; Argus"
+)
 ID_ALPHABET = string.ascii_uppercase + string.digits
 ID_LENGTH = 6
 SHORT_TEXT_MAX_LENGTH = 60
@@ -2023,6 +2042,248 @@ def normalize_attribute_rows(rows: list[AttributeRow]) -> list[AttributeRow]:
             )
         )
     return normalized
+
+
+# ---------------------------------------------------------------------------
+# Marke (Attribut 8988): Markenliste, Erkennung aus Abruf-Signalen, Attributzeile
+# ---------------------------------------------------------------------------
+
+# Fallback fuer den Katalogeintrag 8988, falls die Attributliste (G:-Laufwerk)
+# nicht geladen ist - die Marke soll trotzdem gepflegt werden koennen.
+BRAND_ATTRIBUTE_OPTION = AttributeOption(
+    criteria_id=BRAND_CRITERIA_ID,
+    label="Marke",
+    value_format="Alphanumerisch",
+    max_length=BRAND_ATTRIBUTE_MAX_LENGTH,
+    source="TOPMOTIVE",
+    type_name="",
+)
+
+# Signale der Markenerkennung in Prioritaetsreihenfolge (erster Treffer gewinnt)
+# und ihre Anzeige in Status/Bericht.
+BRAND_SIGNAL_LABELS = {
+    "medienordner": "Medienordner",
+    "kategorie": "Kategoriepfad",
+    "suchwoerter": "Shop-Suchwoerter",
+    "titel": "Titel",
+    "kurztext": "Kurzbezeichnung",
+    "langtext": "Text",
+    "links": "Link-Label",
+    "ean": "EAN (Kunzer-GS1)",
+    "standard": "Standard",
+}
+
+_BRAND_ALIAS_PATTERN_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def parse_brand_list(raw: str | None) -> list[tuple[str, list[str]]]:
+    """Zerlegt die Markenliste ('Kunzer; Airman=airman,airMAN; TDL=T D L') in
+    (kanonischer Name, Aliasse casefold).
+
+    Der kanonische Name ist immer selbst ein Alias. Leere Eintraege werden
+    uebersprungen, doppelte Namen (ohne Gross-/Kleinschreibung) zusammengefasst.
+    """
+    entries: list[tuple[str, list[str]]] = []
+    index_by_name: dict[str, int] = {}
+    for part in str(raw if raw is not None else "").split(";"):
+        name, _, alias_text = part.partition("=")
+        name = " ".join(name.split())
+        if not name:
+            continue
+        aliases = [name.casefold()]
+        for alias in alias_text.split(","):
+            alias_key = " ".join(alias.split()).casefold()
+            if alias_key and alias_key not in aliases:
+                aliases.append(alias_key)
+        key = name.casefold()
+        if key in index_by_name:
+            _existing_name, existing_aliases = entries[index_by_name[key]]
+            for alias_key in aliases:
+                if alias_key not in existing_aliases:
+                    existing_aliases.append(alias_key)
+            continue
+        index_by_name[key] = len(entries)
+        entries.append((name, aliases))
+    return entries
+
+
+def _brand_alias_pattern(alias: str) -> "re.Pattern[str]":
+    """Regex fuer einen Alias an Wortgrenzen (Buchstabe/Ziffer davor oder danach
+    verhindert den Treffer: 'norma' trifft nicht 'normal'). Leerzeichen,
+    Bindestriche und Unterstriche im Alias sind beliebig, 'weber hydraulik'
+    trifft also 'Weber-Hydraulik' und 'T D L' auch 'TDL'."""
+    pattern = _BRAND_ALIAS_PATTERN_CACHE.get(alias)
+    if pattern is None:
+        tokens = [re.escape(token) for token in re.split(r"[\s\-_]+", alias) if token]
+        body = r"[\s\-_]*".join(tokens) if tokens else re.escape(alias)
+        pattern = re.compile(rf"(?<![^\W_])(?:{body})(?![^\W_])", re.IGNORECASE)
+        _BRAND_ALIAS_PATTERN_CACHE[alias] = pattern
+    return pattern
+
+
+def _brand_match_in_text(text: str, brands: list[tuple[str, list[str]]], skip_default: bool = False) -> str:
+    """Marke, deren Alias im Text am fruehesten vorkommt; '' ohne Treffer.
+
+    Mit skip_default zaehlt die Standardmarke nicht als Treffer (in Texten
+    ist 'Kunzer' kein Unterscheidungsmerkmal - sie ist ohnehin der Rueckfall).
+    """
+    if not text:
+        return ""
+    best_position: int | None = None
+    best_name = ""
+    default_key = DEFAULT_BRAND_NAME.casefold()
+    for name, aliases in brands:
+        if skip_default and name.casefold() == default_key:
+            continue
+        for alias in aliases:
+            match = _brand_alias_pattern(alias).search(text)
+            if match is not None and (best_position is None or match.start() < best_position):
+                best_position = match.start()
+                best_name = name
+    return best_name
+
+
+def _brand_signal_text(signals: object, name: str) -> str:
+    return str(getattr(signals, name, "") or "")
+
+
+def _brand_signal_list(signals: object, name: str) -> list[str]:
+    values = getattr(signals, name, None) or []
+    if isinstance(values, str):
+        values = [values]
+    return [str(value) for value in values if str(value or "").strip()]
+
+
+def detect_article_brand_with_source(
+    signals: object, brand_list: str | list[tuple[str, list[str]]] | None = None
+) -> tuple[str, str]:
+    """Erkennt die Marke eines Artikels aus den Abruf-Signalen; (Marke, Signal).
+
+    `signals` ist ein beliebiges Objekt mit den Feldern brand_folder,
+    category_path, shop_search_terms, title, short_text_de, long_text_de,
+    image_links, document_links, shop_link_labels, ean (z. B. direkt ein
+    KunzerScrapeResult; fehlende Felder gelten als leer). Reihenfolge:
+    Medienordner -> markenartige Kategorie im Pfad -> Shop-Suchwoerter ->
+    Titel/Kurztext/Langtext (Wortgrenzen) -> Link-Labels -> EAN-Praefix der
+    Kunzer-GS1 -> Standard. Das Ergebnis ist immer ein kanonischer Name aus
+    der Markenliste mit hoechstens BRAND_ATTRIBUTE_MAX_LENGTH Zeichen.
+    """
+    if isinstance(brand_list, str) or brand_list is None:
+        brands = parse_brand_list(DEFAULT_BRAND_LIST if brand_list is None else brand_list)
+    else:
+        brands = [(str(name), [str(alias) for alias in aliases]) for name, aliases in brand_list]
+
+    def finish(name: str, source: str) -> tuple[str, str]:
+        canonical = " ".join(str(name or "").split())[:BRAND_ATTRIBUTE_MAX_LENGTH].strip()
+        return (canonical or DEFAULT_BRAND_NAME[:BRAND_ATTRIBUTE_MAX_LENGTH]), source
+
+    folder = " ".join(_brand_signal_text(signals, "brand_folder").split()).casefold()
+    if not folder:
+        folder = kunzer_media_folder_from_links(
+            _brand_signal_list(signals, "image_links") + _brand_signal_list(signals, "document_links")
+        )
+    if folder:
+        name = _brand_match_in_text(folder, brands)
+        if name:
+            return finish(name, "medienordner")
+
+    for segment in _brand_signal_list(signals, "category_path"):
+        name = _brand_match_in_text(segment, brands)
+        if name:
+            return finish(name, "kategorie")
+
+    for term in _brand_signal_list(signals, "shop_search_terms"):
+        name = _brand_match_in_text(term, brands)
+        if name:
+            return finish(name, "suchwoerter")
+
+    for field_name, source in (("title", "titel"), ("short_text_de", "kurztext"), ("long_text_de", "langtext")):
+        name = _brand_match_in_text(_brand_signal_text(signals, field_name), brands, skip_default=True)
+        if name:
+            return finish(name, source)
+
+    for label in _brand_signal_list(signals, "shop_link_labels"):
+        name = _brand_match_in_text(label, brands, skip_default=True)
+        if name:
+            return finish(name, "links")
+
+    ean = re.sub(r"\D", "", _brand_signal_text(signals, "ean"))
+    if ean.startswith(KUNZER_EAN_PREFIX):
+        return finish(DEFAULT_BRAND_NAME, "ean")
+    return finish(DEFAULT_BRAND_NAME, "standard")
+
+
+def detect_article_brand(signals: object, brand_list: str | list[tuple[str, list[str]]] | None = None) -> str:
+    """Kanonischer Markenname (<= 20 Zeichen) fuer die Abruf-Signale; Standard 'Kunzer'."""
+    return detect_article_brand_with_source(signals, brand_list)[0]
+
+
+def brand_attribute_option(attribute_options_by_id: dict[str, AttributeOption] | None) -> AttributeOption:
+    """Katalogeintrag 8988 'Marke' - aus der Attributliste oder als Fallback-Konstante."""
+    option = (attribute_options_by_id or {}).get(BRAND_CRITERIA_ID)
+    return option if option is not None else BRAND_ATTRIBUTE_OPTION
+
+
+def build_brand_attribute_row(brand: str, option: AttributeOption | None = None) -> AttributeRow | None:
+    """Attributzeile 8988 fuer die Marke.
+
+    None, wenn der Wert leer ist oder die Formatpruefung nicht besteht (ein
+    ueberlanger Wert wuerde sonst den gesamten Attribut-Export des Artikels
+    blockieren, siehe attribute_row_format_error).
+    """
+    value = " ".join(str(brand or "").split())
+    if not value:
+        return None
+    option = option if option is not None else BRAND_ATTRIBUTE_OPTION
+    max_length = option.max_length if option.max_length is not None else BRAND_ATTRIBUTE_MAX_LENGTH
+    row = AttributeRow(
+        criteria_id=BRAND_CRITERIA_ID,
+        label=option.label.strip() or BRAND_ATTRIBUTE_OPTION.label,
+        value_format=option.value_format.strip() or BRAND_ATTRIBUTE_OPTION.value_format,
+        max_length=max_length,
+        type_name=option.type_name,
+        value=value,
+    )
+    if attribute_row_format_error(row):
+        return None
+    return row
+
+
+def find_brand_attribute_value(rows: list[AttributeRow]) -> str:
+    """Wert der ersten 8988-Zeile mit nicht-leerem Wert; '' wenn keine vorhanden."""
+    for row in rows:
+        if row.criteria_id.strip() == BRAND_CRITERIA_ID and row.value.strip():
+            return row.value.strip()
+    return ""
+
+
+def merge_brand_attribute_row(rows: list[AttributeRow], brand_row: AttributeRow | None) -> tuple[list[AttributeRow], bool]:
+    """Setzt die 8988-Zeile in eine Attributliste, ohne eine bereits gepflegte
+    Marke zu ueberschreiben (manuelle Pflege gewinnt).
+
+    Eine vorhandene 8988-Zeile mit Wert bleibt unveraendert; leere 8988-Zeilen
+    werden durch die erkannte Marke ersetzt. Alle anderen Zeilen bleiben
+    erhalten. Rueckgabe: (Zeilen, True wenn die Marke neu gesetzt wurde).
+    """
+    existing = list(rows)
+    if brand_row is None or find_brand_attribute_value(existing):
+        return existing, False
+    kept = [row for row in existing if row.criteria_id.strip() != BRAND_CRITERIA_ID]
+    return kept + [brand_row], True
+
+
+def merge_attribute_rows_add_only(rows: list[AttributeRow], new_rows: list[AttributeRow]) -> list[AttributeRow]:
+    """Ergaenzt Attributzeilen nur fuer Kriterien-IDs, die noch fehlen (wie
+    append_attribute_rows_add_only, aber im Speicher)."""
+    merged = list(rows)
+    existing_ids = {row.criteria_id.strip() for row in merged if row.criteria_id.strip()}
+    for row in new_rows:
+        criteria_id = row.criteria_id.strip()
+        if not criteria_id or criteria_id in existing_ids:
+            continue
+        existing_ids.add(criteria_id)
+        merged.append(row)
+    return merged
 
 
 def format_oe_number_rows(label: str, rows: list[OeNumberRow]) -> str:
@@ -4693,6 +4954,120 @@ class ClaudeAttributeClient:
         return [item for item in extractions if isinstance(item, dict)]
 
 
+def kunzer_media_folder_from_links(links: list[str]) -> str:
+    """Medienordner eines Artikels = erstes Pfadsegment der restapi.kunzer.de-Links
+    (URL-dekodiert, casefold), z. B. 'airman', 'weber hydraulik', 'kunzer werkzeuge'.
+
+    Bei mehreren Ordnern gewinnt der haeufigste (bei Gleichstand der zuerst
+    gesehene). Interne tote Pfade wie 's:' werden ignoriert. '' wenn unbekannt.
+    """
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for link in links:
+        try:
+            parsed = urlparse(str(link or "").strip())
+        except ValueError:
+            continue
+        if "restapi.kunzer.de" not in parsed.netloc.casefold():
+            continue
+        segments = [unquote(segment) for segment in parsed.path.replace("\\", "/").split("/") if segment]
+        if len(segments) < 2:
+            # Datei direkt unter dem Host: kein Ordner.
+            continue
+        folder = " ".join(segments[0].split()).casefold()
+        if not folder or folder.endswith(":"):
+            continue
+        if folder not in counts:
+            order.append(folder)
+        counts[folder] = counts.get(folder, 0) + 1
+    if not counts:
+        return ""
+    return max(order, key=lambda name: (counts[name], -order.index(name)))
+
+
+_FLIGHT_ROW_HEADER = re.compile(rb"([0-9a-fA-F]+):(T([0-9a-fA-F]+),)?")
+
+
+def _iter_flight_rows(data: bytes) -> Iterator[tuple[str, bytes]]:
+    """Zeilen einer React-Flight-Antwort (text/x-component) als (ID, Rohdaten).
+
+    Normale Zeilen haben die Form '<id>:<json>\\n'. Textbloecke (z. B. der
+    HTML-Langtext) stehen als '<id>:T<hexlaenge>,<rohtext>' - die Laenge gilt
+    in Bytes, der Text enthaelt selbst Zeilenumbrueche und endet ohne
+    Zeilenende, die naechste Zeile folgt direkt. Deshalb wird byteweise
+    gelesen statt an Zeilenumbruechen getrennt.
+    """
+    position = 0
+    total = len(data)
+    while position < total:
+        match = _FLIGHT_ROW_HEADER.match(data, position)
+        if match is None:
+            newline = data.find(b"\n", position)
+            if newline < 0:
+                break
+            position = newline + 1
+            continue
+        row_id = match.group(1).decode("ascii")
+        start = match.end()
+        if match.group(2):
+            length = int(match.group(3), 16)
+            yield row_id, data[start : start + length]
+            position = start + length
+            if data[position : position + 1] == b"\n":
+                position += 1
+            continue
+        newline = data.find(b"\n", start)
+        if newline < 0:
+            newline = total
+        yield row_id, data[start:newline]
+        position = newline + 1
+
+
+def parse_kunzer_detail_payload(payload: bytes | str) -> dict[str, object] | None:
+    """Liest aus der Flight-Antwort der Detail-Server-Action von kunzer.de den
+    ersten Artikel-Datensatz ('article': [...]). Bytes werden immer als UTF-8
+    gelesen (Umlaute in 'Stück' usw.). None, wenn kein Artikel enthalten ist."""
+    if isinstance(payload, (bytes, bytearray)):
+        data = bytes(payload)
+    else:
+        data = str(payload or "").encode("utf-8")
+    if b'"article"' not in data:
+        return None
+    for _row_id, raw in _iter_flight_rows(data):
+        if b'"article"' not in raw:
+            continue
+        try:
+            parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        articles = parsed.get("article")
+        if isinstance(articles, list) and articles and isinstance(articles[0], dict):
+            return articles[0]
+    return None
+
+
+def kunzer_shop_search_terms_from_raw(raw: object) -> list[str]:
+    """Bereinigt das SUCHWOERTER-Feld der Detail-Server-Action.
+
+    Das Feld enthaelt harte \\r\\n-Umbrueche, auch mitten im Wort
+    ('Pa\\r\\nnnenpilot') - sie werden vor dem Trennen entfernt. Trenner sind
+    ';' und '|'; Eintraege werden getrimmt, leere und doppelte (ohne
+    Gross-/Kleinschreibung) entfallen.
+    """
+    text = str(raw or "").replace("\r\n", "").replace("\r", "").replace("\n", "")
+    terms: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[;|]", text):
+        term = " ".join(part.split())
+        key = term.casefold()
+        if term and key not in seen:
+            seen.add(key)
+            terms.append(term)
+    return terms
+
+
 class KunzerScrapeError(RuntimeError):
     pass
 
@@ -4708,6 +5083,16 @@ class KunzerScrapeResult:
     image_links: list[str]
     document_links: list[str]
     video_links: list[str]
+    # Signale fuer die Markenerkennung und Suchwoerter (siehe detect_article_brand):
+    # Medienordner (erstes Pfadsegment der restapi-Links, casefold, '' wenn unbekannt),
+    # Kategoriepfad der Produktseite, Shop-Suchwoerter (SUCHWOERTER, bereinigt),
+    # EAN und Kategorie-ID (ArticleGroupeID) sowie Link-Labels aus der Detail-Action.
+    brand_folder: str = ""
+    category_path: list[str] = field(default_factory=list)
+    shop_search_terms: list[str] = field(default_factory=list)
+    ean: str = ""
+    article_group_id: str = ""
+    shop_link_labels: list[str] = field(default_factory=list)
 
 
 class KunzerScraper:
@@ -4744,6 +5129,23 @@ class KunzerScraper:
                 headless=True,
             )
             page = browser.new_page(viewport={"width": 1440, "height": 2400})
+            # Die Seite laedt die Artikeldaten (SUCHWOERTER, EAN, Kategorie-ID,
+            # Link-Labels) selbst ueber eine Next.js-Server-Action. Die Antworten
+            # werden mitgeschnitten und nach dem Laden ausgewertet - so muss keine
+            # Action-ID hart kodiert werden (sie aendert sich mit jedem Deploy).
+            server_action_responses: list[object] = []
+
+            def remember_server_action_response(response: object) -> None:
+                try:
+                    if response.request.headers.get("next-action"):
+                        server_action_responses.append(response)
+                except Exception:
+                    pass
+
+            try:
+                page.on("response", remember_server_action_response)
+            except Exception:
+                pass
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
                 self._accept_cookies_if_present(page)
@@ -4761,7 +5163,8 @@ class KunzerScraper:
                 title = self._clean_single_line(page.title().replace("| Kunzer", ""))
                 heading = self._safe_first_text(page.get_by_role("heading").all_inner_texts())
                 short_text_de = self._clean_single_line(heading or title)
-                breadcrumb_text = self._extract_breadcrumb_text(page)
+                category_path = self._extract_category_path(page)
+                breadcrumb_text = " > ".join(category_path)
 
                 description_text = self._extract_tab_content(page, "Artikelbeschreibung")
                 info_text = self._extract_tab_content(page, "Artikelinformationen")
@@ -4776,6 +5179,7 @@ class KunzerScraper:
                     self._extract_article_number(page.url, page.locator("body").inner_text(), short_text_de)
                 )
 
+                detail = self._read_detail_payload(server_action_responses)
                 result = KunzerScrapeResult(
                     article_number=article_number,
                     product_url=page.url,
@@ -4786,6 +5190,16 @@ class KunzerScraper:
                     image_links=image_links,
                     document_links=document_links,
                     video_links=video_links,
+                    brand_folder=kunzer_media_folder_from_links(image_links + document_links),
+                    category_path=category_path,
+                    shop_search_terms=kunzer_shop_search_terms_from_raw(detail.get("SUCHWOERTER")),
+                    ean=self._clean_single_line(str(detail.get("EAN") or "")),
+                    article_group_id=self._clean_single_line(str(detail.get("ArticleGroupeID") or "")),
+                    shop_link_labels=[
+                        self._clean_single_line(str(item.get("label") or ""))
+                        for item in (detail.get("links") or [])
+                        if isinstance(item, dict) and str(item.get("label") or "").strip()
+                    ],
                 )
                 self._result_cache[target_url] = result
                 self._result_cache[result.product_url] = result
@@ -4808,7 +5222,33 @@ class KunzerScraper:
             image_links=list(result.image_links),
             document_links=list(result.document_links),
             video_links=list(result.video_links),
+            brand_folder=str(getattr(result, "brand_folder", "") or ""),
+            category_path=list(getattr(result, "category_path", None) or []),
+            shop_search_terms=list(getattr(result, "shop_search_terms", None) or []),
+            ean=str(getattr(result, "ean", "") or ""),
+            article_group_id=str(getattr(result, "article_group_id", "") or ""),
+            shop_link_labels=list(getattr(result, "shop_link_labels", None) or []),
         )
+
+    def _read_detail_payload(self, responses: list[object]) -> dict[str, object]:
+        """Artikel-Datensatz aus den mitgeschnittenen Server-Action-Antworten.
+
+        Erkannt wird die Antwort am Inhalt ('article': [...]), nicht an einer
+        Action-ID. Antworten ohne Body (Redirects) oder mit Fehlern werden
+        uebersprungen; ohne Treffer kommt ein leeres Dict zurueck.
+        """
+        for response in responses:
+            try:
+                body = response.body()
+            except Exception:
+                continue
+            try:
+                detail = parse_kunzer_detail_payload(body)
+            except Exception:
+                detail = None
+            if detail:
+                return detail
+        return {}
 
     def _load_sitemap_index(self) -> dict[str, str]:
         if self._sitemap_index is not None:
@@ -4867,62 +5307,71 @@ class KunzerScraper:
         return hrefs
 
     def _extract_breadcrumb_text(self, page: object) -> str:
+        """Kategoriepfad der Produktseite als 'A > B > C' (siehe _extract_category_path)."""
+        return " > ".join(self._extract_category_path(page))
+
+    def _extract_category_path(self, page: object) -> list[str]:
+        """Kategoriepfad (Breadcrumb) der gerenderten Produktseite, z. B.
+        ['Produkte', 'Werkzeuge', 'Rad und Reifen', 'airMAN'].
+
+        Der Pfad steht nicht im Roh-HTML, sondern wird clientseitig gerendert:
+        eine Kette von Links auf /shop/... (jeder in einem eigenen Wrapper),
+        oberhalb des Produkts. Gesucht wird strukturell, nicht ueber CSS-Klassen:
+        der kleinste Container mit 2-8 Shop-Links und kurzen Texten ausserhalb
+        von Kopf-/Fusszeile; Hauptnavigation und Fusszeilen-Kategorieliste
+        (mehr Links, innerhalb header/footer) scheiden damit aus.
+        """
         script = """
         () => {
             const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
-            const selectors = [
-                '[aria-label*="breadcrumb" i]',
-                '[class*="breadcrumb" i]',
-                '[data-testid*="breadcrumb" i]',
-                'nav',
-            ];
+            const isShopLink = (node) =>
+                node.tagName === 'A' && /^\\/shop(\\/|$|\\?)/.test(node.getAttribute('href') || '');
             const candidates = [];
             const seen = new Set();
-
-            for (const selector of selectors) {
-                for (const node of document.querySelectorAll(selector)) {
-                    const parts = [];
-                    const descendants = node.querySelectorAll('a, span, li, p, div');
-                    for (const descendant of descendants) {
-                        const text = clean(descendant.textContent);
-                        if (!text || text.length > 50) {
-                            continue;
-                        }
-                        if (parts.length && parts[parts.length - 1] === text) {
-                            continue;
-                        }
-                        parts.push(text);
-                    }
-
-                    if (parts.length < 2 || parts.length > 6) {
+            for (const link of document.querySelectorAll('a[href^="/shop"]')) {
+                if (!isShopLink(link) || link.closest('header, footer')) {
+                    continue;
+                }
+                let node = link.parentElement;
+                for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+                    const anchors = Array.from(node.querySelectorAll('a'));
+                    const shopLinks = anchors.filter(isShopLink);
+                    if (shopLinks.length < 2) {
                         continue;
                     }
-
-                    const text = parts.join(' > ');
-                    if (!text || text.length > 140 || seen.has(text)) {
-                        continue;
+                    if (seen.has(node) || shopLinks.length > 8 || anchors.length - shopLinks.length > 1) {
+                        break;
                     }
-                    seen.add(text);
-
+                    seen.add(node);
+                    const parts = shopLinks.map((anchor) => clean(anchor.textContent));
+                    if (parts.some((part) => !part || part.length > 60)) {
+                        break;
+                    }
                     let score = 0;
-                    if (/produkte/i.test(text)) score += 120;
-                    if (/breadcrumb/i.test(selector)) score += 80;
-                    if (/shop|downloads|kontakt|über uns/i.test(text)) score -= 60;
-                    score += Math.max(0, 40 - parts.length * 6);
-                    score += Math.max(0, 50 - text.length / 3);
-                    candidates.push({ text, score });
+                    if (/^\\/shop\\/?$/.test(shopLinks[0].getAttribute('href') || '')) score += 50;
+                    if (/^produkte$/i.test(parts[0])) score += 30;
+                    if (node.closest('[aria-label*="breadcrumb" i], [class*="breadcrumb" i], nav')) score += 20;
+                    score -= depth * 5;
+                    candidates.push({ parts, score, top: node.getBoundingClientRect().top });
+                    break;
                 }
             }
-
-            candidates.sort((left, right) => right.score - left.score);
-            return candidates.length ? candidates[0].text : '';
+            candidates.sort((left, right) => right.score - left.score || left.top - right.top);
+            return candidates.length ? candidates[0].parts : [];
         }
         """
         try:
-            breadcrumb_text = str(page.evaluate(script)).strip()
+            raw_parts = page.evaluate(script)
         except Exception:
-            return ""
-        return self._clean_single_line(breadcrumb_text)
+            return []
+        if not isinstance(raw_parts, list):
+            return []
+        parts: list[str] = []
+        for raw in raw_parts:
+            text = self._clean_single_line(str(raw or ""))
+            if text and (not parts or parts[-1] != text):
+                parts.append(text)
+        return parts
 
     def _extract_tab_content(self, page: object, button_label: str) -> str:
         try:
