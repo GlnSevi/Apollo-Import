@@ -208,20 +208,22 @@ Die KI erhaelt den Produkttext als reinen Inhalt und darf nur Attribute aus der 
 
 Die Marke eines Artikels wird in Apollo als Attribut `8988 Marke` (Format `Alphanumerisch`, max. 20 Zeichen) gepflegt. Bei jedem Kunzer-Abruf - im Einzelartikel (`Artikel anlegen`) wie im Massenimport (`Liste importieren`, `Artikelliste aktualisieren`) - setzt die App diese Zeile automatisch, rein lokal und ohne KI-Aufruf. Die Marke steht auf kunzer.de nicht im Seitentext, sondern wird aus den Signalen der Produktseite erkannt, in dieser Reihenfolge (der erste Treffer gewinnt):
 
-1. **Medienordner**: erstes Pfadsegment der `restapi.kunzer.de`-Links von Bildern und Dokumenten, z. B. `airman`, `tdl`, `weber hydraulik`, `moto meter`, `norma`, `oetiker`, `suprabeam`, `handschuhe` (Tiger Grip) oder `kunzer werkzeuge`. Nennt der Ordner `Kunzer`, gewinnt trotzdem eine Fremdmarke aus dem Kategoriepfad oder aus den ersten Woertern von Titel/Kurzbezeichnung (z. B. `Oetiker Montagezange ...` im Ordner `kunzer werkzeuge` -> `Oetiker`)
+1. **Medienordner**: erstes Pfadsegment der `restapi.kunzer.de`-Links von Bildern und Dokumenten, z. B. `airman`, `tdl`, `weber hydraulik`, `moto meter`, `norma`, `oetiker`, `argus - batterietester` oder `kunzer werkzeuge` (Ordner ohne Marke aus der Liste, z. B. `suprabeam` oder `handschuhe`, zaehlen nicht). Nennt der Ordner `KUNZER`, gewinnt trotzdem eine Fremdmarke aus dem Kategoriepfad oder aus den ersten Woertern von Titel/Kurzbezeichnung (z. B. `Oetiker Montagezange ...` im Ordner `kunzer werkzeuge` -> `OETIKER`)
 2. **Kategoriepfad** der Produktseite (Breadcrumb), z. B. `Produkte > Werkzeuge > Rad und Reifen > airMAN` oder `Produkte > Hebetechnik > Lufthydraulische Heber T D L`
 3. **Shop-Suchwoerter** des Artikels (Feld `SUCHWOERTER` der Produktdaten, z. B. `Dichtmilch;Pannenpilot;Airman`)
-4. **Titel, Kurzbezeichnung, Text** - Treffer nur an Wortgrenzen (`Norma` trifft nicht `normal`); `Kunzer` zaehlt in Texten nicht als Treffer, weil es ohnehin der Standard ist
+4. **Titel, Kurzbezeichnung, Text** - Treffer nur an Wortgrenzen (`Norma` trifft nicht `normal`); `KUNZER` zaehlt in Texten nicht als Treffer, weil es ohnehin der Standard ist
 5. **Link-Labels** der Produktseite (z. B. `AIRMAN - 71-051-011`)
-6. ohne Treffer: `Kunzer` (Kunzer-Eigenartikel tragen zudem EAN mit GS1-Praefix `4260174`)
+6. ohne Treffer: `KUNZER` (Kunzer-Eigenartikel tragen zudem EAN mit GS1-Praefix `4260174`)
 
-Erkannt werden nur Marken aus der **Markenliste** (Einstellungen, Tab `API & Datenstaemme`, Block `Marke (Attribut 8988)`). Jeder Eintrag nennt den kanonischen Namen, der in die `Attribute.xlsx` geschrieben wird, und optional Schreibweisen (Aliasse): Eintraege mit `;` trennen, Aliasse nach `=` mit `,` - Gross-/Kleinschreibung spielt keine Rolle, Leerzeichen und Bindestriche in Aliassen sind beliebig (`T D L` trifft auch `TDL`, `weber hydraulik` auch `Weber-Hydraulik`). Standard:
+Erkannt werden nur Marken aus der **Markenliste** (Einstellungen, Tab `API & Datenstaemme`, Block `Marke (Attribut 8988)`). Jeder Eintrag nennt den kanonischen Namen, der in die `Attribute.xlsx` geschrieben wird - das ist die Schreibweise der Apollo-Liste `Product Brand Name` - und optional Schreibweisen (Aliasse): Eintraege mit `;` trennen, Aliasse nach `=` mit `,` - Gross-/Kleinschreibung spielt keine Rolle, Leerzeichen und Bindestriche in Aliassen sind beliebig (`T D L` trifft auch `TDL`, `weber hydraulik` auch `Weber-Hydraulik`). Standard:
 
 ```
-Kunzer; Airman=airman,airMAN,air man; TDL=T D L,tdl; Weber Hydraulik=weber hydraulik,weber-hydraulik; MotoMeter=moto meter,motometer,moto-meter; Norma; Oetiker; Suprabeam; Gefo; Tiger Grip=handschuhe,tigergrip,tiger-grip; Argus
+KUNZER; OETIKER; T D L=tdl; JOKON; Airman=air man; MOTO METER=motometer,moto-meter; WEBER=weber hydraulik,weber-hydraulik; ARGUS; NORMA
 ```
 
-Die Liste wird mit dem Sitzungszustand gespeichert; `Standard` stellt die eingebaute Liste wieder her. Kanonische Namen muessen in 20 Zeichen passen (laengere werden abgeschnitten).
+Die Liste wird mit dem Sitzungszustand gespeichert; `Standard` stellt die eingebaute Liste wieder her (eine gespeicherte unveraenderte Standardliste aus v0.1.36 wird automatisch ersetzt). Kanonische Namen muessen in 20 Zeichen passen (laengere werden abgeschnitten).
+
+**Schreibweise angleichen:** Steht in einer vorhandenen `8988`-Zeile eine Marke der Liste in anderer Schreibweise (z. B. `MotoMeter`, `TDL`, `Kunzer`, `Weber Hydraulik`), bringt der naechste Kunzer-Abruf bzw. Massenimport des Artikels sie auf die Schreibweise der Liste (`MOTO METER`, `T D L`, `KUNZER`, `WEBER`). Werte, die keiner Marke der Liste entsprechen, bleiben unveraendert.
 
 Verhalten:
 

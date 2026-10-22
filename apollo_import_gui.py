@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from difflib import SequenceMatcher, get_close_matches
 import hashlib
@@ -111,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.36"
+APP_VERSION = "0.1.37"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -170,13 +171,23 @@ def estimate_claude_cost_usd(model: str, input_tokens: int, output_tokens: int, 
 # beliebig, 'T D L' trifft also auch 'TDL').
 BRAND_CRITERIA_ID = "8988"
 BRAND_ATTRIBUTE_MAX_LENGTH = 20
-DEFAULT_BRAND_NAME = "Kunzer"
+DEFAULT_BRAND_NAME = "KUNZER"
 # GS1-Basisnummer der Kunzer GmbH: EAN mit diesem Praefix = Kunzer-Eigenartikel.
 KUNZER_EAN_PREFIX = "4260174"
+# Kanonische Namen = 'Product Brand Name' in Apollo - genau diese Schreibweise
+# landet in Attribut 8988. Aliasse decken die Schreibweisen auf kunzer.de ab
+# (Medienordner 'weber hydraulik', Kategorie 'Lufthydraulische Heber T D L' ...).
 DEFAULT_BRAND_LIST = (
-    "Kunzer; Airman=airman,airMAN,air man; TDL=T D L,tdl; "
-    "Weber Hydraulik=weber hydraulik,weber-hydraulik; MotoMeter=moto meter,motometer,moto-meter; "
-    "Norma; Oetiker; Suprabeam; Gefo; Tiger Grip=handschuhe,tigergrip,tiger-grip; Argus"
+    "KUNZER; OETIKER; T D L=tdl; JOKON; Airman=air man; MOTO METER=motometer,moto-meter; "
+    "WEBER=weber hydraulik,weber-hydraulik; ARGUS; NORMA"
+)
+# Fruehere Standardlisten: in gespeicherten Sitzungen durch die aktuelle ersetzen.
+LEGACY_DEFAULT_BRAND_LISTS = frozenset(
+    {
+        "Kunzer; Airman=airman,airMAN,air man; TDL=T D L,tdl; "
+        "Weber Hydraulik=weber hydraulik,weber-hydraulik; MotoMeter=moto meter,motometer,moto-meter; "
+        "Norma; Oetiker; Suprabeam; Gefo; Tiger Grip=handschuhe,tigergrip,tiger-grip; Argus",
+    }
 )
 ID_ALPHABET = string.ascii_uppercase + string.digits
 ID_LENGTH = 6
@@ -2493,6 +2504,44 @@ def build_brand_attribute_row(brand: str, option: AttributeOption | None = None)
     if attribute_row_format_error(row):
         return None
     return row
+
+
+def canonical_brand_spelling(value: str, brand_list: str | list[tuple[str, list[str]]] | None = None) -> str:
+    """Kanonischer Markenname, wenn `value` genau einer Marke der Liste entspricht
+    (Name oder Alias, Gross-/Kleinschreibung, Leerzeichen und Bindestriche egal:
+    'MotoMeter' -> 'MOTO METER', 'TDL' -> 'T D L'); sonst ''."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    if isinstance(brand_list, str) or brand_list is None:
+        brands = parse_brand_list(DEFAULT_BRAND_LIST if brand_list is None else brand_list)
+    else:
+        brands = [(str(name), [str(alias) for alias in aliases]) for name, aliases in brand_list]
+    for name, aliases in brands:
+        for alias in aliases:
+            if _brand_alias_pattern(alias).fullmatch(text):
+                return name[:BRAND_ATTRIBUTE_MAX_LENGTH].strip()
+    return ""
+
+
+def normalize_brand_attribute_spelling(
+    rows: list[AttributeRow], brand_list: str | list[tuple[str, list[str]]] | None = None
+) -> tuple[list[AttributeRow], bool]:
+    """Bringt den Wert vorhandener 8988-Zeilen auf die Schreibweise der Markenliste.
+
+    Nur Werte, die eindeutig einer bekannten Marke entsprechen, werden angepasst
+    ('MotoMeter' -> 'MOTO METER'); andere (manuell gepflegte) Werte bleiben.
+    Rueckgabe: (Zeilen, True wenn etwas geaendert wurde)."""
+    changed = False
+    result: list[AttributeRow] = []
+    for row in rows:
+        if row.criteria_id.strip() == BRAND_CRITERIA_ID and row.value.strip():
+            canonical = canonical_brand_spelling(row.value, brand_list)
+            if canonical and canonical != row.value.strip():
+                row = dataclass_replace(row, value=canonical)
+                changed = True
+        result.append(row)
+    return result, changed
 
 
 def find_brand_attribute_value(rows: list[AttributeRow]) -> str:
@@ -7405,6 +7454,31 @@ def read_article_search_terms(path: Path) -> dict[str, list[str]]:
         if article and term:
             terms_by_article.setdefault(article, []).append(term)
     return {article: normalize_search_terms(terms) for article, terms in terms_by_article.items()}
+
+
+def replace_attribute_value(path: Path, article_number: str, criteria_id: str, value: str, written_at: str) -> bool:
+    """Setzt den Wert der Zeilen (Artikel, Kriterien-ID) in Attribute.xlsx; True wenn geschrieben."""
+    if not path.exists():
+        return False
+    article_key = normalize_article_number(article_number)
+    wanted = str(criteria_id).strip()
+    with _workbook_file_lock(_workbook_cache_key(path)):
+        # Kopien: die gelesenen Zeilen koennen aus dem Zeilen-Cache stammen.
+        rows = [list(row) for row in prepare_existing_rows_for_write(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS)]
+        changed = False
+        for row in rows:
+            if (
+                len(row) >= 7
+                and normalize_article_number(str(row[0] or "")) == article_key
+                and str(row[1] or "").strip() == wanted
+                and str(row[4] or "").strip() != value
+            ):
+                row[4] = value
+                row[6] = written_at
+                changed = True
+        if changed:
+            write_workbook(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS, rows)
+        return changed
 
 
 def append_attribute_rows_add_only(
@@ -13727,9 +13801,11 @@ class ApolloImportApp:
                     bool(options.get("batch_attribute_dry_run", self.batch_attribute_dry_run_var.get()))
                 )
                 # Aeltere Sitzungsdateien ohne Markenliste behalten den Standard.
-                self.brand_list_var.set(
-                    str(options.get("brand_list", self.brand_list_var.get()) or "").strip() or DEFAULT_BRAND_LIST
-                )
+                stored_brand_list = str(options.get("brand_list", self.brand_list_var.get()) or "").strip()
+                # Unveraenderte alte Standardliste -> aktuelle Liste (offizielle Schreibweisen).
+                if not stored_brand_list or stored_brand_list in LEGACY_DEFAULT_BRAND_LISTS:
+                    stored_brand_list = DEFAULT_BRAND_LIST
+                self.brand_list_var.set(stored_brand_list)
                 self.search_term_ai_var.set(bool(options.get("search_term_ai", self.search_term_ai_var.get())))
                 self.batch_search_term_ai_var.set(
                     bool(options.get("batch_search_term_ai", self.batch_search_term_ai_var.get()))
@@ -15713,6 +15789,9 @@ if ($copied) {{
             (error for error in (attribute_row_format_error(row) for row in existing) if error), ""
         )
         option = brand_attribute_option(self.attribute_options_by_id)
+        # Vorhandene Marke in abweichender Schreibweise ('MotoMeter') auf die
+        # Schreibweise der Markenliste bringen ('MOTO METER') - der Wert bleibt.
+        existing, _spelling_changed = normalize_brand_attribute_spelling(existing, self.brand_list_var.get())
         brand, _source = detect_article_brand_with_source(result, self.brand_list_var.get())
         rows, _changed = merge_brand_attribute_row(existing, build_brand_attribute_row(brand, option))
         self.attribute_frame.set_rows(rows)
@@ -18186,7 +18265,23 @@ if ($copied) {{
                         ]
                     )
 
-                if BRAND_CRITERIA_ID in known_ids and brand_values_by_article.get(article_key):
+                existing_brand = brand_values_by_article.get(article_key, "")
+                canonical_existing = canonical_brand_spelling(existing_brand, brand_list_worker) if existing_brand else ""
+                if BRAND_CRITERIA_ID in known_ids and existing_brand and canonical_existing and canonical_existing != existing_brand:
+                    # Schreibweise der Markenliste angleichen ('MotoMeter' -> 'MOTO METER').
+                    with WORKBOOK_WRITE_LOCK:
+                        replace_attribute_value(
+                            output_root / ATTRIBUTE_FILE[0],
+                            bundle.article_number,
+                            BRAND_CRITERIA_ID,
+                            canonical_existing,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        )
+                    brand_values_by_article[article_key] = canonical_existing
+                    summary["brand_existing_count"] = int(summary["brand_existing_count"]) + 1
+                    report("angeglichen", f"Schreibweise angeglichen: {existing_brand} -> {canonical_existing}")
+                    return
+                if BRAND_CRITERIA_ID in known_ids and existing_brand:
                     summary["brand_existing_count"] = int(summary["brand_existing_count"]) + 1
                     report("vorhanden", f"Marke bereits gepflegt, nicht ueberschrieben (erkannt: {brand}, {source_label})")
                     return
