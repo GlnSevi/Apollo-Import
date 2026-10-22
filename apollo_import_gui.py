@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.38"
+APP_VERSION = "0.1.39"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -172,6 +172,12 @@ def estimate_claude_cost_usd(model: str, input_tokens: int, output_tokens: int, 
 BRAND_CRITERIA_ID = "8988"
 BRAND_ATTRIBUTE_MAX_LENGTH = 20
 DEFAULT_BRAND_NAME = "KUNZER"
+# Ab dieser Textlaenge fragt die Attribut-Findung die KI auch ohne unerkannte
+# 'Label: Wert'-Zeilen (Kostenbremse). Mit der Option 'KI auch bei kurzem Text'
+# reicht AI_SHORT_TEXT_MIN_LENGTH - bei knappen Shop-Texten wie 'KPS fuer
+# Dieselmotor 10-40 bar' steckt der Messbereich sonst nirgends.
+AI_MIN_TEXT_LENGTH = 200
+AI_SHORT_TEXT_MIN_LENGTH = 15
 # GS1-Basisnummer der Kunzer GmbH: EAN mit diesem Praefix = Kunzer-Eigenartikel.
 KUNZER_EAN_PREFIX = "4260174"
 # Kanonische Namen = 'Product Brand Name' in Apollo - genau diese Schreibweise
@@ -1208,6 +1214,9 @@ SEARCH_TERM_STOPWORDS = frozenset(
         # Titel-Adjektive und Farben ohne eigenen Suchwert
         "lang", "kurz", "extra", "flach", "max", "min", "groß", "gross", "klein", "mini",
         "schwarz", "rot", "blau", "gelb", "grün", "gruen", "weiß", "weiss", "grau",
+        # Verben und Partikeln aus Hinweistexten ('Artikel ist nicht mehr im Sortiment')
+        "ist", "sind", "wird", "werden", "mehr", "nur", "noch", "sehr", "kann", "hat", "haben",
+        "alle", "diese", "dieser", "dieses", "sich", "bzw", "usw", "etc", "artikel", "sortiment",
     }
 )
 
@@ -1798,6 +1807,7 @@ def run_hybrid_attribute_extraction(
     web_research: bool = False,
     article_number: str = "",
     product_group: str = "",
+    min_ai_text_length: int = AI_MIN_TEXT_LENGTH,
 ) -> HybridAttributeResult:
     """Hybride Attribut-Findung: erst Regeln, dann optional KI für den Rest.
 
@@ -1813,7 +1823,7 @@ def run_hybrid_attribute_extraction(
     if not combined and not (web_research and article_number.strip()):
         return result
 
-    if claude_client is None or (not web_research and not result.unmatched and len(combined) < 200):
+    if claude_client is None or (not web_research and not result.unmatched and len(combined) < min_ai_text_length):
         return result
 
     prepared = prepare_ai_extraction(
@@ -2662,6 +2672,22 @@ def score_attribute_option_match(option: AttributeOption, query: str) -> float:
 
 
 AI_CANDIDATE_LIMIT = 300
+# Grobe Kosten der Internet-Recherche je Artikel (USD) fuer die Rueckfrage vor dem
+# Massenimport - entspricht dem Hinweis am Button 'Automatisch ermitteln (Internet)'.
+WEB_RESEARCH_COST_RANGE_USD = (0.10, 0.30)
+# Auslaufartikel: kunzer.de zeigt statt Titel/Kurztext nur diesen Hinweis.
+KUNZER_DISCONTINUED_MARKERS = ("nicht mehr im sortiment",)
+
+
+def is_discontinued_kunzer_result(result: object) -> bool:
+    """True, wenn die Produktseite den Artikel als nicht mehr im Sortiment ausweist
+    (Titel bzw. Kurzbezeichnung; der Langtext zaehlt nicht - dort kann der Satz auch
+    ueber Zubehoer stehen)."""
+    for field_name in ("title", "short_text_de"):
+        text = " ".join(str(getattr(result, field_name, "") or "").split()).casefold()
+        if any(marker in text for marker in KUNZER_DISCONTINUED_MARKERS):
+            return True
+    return False
 AI_KEY_VALUE_LIMIT = 25
 
 # Deutsche Funktionswörter, die bei der Kandidaten-Suche keine Wortstamm-
@@ -12771,6 +12797,13 @@ class ApolloImportApp:
         self.batch_attribute_var = tk.BooleanVar(value=False)
         # Testlauf standardmaessig AN: erst Bericht pruefen, dann scharf schreiben.
         self.batch_attribute_dry_run_var = tk.BooleanVar(value=True)
+        # KI auch bei kurzem Produkttext fragen (sonst erst ab AI_MIN_TEXT_LENGTH Zeichen).
+        self.attribute_short_text_ai_var = tk.BooleanVar(value=True)
+        # Internet-Recherche (wie Button 'Automatisch ermitteln (Internet)') auch im
+        # Massenimport - kostet deutlich mehr, deshalb standardmaessig aus.
+        self.batch_attribute_web_var = tk.BooleanVar(value=False)
+        # Auslaufartikel ('nicht mehr im Sortiment' auf kunzer.de) nicht uebernehmen.
+        self.skip_discontinued_var = tk.BooleanVar(value=True)
         # Suchwoerter: KI-Vorschlaege im Einzelartikel (wirksam nur mit API Key -
         # ohne Key laufen nur die Regeln) und im Massenimport (Standard aus, kostet
         # je Artikel einen KI-Aufruf).
@@ -13634,6 +13667,9 @@ class ApolloImportApp:
                 "batch_web": self.batch_web_var.get(),
                 "batch_attribute": self.batch_attribute_var.get(),
                 "batch_attribute_dry_run": self.batch_attribute_dry_run_var.get(),
+                "attribute_short_text_ai": self.attribute_short_text_ai_var.get(),
+                "batch_attribute_web": self.batch_attribute_web_var.get(),
+                "skip_discontinued": self.skip_discontinued_var.get(),
                 "brand_list": self.brand_list_var.get(),
                 "search_term_ai": self.search_term_ai_var.get(),
                 "batch_search_term_ai": self.batch_search_term_ai_var.get(),
@@ -13804,6 +13840,11 @@ class ApolloImportApp:
                 self.batch_attribute_dry_run_var.set(
                     bool(options.get("batch_attribute_dry_run", self.batch_attribute_dry_run_var.get()))
                 )
+                self.attribute_short_text_ai_var.set(
+                    bool(options.get("attribute_short_text_ai", self.attribute_short_text_ai_var.get()))
+                )
+                self.batch_attribute_web_var.set(bool(options.get("batch_attribute_web", self.batch_attribute_web_var.get())))
+                self.skip_discontinued_var.set(bool(options.get("skip_discontinued", self.skip_discontinued_var.get())))
                 # Aeltere Sitzungsdateien ohne Markenliste behalten den Standard.
                 stored_brand_list = str(options.get("brand_list", self.brand_list_var.get()) or "").strip()
                 # Unveraenderte alte Standardliste -> aktuelle Liste (offizielle Schreibweisen).
@@ -14892,6 +14933,21 @@ if ($copied) {{
             text="Testlauf: nur Bericht, nichts schreiben",
             variable=self.batch_attribute_dry_run_var,
         ).grid(row=4, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            scope_frame,
+            text="KI auch bei kurzem Text (unter 200 Zeichen)",
+            variable=self.attribute_short_text_ai_var,
+        ).grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            scope_frame,
+            text="Internet-Recherche auch im Massenimport (ca. 10-30 ct/Artikel)",
+            variable=self.batch_attribute_web_var,
+        ).grid(row=5, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            scope_frame,
+            text="Auslaufartikel überspringen ('nicht mehr im Sortiment')",
+            variable=self.skip_discontinued_var,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(
             scope_frame,
             text=(
@@ -14899,11 +14955,14 @@ if ($copied) {{
                 "Attribut-Testbericht.xlsx erzeugt - ideal zum Prüfen vor einem großen Lauf. "
                 "Unsichere Treffer landen zusätzlich in der Attribute_Pruefliste.xlsx. "
                 "Die Marke (Attribut 8988) wird bei jedem Abruf automatisch ergänzt - auch ohne 'Attribute' "
-                "und im Testlauf (Markenliste in den Einstellungen)."
+                "und im Testlauf (Markenliste in den Einstellungen). 'KI auch bei kurzem Text' wertet auch knappe "
+                "Shop-Texte aus (ein paar Cent je Artikel); die Internet-Recherche sucht zusätzlich auf Hersteller"
+                "seiten und in Datenblättern (vor dem Start gibt es eine Kostenabfrage). Auslaufartikel werden "
+                "beim Einzel- und Massenimport nicht übernommen und im Massenimport in der Warnliste genannt."
             ),
             wraplength=500,
             foreground="#5E6472",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         self.browser_frame = ttk.LabelFrame(project_parent, text="Artikelverzeichnis", padding=14)
         browser_frame = self.browser_frame
@@ -15618,6 +15677,7 @@ if ($copied) {{
             return
 
         pdf_sources = collect_pdf_sources_from_media_rows(self.document_frame.get_rows())
+        min_ai_text_length = AI_SHORT_TEXT_MIN_LENGTH if self.attribute_short_text_ai_var.get() else AI_MIN_TEXT_LENGTH
         existing_ids = {
             row.criteria_id.strip() for row in self.attribute_frame.get_rows() if row.criteria_id.strip()
         }
@@ -15656,6 +15716,7 @@ if ($copied) {{
                 web_research=web_research,
                 article_number=article_number,
                 product_group=product_group,
+                min_ai_text_length=min_ai_text_length,
             )
 
         def on_success(payload: object) -> None:
@@ -17601,8 +17662,13 @@ if ($copied) {{
             # Modifikator, keine Datenart: Attribut-Findung schreibt nichts,
             # sondern erzeugt nur den Attribut-Testbericht.
             "attributes_dry_run": self.batch_attribute_dry_run_var.get(),
+            # Modifikatoren der Attribut-Findung bzw. des Abrufs (keine Datenarten).
+            "attributes_short_text": self.attribute_short_text_ai_var.get(),
+            "attributes_web": self.batch_attribute_web_var.get(),
+            "skip_discontinued": self.skip_discontinued_var.get(),
         }
-        if not any(value for key, value in options.items() if key != "attributes_dry_run"):
+        modifier_keys = {"attributes_dry_run", "attributes_short_text", "attributes_web", "skip_discontinued"}
+        if not any(value for key, value in options.items() if key not in modifier_keys):
             raise ValueError("Bitte im Abrufumfang mindestens eine Datenart auswählen.")
         return options
 
@@ -17687,6 +17753,15 @@ if ($copied) {{
             "videos": True,
             "web_links": True,
         }
+        if scrape_options.get("skip_discontinued") and is_discontinued_kunzer_result(result):
+            article = normalize_article_number(result.article_number) or result.article_number
+            self.status_var.set(f"{article}: auf kunzer.de nicht mehr im Sortiment - nichts übernommen.")
+            messagebox.showwarning(
+                APP_TITLE,
+                f"{article} ist auf kunzer.de nicht mehr im Sortiment.\n\n"
+                "Es wurde nichts übernommen (Option 'Auslaufartikel überspringen' im Abrufumfang).",
+            )
+            return
         self.last_kunzer_scrape = result
         # Fertige Schreibauftraege zuerst abholen, damit der gespeicherte Stand
         # des Artikels (Verzeichnis-Eintrag) aktuell ist.
@@ -18035,6 +18110,22 @@ if ($copied) {{
                 )
                 return
             claude_client = self._build_claude_client()
+            if options.get("attributes_web"):
+                if claude_client is None:
+                    options["attributes_web"] = False
+                    self.status_var.set("Internet-Recherche im Massenimport übersprungen: kein Claude API Key.")
+                else:
+                    low, high = WEB_RESEARCH_COST_RANGE_USD
+                    if not messagebox.askyesno(
+                        APP_TITLE,
+                        f"Internet-Recherche für Attribute bei {len(items)} Artikeln ({claude_client.model}):\n"
+                        f"geschätzte Kosten ca. {low * len(items):.2f}-{high * len(items):.2f} $ "
+                        f"(je Artikel ca. {low * 100:.0f}-{high * 100:.0f} ct), Laufzeit deutlich länger.\n\n"
+                        "Mit Internet-Recherche starten?\n(Nein = Lauf ohne Internet-Recherche starten)",
+                    ):
+                        options["attributes_web"] = False
+        attribute_web_worker = bool(options.get("attributes") and options.get("attributes_web") and claude_client is not None)
+        min_ai_text_length_worker = AI_SHORT_TEXT_MIN_LENGTH if options.get("attributes_short_text") else AI_MIN_TEXT_LENGTH
         # Kopien für den Worker-Thread: keine Tk-/App-Zugriffe aus dem Thread.
         attribute_mapping_worker = dict(self.attribute_mapping)
         attribute_options_worker = list(self.attribute_options)
@@ -18112,6 +18203,8 @@ if ($copied) {{
                 "success_count": 0,
                 "error_messages": [],
                 "failed_items": [],
+                # Auslaufartikel ('nicht mehr im Sortiment'), die nicht uebernommen wurden.
+                "discontinued_items": [],
                 "last_result": None,
                 "last_bundle": None,
                 "total": total,
@@ -18317,7 +18410,8 @@ if ($copied) {{
             # Ab dieser Groesse laufen die KI-Aufrufe gesammelt ueber die
             # Anthropic Batch API (50 % Rabatt, gleiche Qualitaet).
             pending_ai: list[dict[str, object]] = []
-            ai_batch_mode = claude_client is not None and total > 3
+            # Internet-Recherche laeuft je Artikel direkt (Websuche), nicht ueber die Batch API.
+            ai_batch_mode = claude_client is not None and total > 3 and not attribute_web_worker
 
             def run_attribute_step(result: KunzerScrapeResult, bundle: ExportBundle) -> None:
                 """Attribut-Findung pro Artikel: Regel-Pass sofort, KI je nach
@@ -18336,6 +18430,24 @@ if ($copied) {{
                 pdf_texts = [text for text in (extract_pdf_text(source) for source in pdf_sources) if text]
                 existing_ids = set(attribute_ids_by_article.get(bundle.article_number, set()))
                 product_group = article_product_groups.get(normalize_article_number(bundle.article_number), "")
+                if attribute_web_worker and claude_client is not None and not ai_disabled:
+                    # Wie Button 'Automatisch ermitteln (Internet)': Regeln + KI mit Websuche.
+                    hybrid = run_hybrid_attribute_extraction(
+                        combined_text,
+                        pdf_texts,
+                        attribute_mapping_worker,
+                        attribute_options_worker,
+                        attribute_options_by_id_worker,
+                        attribute_key_values_worker,
+                        existing_ids,
+                        claude_client,
+                        web_research=True,
+                        article_number=bundle.article_number,
+                        product_group=product_group,
+                        min_ai_text_length=min_ai_text_length_worker,
+                    )
+                    finalize_attribute_step(bundle, hybrid, product_group)
+                    return
                 hybrid, combined = run_rule_attribute_pass(
                     combined_text,
                     pdf_texts,
@@ -18345,7 +18457,7 @@ if ($copied) {{
                     existing_ids,
                 )
                 client_available = claude_client is not None and not ai_disabled
-                if client_available and combined and (hybrid.unmatched or len(combined) >= 200):
+                if client_available and combined and (hybrid.unmatched or len(combined) >= min_ai_text_length_worker):
                     prepared = prepare_ai_extraction(
                         hybrid,
                         combined,
@@ -18481,6 +18593,16 @@ if ($copied) {{
                             if attempt > 1:
                                 post(index - 1, f"{identifier}: 2. Versuch ...")
                             result = self.kunzer_scraper.scrape_product(identifier)
+                            if options.get("skip_discontinued") and is_discontinued_kunzer_result(result):
+                                # Auslaufartikel: nichts schreiben (sonst landen 'Artikel ist nicht
+                                # mehr im Sortiment.' als Kurzbezeichnung und KUNZER als Marke).
+                                skipped_article = normalize_article_number(result.article_number) or identifier
+                                summary["discontinued_items"].append(skipped_article)
+                                summary["media_warnings"].append(
+                                    (skipped_article, "Auslaufartikel übersprungen: auf kunzer.de nicht mehr im Sortiment")
+                                )
+                                last_error = None
+                                break
                             post(index - 1, f"{identifier}: Übersetzung, Medien-Download & Export ...")
                             bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
                             article_media_warnings: list[str] = []
@@ -18940,6 +19062,12 @@ if ($copied) {{
         brand_added_count = int(summary.get("brand_added_count") or 0)
         brand_existing_count = int(summary.get("brand_existing_count") or 0)
         brand_failed_count = int(summary.get("brand_failed_count") or 0)
+        discontinued_items = list(summary.get("discontinued_items") or [])
+        if discontinued_items:
+            shown = ", ".join(discontinued_items[:10]) + (" …" if len(discontinued_items) > 10 else "")
+            error_list_hint += (
+                f"\n\nAuslaufartikel übersprungen (nicht mehr im Sortiment): {len(discontinued_items)} - {shown}"
+            )
         if brand_failed_count:
             reason = str(summary.get("brand_failed_reason") or "").strip()
             error_list_hint += (
