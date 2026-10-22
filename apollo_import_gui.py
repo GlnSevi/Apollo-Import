@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.37"
+APP_VERSION = "0.1.38"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -352,6 +352,10 @@ VEHICLE_LINK_FILE = ("Fahrzeugverknuepfungen.xlsx", "Sheet1")
 # Output-Ordner. Spalte A = Artikelnummer, damit die Datei direkt wieder als
 # Produktliste geladen werden kann.
 BATCH_ERROR_LIST_FILENAME = "Massenimport-Fehler.xlsx"
+# Apollo-Loeschliste: Spalte A traegt fest 757 (als Zahl), Spalte B die
+# Artikelnummer - Aufbau wie die in Apollo verwendeten Loeschlisten (VLoesch.xlsx).
+APOLLO_DELETE_LIST_COLUMN_A_VALUE = 757
+APOLLO_DELETE_LIST_HEADERS = ["", "Artikelnummer"]
 # Übersprungene tote Medien-Links (Server liefert die Datei dauerhaft nicht).
 # Eigene Datei, damit die Fehlerliste nur echte, wiederholbare Fehler enthält.
 BATCH_WARNING_LIST_FILENAME = "Massenimport-Warnungen.xlsx"
@@ -18773,7 +18777,7 @@ if ($copied) {{
         self.batch_completion_dialog = dialog
 
     def save_apollo_delete_list(self) -> None:
-        """Speichert die Artikelnummern des letzten Laufs (Spalte A) als Löschliste für Apollo."""
+        """Speichert die Artikelnummern des letzten Laufs als Löschliste für Apollo (A = 757, B = Artikelnummer)."""
         articles = list(self.last_batch_updated_articles)
         if not articles:
             messagebox.showwarning(APP_TITLE, "Es liegt noch keine Aktualisierung aus diesem Programmlauf vor.")
@@ -18794,11 +18798,16 @@ if ($copied) {{
             if target_path.suffix.lower() == ".csv":
                 with target_path.open("w", encoding="utf-8-sig", newline="") as handle:
                     writer = csv.writer(handle, delimiter=";")
-                    writer.writerow(["Artikelnummer"])
+                    writer.writerow(APOLLO_DELETE_LIST_HEADERS)
                     for article_number in articles:
-                        writer.writerow([article_number])
+                        writer.writerow([APOLLO_DELETE_LIST_COLUMN_A_VALUE, article_number])
             else:
-                write_workbook(target_path, "Loeschliste", ["Artikelnummer"], [[article_number] for article_number in articles])
+                write_workbook(
+                    target_path,
+                    "Loeschliste",
+                    APOLLO_DELETE_LIST_HEADERS,
+                    [[APOLLO_DELETE_LIST_COLUMN_A_VALUE, article_number] for article_number in articles],
+                )
         except OSError as exc:
             messagebox.showwarning(APP_TITLE, f"Löschliste konnte nicht gespeichert werden:\n{exc}")
             return
@@ -18806,7 +18815,7 @@ if ($copied) {{
         self.status_var.set(f"Apollo-Löschliste gespeichert: {len(articles)} Artikel – {target_path}")
         messagebox.showinfo(
             APP_TITLE,
-            f"Löschliste mit {len(articles)} Artikelnummern gespeichert:\n{target_path}\n\nSpalte A enthält die Artikelnummern der aktualisierten Artikel.",
+            f"Löschliste mit {len(articles)} Artikelnummern gespeichert:\n{target_path}\n\nSpalte A enthält {APOLLO_DELETE_LIST_COLUMN_A_VALUE}, Spalte B die Artikelnummern der aktualisierten Artikel.",
         )
 
     def _set_batch_ui_running(self, running: bool, total: int = 0) -> None:
