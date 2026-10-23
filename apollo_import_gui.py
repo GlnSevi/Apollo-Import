@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.39"
+APP_VERSION = "0.1.40"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -1795,6 +1795,26 @@ def build_attribute_suggestions_from_text(
     return suggestions, unmatched
 
 
+def restrict_hybrid_to_template(result: "HybridAttributeResult", template_ids: list[str] | set[str]) -> None:
+    """Attribut-Vorlage (Referenzartikel): nur Vorlage-Attribute duerfen geschrieben werden.
+
+    Sichere Treffer ausserhalb der Vorlage wandern in die Pruefung (Pruefliste
+    statt Attribute.xlsx); gelernte Label-Zuordnungen werden verworfen, damit
+    die Vorlage eines Laufs nicht dauerhaft in die Zuordnungsdatei wirkt."""
+    allowed = {str(criteria_id).strip() for criteria_id in template_ids}
+    kept: list[AttributeSuggestion] = []
+    for suggestion in result.accepted:
+        if suggestion.option.criteria_id in allowed:
+            kept.append(suggestion)
+        else:
+            note = "nicht in der Vorlage (Referenzartikel)"
+            result.review.append(
+                dataclass_replace(suggestion, confident=False, note=f"{suggestion.note}; {note}" if suggestion.note else note)
+            )
+    result.accepted = kept
+    result.learned_entries = []
+
+
 def run_hybrid_attribute_extraction(
     text: str,
     pdf_texts: list[str],
@@ -1808,6 +1828,8 @@ def run_hybrid_attribute_extraction(
     article_number: str = "",
     product_group: str = "",
     min_ai_text_length: int = AI_MIN_TEXT_LENGTH,
+    candidate_ids: list[str] | None = None,
+    reference_lines: list[str] | None = None,
 ) -> HybridAttributeResult:
     """Hybride Attribut-Findung: erst Regeln, dann optional KI für den Rest.
 
@@ -1820,10 +1842,18 @@ def run_hybrid_attribute_extraction(
     result, combined = run_rule_attribute_pass(
         text, pdf_texts, mapping, attribute_options_by_id, attribute_key_values_by_group, existing_criteria_ids
     )
+    if candidate_ids is not None:
+        restrict_hybrid_to_template(result, candidate_ids)
     if not combined and not (web_research and article_number.strip()):
         return result
 
-    if claude_client is None or (not web_research and not result.unmatched and len(combined) < min_ai_text_length):
+    if candidate_ids is not None:
+        # Vorlage: die KI immer fragen, solange Vorlage-Attribute fehlen - unabhaengig
+        # von der Textlaenge (genau diese Angaben will man fuer jeden Artikel haben).
+        missing = set(candidate_ids) - existing_criteria_ids - {s.option.criteria_id for s in result.accepted}
+        if claude_client is None or not missing:
+            return result
+    elif claude_client is None or (not web_research and not result.unmatched and len(combined) < min_ai_text_length):
         return result
 
     prepared = prepare_ai_extraction(
@@ -1836,6 +1866,8 @@ def run_hybrid_attribute_extraction(
         existing_criteria_ids,
         article_number=article_number,
         product_group=product_group,
+        candidate_ids=candidate_ids,
+        reference_lines=reference_lines,
     )
     if prepared is None:
         return result
@@ -1851,6 +1883,8 @@ def run_hybrid_attribute_extraction(
         result, extractions, candidates, mapping, attribute_options_by_id,
         attribute_key_values_by_group, existing_criteria_ids,
     )
+    if candidate_ids is not None:
+        result.learned_entries = []
     return result
 
 
@@ -1910,20 +1944,30 @@ def prepare_ai_extraction(
     existing_criteria_ids: set[str],
     article_number: str = "",
     product_group: str = "",
+    candidate_ids: list[str] | None = None,
+    reference_lines: list[str] | None = None,
 ) -> tuple[str, list[AttributeOption]] | None:
     """Stufe 2a: Kandidaten wählen und die User-Message für die KI bauen.
 
     Getrennt von der KI-Antwort-Verarbeitung, damit Massenläufe die Anfragen
     über die Batch API bündeln können. Rückgabe None = kein KI-Aufruf nötig.
     """
-    candidates = select_candidate_attribute_options(combined, mapping, attribute_options)
-    # Zusatzinfo immer als Kandidat mitgeben: Auffangbecken für Angaben,
-    # die zu keinem anderen Attribut passen (siehe System-Prompt).
-    fallback_option = attribute_options_by_id.get(FREE_TEXT_CRITERIA_ID)
-    if fallback_option is not None and all(
-        option.criteria_id != FREE_TEXT_CRITERIA_ID for option in candidates
-    ):
-        candidates.append(fallback_option)
+    if candidate_ids is not None:
+        # Vorlage (Referenzartikel): genau diese Attribute, in der Reihenfolge der Vorlage.
+        candidates = [
+            attribute_options_by_id[criteria_id]
+            for criteria_id in dict.fromkeys(str(cid).strip() for cid in candidate_ids)
+            if criteria_id in attribute_options_by_id
+        ]
+    else:
+        candidates = select_candidate_attribute_options(combined, mapping, attribute_options)
+        # Zusatzinfo immer als Kandidat mitgeben: Auffangbecken für Angaben,
+        # die zu keinem anderen Attribut passen (siehe System-Prompt).
+        fallback_option = attribute_options_by_id.get(FREE_TEXT_CRITERIA_ID)
+        if fallback_option is not None and all(
+            option.criteria_id != FREE_TEXT_CRITERIA_ID for option in candidates
+        ):
+            candidates.append(fallback_option)
     if not candidates:
         return None
 
@@ -1933,6 +1977,13 @@ def prepare_ai_extraction(
         product_lines.append("Hersteller: Kunzer")
     if product_group.strip():
         product_lines.append(f"Produktgruppe: {product_group.strip()}")
+    if reference_lines:
+        product_lines.append(
+            "Vorlage: Belege genau diese Attribute wie beim Referenzartikel derselben Produktart "
+            "(die Werte des Referenzartikels sind nur Formatbeispiele - nicht uebernehmen; z. B. "
+            "Bereiche als von/bis im selben Attribut):"
+        )
+        product_lines.extend(f"- {line}" for line in reference_lines)
     product_info = "\n".join(product_lines)
 
     # Bereits belegte Attribute (vorhandene Zeilen + Regel-Treffer) der KI
@@ -12804,6 +12855,10 @@ class ApolloImportApp:
         self.batch_attribute_web_var = tk.BooleanVar(value=False)
         # Auslaufartikel ('nicht mehr im Sortiment' auf kunzer.de) nicht uebernehmen.
         self.skip_discontinued_var = tk.BooleanVar(value=True)
+        # Attribut-Vorlage: alle Artikel eines Massenimports bekommen genau die
+        # Attribute dieses Referenzartikels (Werte je Artikel aus Text/KI).
+        self.batch_attribute_reference_var = tk.BooleanVar(value=False)
+        self.batch_attribute_reference_article_var = tk.StringVar(value="")
         # Suchwoerter: KI-Vorschlaege im Einzelartikel (wirksam nur mit API Key -
         # ohne Key laufen nur die Regeln) und im Massenimport (Standard aus, kostet
         # je Artikel einen KI-Aufruf).
@@ -13670,6 +13725,8 @@ class ApolloImportApp:
                 "attribute_short_text_ai": self.attribute_short_text_ai_var.get(),
                 "batch_attribute_web": self.batch_attribute_web_var.get(),
                 "skip_discontinued": self.skip_discontinued_var.get(),
+                "batch_attribute_reference": self.batch_attribute_reference_var.get(),
+                "batch_attribute_reference_article": self.batch_attribute_reference_article_var.get(),
                 "brand_list": self.brand_list_var.get(),
                 "search_term_ai": self.search_term_ai_var.get(),
                 "batch_search_term_ai": self.batch_search_term_ai_var.get(),
@@ -13845,6 +13902,12 @@ class ApolloImportApp:
                 )
                 self.batch_attribute_web_var.set(bool(options.get("batch_attribute_web", self.batch_attribute_web_var.get())))
                 self.skip_discontinued_var.set(bool(options.get("skip_discontinued", self.skip_discontinued_var.get())))
+                self.batch_attribute_reference_var.set(
+                    bool(options.get("batch_attribute_reference", self.batch_attribute_reference_var.get()))
+                )
+                self.batch_attribute_reference_article_var.set(
+                    str(options.get("batch_attribute_reference_article", self.batch_attribute_reference_article_var.get()) or "")
+                )
                 # Aeltere Sitzungsdateien ohne Markenliste behalten den Standard.
                 stored_brand_list = str(options.get("brand_list", self.brand_list_var.get()) or "").strip()
                 # Unveraenderte alte Standardliste -> aktuelle Liste (offizielle Schreibweisen).
@@ -14948,6 +15011,22 @@ if ($copied) {{
             text="Auslaufartikel überspringen ('nicht mehr im Sortiment')",
             variable=self.skip_discontinued_var,
         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            scope_frame,
+            text="Attribute nach Referenzartikel (alle Artikel des Laufs)",
+            variable=self.batch_attribute_reference_var,
+        ).grid(row=7, column=0, sticky="w", pady=(6, 0))
+        reference_row = ttk.Frame(scope_frame)
+        reference_row.grid(row=7, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(reference_row, text="Referenzartikel").grid(row=0, column=0, padx=(0, 6))
+        ttk.Entry(reference_row, textvariable=self.batch_attribute_reference_article_var, width=20).grid(row=0, column=1)
+        ttk.Button(
+            reference_row,
+            text="Aus Maske",
+            command=lambda: self.batch_attribute_reference_article_var.set(
+                normalize_article_number(self.article_number_var.get())
+            ),
+        ).grid(row=0, column=2, padx=(6, 0))
         ttk.Label(
             scope_frame,
             text=(
@@ -14958,11 +15037,14 @@ if ($copied) {{
                 "und im Testlauf (Markenliste in den Einstellungen). 'KI auch bei kurzem Text' wertet auch knappe "
                 "Shop-Texte aus (ein paar Cent je Artikel); die Internet-Recherche sucht zusätzlich auf Hersteller"
                 "seiten und in Datenblättern (vor dem Start gibt es eine Kostenabfrage). Auslaufartikel werden "
-                "beim Einzel- und Massenimport nicht übernommen und im Massenimport in der Warnliste genannt."
+                "beim Einzel- und Massenimport nicht übernommen und im Massenimport in der Warnliste genannt. "
+                "Mit 'Attribute nach Referenzartikel' bekommen alle Artikel eines Massenimports genau die Attribute "
+                "des Referenzartikels (z. B. Spannbereich statt Klemmbereich von/bis); andere Treffer landen nur in "
+                "der Prüfliste. Für Listen gleichartiger Produkte."
             ),
             wraplength=500,
             foreground="#5E6472",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         self.browser_frame = ttk.LabelFrame(project_parent, text="Artikelverzeichnis", padding=14)
         browser_frame = self.browser_frame
@@ -17666,8 +17748,9 @@ if ($copied) {{
             "attributes_short_text": self.attribute_short_text_ai_var.get(),
             "attributes_web": self.batch_attribute_web_var.get(),
             "skip_discontinued": self.skip_discontinued_var.get(),
+            "attributes_reference": self.batch_attribute_reference_var.get(),
         }
-        modifier_keys = {"attributes_dry_run", "attributes_short_text", "attributes_web", "skip_discontinued"}
+        modifier_keys = {"attributes_dry_run", "attributes_short_text", "attributes_web", "skip_discontinued", "attributes_reference"}
         if not any(value for key, value in options.items() if key not in modifier_keys):
             raise ValueError("Bitte im Abrufumfang mindestens eine Datenart auswählen.")
         return options
@@ -18125,6 +18208,47 @@ if ($copied) {{
                     ):
                         options["attributes_web"] = False
         attribute_web_worker = bool(options.get("attributes") and options.get("attributes_web") and claude_client is not None)
+        # Attribut-Vorlage aus dem Referenzartikel (Attribute ausser Marke/Altbestand).
+        template_ids_worker: list[str] | None = None
+        reference_lines_worker: list[str] = []
+        reference_article_worker = ""
+        if options.get("attributes") and options.get("attributes_reference"):
+            reference_article_worker = normalize_article_number(self.batch_attribute_reference_article_var.get())
+            reference_record = self.article_browser_records.get(reference_article_worker) if reference_article_worker else None
+            template_rows = [
+                row
+                for row in (reference_record.attribute_rows if reference_record is not None else [])
+                if row.criteria_id.strip()
+                and row.criteria_id.strip() not in {BRAND_CRITERIA_ID, LEGACY_SEARCH_TERM_CRITERIA_ID}
+                and row.criteria_id.strip() in self.attribute_options_by_id
+            ]
+            if not template_rows:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    f"Referenzartikel '{reference_article_worker or self.batch_attribute_reference_article_var.get()}' "
+                    "hat im Output keine Attribute (außer der Marke).\n\n"
+                    "Bitte die Artikelnummer prüfen bzw. den Referenzartikel zuerst pflegen - oder die Option "
+                    "'Attribute nach Referenzartikel' im Abrufumfang abschalten.",
+                )
+                return
+            template_ids_worker = list(dict.fromkeys(row.criteria_id.strip() for row in template_rows))
+            def reference_value_text(row: AttributeRow) -> str:
+                # Schluesselwerte stehen in der Datei als Schluessel ('1') - fuer die KI
+                # mit Bezeichnung aus der Werteliste ('1 | Einohrklemme').
+                value = row.value.strip()
+                option = self.attribute_options_by_id.get(row.criteria_id.strip())
+                if option is not None and is_attribute_key_value_format(option.value_format):
+                    for group in option.key_value_group_candidates():
+                        for key_value in self.attribute_key_values_by_group.get(group, []):
+                            if key_value.key_value_id.strip() == value and key_value.label.strip():
+                                return f"{value} | {key_value.label.strip()}"
+                return value
+
+            reference_lines_worker = [
+                f"{row.criteria_id} | {row.label}: {reference_value_text(row)}"
+                + (f" bis {row.value_to}" if row.value_to.strip() else "")
+                for row in template_rows
+            ]
         min_ai_text_length_worker = AI_SHORT_TEXT_MIN_LENGTH if options.get("attributes_short_text") else AI_MIN_TEXT_LENGTH
         # Kopien für den Worker-Thread: keine Tk-/App-Zugriffe aus dem Thread.
         attribute_mapping_worker = dict(self.attribute_mapping)
@@ -18205,6 +18329,10 @@ if ($copied) {{
                 "failed_items": [],
                 # Auslaufartikel ('nicht mehr im Sortiment'), die nicht uebernommen wurden.
                 "discontinued_items": [],
+                # Attribut-Vorlage dieses Laufs (Referenzartikel), fuer den Abschlussdialog.
+                "attribute_template": (
+                    f"{reference_article_worker} ({', '.join(template_ids_worker)})" if template_ids_worker else ""
+                ),
                 "last_result": None,
                 "last_bundle": None,
                 "total": total,
@@ -18445,6 +18573,8 @@ if ($copied) {{
                         article_number=bundle.article_number,
                         product_group=product_group,
                         min_ai_text_length=min_ai_text_length_worker,
+                        candidate_ids=template_ids_worker,
+                        reference_lines=reference_lines_worker,
                     )
                     finalize_attribute_step(bundle, hybrid, product_group)
                     return
@@ -18456,8 +18586,16 @@ if ($copied) {{
                     attribute_key_values_worker,
                     existing_ids,
                 )
+                if template_ids_worker is not None:
+                    restrict_hybrid_to_template(hybrid, template_ids_worker)
+                    missing_template_ids = (
+                        set(template_ids_worker) - existing_ids - {s.option.criteria_id for s in hybrid.accepted}
+                    )
+                    wants_ai = bool(combined) and bool(missing_template_ids)
+                else:
+                    wants_ai = bool(combined) and bool(hybrid.unmatched or len(combined) >= min_ai_text_length_worker)
                 client_available = claude_client is not None and not ai_disabled
-                if client_available and combined and (hybrid.unmatched or len(combined) >= min_ai_text_length_worker):
+                if client_available and wants_ai:
                     prepared = prepare_ai_extraction(
                         hybrid,
                         combined,
@@ -18468,6 +18606,8 @@ if ($copied) {{
                         existing_ids,
                         article_number=bundle.article_number,
                         product_group=product_group,
+                        candidate_ids=template_ids_worker,
+                        reference_lines=reference_lines_worker,
                     )
                     if prepared is not None:
                         user_message, candidates = prepared
@@ -18499,6 +18639,9 @@ if ($copied) {{
             def finalize_attribute_step(bundle: ExportBundle, hybrid: HybridAttributeResult, product_group: str) -> None:
                 """Validierte Ergebnisse schreiben bzw. berichten (auch rules-only)."""
                 nonlocal ai_disabled
+                if template_ids_worker is not None:
+                    # Vorlage: nichts dauerhaft in die Zuordnungsdatei lernen.
+                    hybrid.learned_entries = []
                 if hybrid.ai_error:
                     summary["media_warnings"].append((bundle.article_number, f"Attribut-KI: {hybrid.ai_error}"))
                     if "Key" in hybrid.ai_error:
@@ -19062,6 +19205,9 @@ if ($copied) {{
         brand_added_count = int(summary.get("brand_added_count") or 0)
         brand_existing_count = int(summary.get("brand_existing_count") or 0)
         brand_failed_count = int(summary.get("brand_failed_count") or 0)
+        attribute_template = str(summary.get("attribute_template") or "")
+        if attribute_template:
+            error_list_hint += f"\n\nAttribut-Vorlage (Referenzartikel): {attribute_template}"
         discontinued_items = list(summary.get("discontinued_items") or [])
         if discontinued_items:
             shown = ", ".join(discontinued_items[:10]) + (" …" if len(discontinued_items) > 10 else "")
