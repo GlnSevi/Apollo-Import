@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.40"
+APP_VERSION = "0.1.41"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -19650,7 +19650,13 @@ if ($copied) {{
             messagebox.showwarning(APP_TITLE, "Bitte zum Laden genau einen Artikel im Verzeichnis auswählen.")
             return
 
-        snapshot = self.article_browser_records.get(selection[0])
+        # Erst gegen die Dateien abgleichen (Signatur-Pruefung, ohne Aenderung nur ein
+        # paar stat-Aufrufe): wurden die Output-Dateien ausserhalb dieser App geaendert
+        # (zweite Instanz, Bereinigung, Excel), muss die Maske den aktuellen Stand
+        # zeigen - sonst schreibt das naechste Speichern den veralteten Stand zurueck.
+        selected_article = selection[0]
+        self._refresh_article_browser()
+        snapshot = self.article_browser_records.get(selected_article)
         if snapshot is None:
             messagebox.showwarning(APP_TITLE, "Der ausgewählte Artikel konnte nicht geladen werden.")
             return
