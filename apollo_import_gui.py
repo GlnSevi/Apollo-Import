@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.42"
+APP_VERSION = "0.1.43"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -13008,6 +13008,7 @@ class ApolloImportApp:
             self._load_attribute_mapping(initial=True)
         with perf_timer("Start: Artikelverzeichnis laden"):
             self.refresh_preview()
+        self._reload_restored_article_from_output()
         self._apply_pending_session_selection()
         log_perf("ApolloImportApp.__init__ gesamt", time.perf_counter() - init_started, always=True)
 
@@ -14088,6 +14089,23 @@ class ApolloImportApp:
 
         self._apply_article_browser_visibility()
         self._schedule_project_tab_layout()
+
+    def _reload_restored_article_from_output(self) -> None:
+        """Maske eines gespeicherten Artikels nach dem Start aus den Output-Dateien fuellen.
+
+        Die Sitzungsdatei haelt den Maskenstand beim letzten Schliessen. Wurden die
+        Dateien seitdem geaendert (Massenimport, Bereinigung, zweite Instanz), galt
+        dieser alte Stand gegenueber den Dateien als Aenderung, und der naechste
+        Fokuswechsel schrieb ihn zurueck (18500260 bekam so wieder KUNZER und
+        Durchmesser statt Spannbereich). Nicht geschriebene Aenderungen gibt es
+        beim Schliessen nur nach Rueckfrage - die Dateien sind daher der Stand.
+        Ein noch nicht gespeicherter Entwurf bleibt aus der Sitzung erhalten.
+        """
+        snapshot = self.article_browser_records.get(normalize_article_number(self.article_number_var.get()))
+        if snapshot is None:
+            return
+        with self._suspend_live_write():
+            self._apply_article_snapshot(snapshot)
 
     def _apply_pending_session_selection(self) -> None:
         selected_article = normalize_article_number(self.pending_article_browser_selection)
