@@ -36,6 +36,7 @@ Alternativ unter Windows:
 - Vergleichsnummern mit Mitbewerber-ID pro Artikel pflegen
 - Mitbewerber aus `KHer.csv` nachschlagen und direkt in Vergleichsnummern uebernehmen
 - Fahrzeugverknuepfungen pro Artikel ueber Motorcodes pflegen
+- Stueckliste (Lieferumfang mit Menge) und Zubehoerliste (optionales Zubehoer) pro Artikel pflegen wie in IMS, Reiter `Artikelliste(n)`
 - Gefuehrter Modus (Wizard): fuehrt Schritt fuer Schritt durch alle Eingaben bis zum Export
 - Tabs nach Befuellung gruppiert: erst die automatisch befuellten (Kunzer-Abruf, Praefix ⚙), dann die manuell zu pflegenden (Praefix ✎)
   - ueber einen oder mehrere Motorcodes werden die passenden KTyp-Nummern (TopMotive und TecDoc) automatisch aus den KTyp-Stammdaten (`KTyp.xlsx`) ergaenzt
@@ -182,6 +183,17 @@ Der Export erzeugt `Fahrzeugverknuepfungen.xlsx` mit den Spalten:
 
 Pro Fahrzeug werden zwei Zeilen geschrieben: eine mit der TopMotive-Nummer und eine mit der TecDoc-Nummer. So kann im Apollo-Import genau die eine passende Spalte auf `TecDoc Verknuepfungs ID` gemappt werden. Ueber die Spalte `KTyp-System` lassen sich die Zeilen bei Bedarf vorher filtern. Jede Zeile traegt zusaetzlich die GenArt des Artikels; sind einem Artikel mehrere GenArts zugeordnet, wird je GenArt und KTyp-Nummer eine eigene Zeile geschrieben. Bestehende `Fahrzeugverknuepfungen.xlsx` ohne GenArt-Spalten werden beim naechsten Schreiben automatisch auf das neue Format migriert (GenArt-Spalten bleiben bei alten Zeilen leer, bis der Artikel neu exportiert wird).
 
+## Stueckliste und Zubehoerliste
+
+Reiter `✎ Stückliste/Zubehör` - entspricht in IMS dem Reiter `Artikelliste(n)` mit den Listentypen `Stückliste` und `Zubehörliste`:
+
+- **Stückliste**: was im Lieferumfang enthalten ist, mit Menge (z. B. Heber `AJ-45T3GFL`: 1x `02041`, 2x `02042`).
+- **Zubehörliste**: optionales Zubehoer (Menge in der Regel 1).
+
+Je Position: Typ, `Lieferantenartikelnummer` (Listenartikel), `Menge`, `TecDoc GenArt ID` und `Produktgruppe` **des Listenartikels** (nicht des Hauptartikels) und `Sort Nr`. Beim Eingeben der Artikelnummer schlaegt die App Artikel aus dem Artikelverzeichnis vor und belegt GenArt und Produktgruppe aus der gespeicherten GenArt des Listenartikels vor (bei mehreren GenArts zur Auswahl). Steht der Listenartikel nicht im Output, GenArt-ID von Hand eingeben - die Produktgruppe kommt dann aus dem GenArt-Katalog. Die `Sort Nr` zaehlt je Artikel und Typ ab 1 in der Reihenfolge der Tabelle; mit ▲/▼ innerhalb eines Typs umsortieren.
+
+Geschrieben wird live in `Artikellisten.xlsx` (Blatt `Artikellisten`): `Artikelnummer`, `Typ`, `Lieferantenartikelnummer`, `Menge`, `TecDoc GenArt ID`, `Produktgruppe`, `Sort Nr`, `Zuletzt geschrieben am`. Wie GenArt, OE-Nummern und Attribute zaehlen die Listen zu den gepflegten Daten: Massenimport und Kunzer-Abruf lassen sie unveraendert, Loeschen im Artikelverzeichnis entfernt die Listen des Artikels (nicht seine Verwendung in Listen anderer Artikel). Abgelehnt werden: Menge keine ganze Zahl ab 1, GenArt fehlt bzw. keine Zahl, der Artikel selbst als Listenartikel, dieselbe Position zweimal im selben Typ. Das Artikelverzeichnis zeigt die Anzahl in der Spalte `Listen`; die Suche findet einen Artikel auch ueber die Nummern seiner Listenartikel.
+
 ## Attribute automatisch finden
 
 Die Attribut-Findung arbeitet hybrid in zwei Stufen und wird ueber den Button `Attribute automatisch ausfuellen` im Attribute-Tab oder automatisch nach dem Kunzer-Laden gestartet.
@@ -316,6 +328,7 @@ Die GUI erzeugt aktuell diese Dateien:
 - `Attribute.xlsx`
 - `OE-Nummern.xlsx`
 - `Vergleichsnummern.xlsx`
+- `Artikellisten.xlsx`
 - `Gebrauchsnummern.xlsx`
 - `Fahrzeugverknuepfungen.xlsx`
 - `Bilder.xlsx`

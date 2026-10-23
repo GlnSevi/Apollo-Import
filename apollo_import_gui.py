@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.43"
+APP_VERSION = "0.1.44"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -354,6 +354,9 @@ COMPARISON_FILE = ("Vergleichsnummern.xlsx", "Sheet1")
 USAGE_NUMBER_FILE = ("Gebrauchsnummern.xlsx", "Sheet1")
 ATTRIBUTE_FILE = ("Attribute.xlsx", "Sheet1")
 VEHICLE_LINK_FILE = ("Fahrzeugverknuepfungen.xlsx", "Sheet1")
+# Stückliste/Zubehörliste wie in IMS (Reiter 'Artikelliste(n)'): je Hauptartikel die
+# Listenartikel mit Menge, TecDoc GenArt ID und Produktgruppe des Listenartikels.
+ARTICLE_LIST_FILE = ("Artikellisten.xlsx", "Artikellisten")
 # Nach jedem Batch-Lauf mit Fehlern: Liste der fehlgeschlagenen Artikel im
 # Output-Ordner. Spalte A = Artikelnummer, damit die Datei direkt wieder als
 # Produktliste geladen werden kann.
@@ -446,6 +449,19 @@ ATTRIBUTE_HEADERS = [
 # GenArt ID    -> GenArt des Artikels; bei mehreren GenArts eine Zeile je GenArt und KTyp
 LEGACY_VEHICLE_LINK_HEADERS = ["Artikelnummer", "Fahrzeugtyp", "KTypNr", "KTyp-System", LAST_WRITTEN_HEADER]
 VEHICLE_LINK_HEADERS = ["Artikelnummer", "Fahrzeugtyp", "KTypNr", "KTyp-System", "GenArt ID", "GenArt Bezeichnung", LAST_WRITTEN_HEADER]
+# Typ 'Stückliste' = im Lieferumfang (mit Menge), 'Zubehörliste' = optionales Zubehör.
+# Sort Nr zählt je Artikel und Typ ab 1 in der Reihenfolge der Maske.
+ARTICLE_LIST_TYPES = ("Stückliste", "Zubehörliste")
+ARTICLE_LIST_HEADERS = [
+    "Artikelnummer",
+    "Typ",
+    "Lieferantenartikelnummer",
+    "Menge",
+    "TecDoc GenArt ID",
+    "Produktgruppe",
+    "Sort Nr",
+    LAST_WRITTEN_HEADER,
+]
 # Zuordnung von Text-Labels (aus gescrapten Produkttexten) zu TecDoc Kriterien IDs.
 ATTRIBUTE_MAPPING_SHEET = "Zuordnung"
 ATTRIBUTE_MAPPING_HEADERS = ["Text-Label", "TecDoc Kriterien ID", "Hinweis"]
@@ -660,6 +676,19 @@ class ComparisonNumberRow:
     def display_competitor_label(self) -> str:
         parts = [self.competitor_id.strip(), self.competitor_code.strip(), self.competitor_name.strip()]
         return " | ".join(part for part in parts if part) or "-"
+
+
+@dataclass(frozen=True)
+class ArticleListRow:
+    """Eine Position der Stückliste bzw. Zubehörliste; GenArt und Produktgruppe
+    gehören zum Listenartikel (IMS: Lieferantenartikelnummer | Menge | TecDoc
+    GenArt ID | Produktgruppe), die Sort Nr ergibt sich aus der Reihenfolge."""
+
+    list_type: str = ""
+    item_number: str = ""
+    quantity: str = "1"
+    genart_id: str = ""
+    product_group: str = ""
 
 
 @dataclass(frozen=True)
@@ -936,6 +965,7 @@ class ExportBundle:
     web_rows: list[MediaRow] = field(default_factory=list)
     oe_number_rows: list[OeNumberRow] = field(default_factory=list)
     comparison_number_rows: list[ComparisonNumberRow] = field(default_factory=list)
+    article_list_rows: list[ArticleListRow] = field(default_factory=list)
     vehicle_link_rows: list[VehicleLinkRow] = field(default_factory=list)
     attribute_rows: list[AttributeRow] = field(default_factory=list)
     search_terms: list[str] = field(default_factory=list)
@@ -956,6 +986,7 @@ class ExportBundle:
         self.sync_genart_fields()
         self.oe_number_rows = normalize_oe_number_rows(self.oe_number_rows)
         self.comparison_number_rows = normalize_comparison_number_rows(self.comparison_number_rows)
+        self.article_list_rows = normalize_article_list_rows(self.article_list_rows)
         self.vehicle_link_rows = normalize_vehicle_link_rows(self.vehicle_link_rows)
         self.attribute_rows = normalize_attribute_rows(self.attribute_rows)
         self.search_terms = normalize_search_terms(self.search_terms)
@@ -994,6 +1025,7 @@ class StoredArticleSnapshot:
     web_rows: list[MediaRow] = field(default_factory=list)
     oe_number_rows: list[OeNumberRow] = field(default_factory=list)
     comparison_number_rows: list[ComparisonNumberRow] = field(default_factory=list)
+    article_list_rows: list[ArticleListRow] = field(default_factory=list)
     vehicle_link_rows: list[VehicleLinkRow] = field(default_factory=list)
     attribute_rows: list[AttributeRow] = field(default_factory=list)
     search_terms: list[str] = field(default_factory=list)
@@ -1002,6 +1034,7 @@ class StoredArticleSnapshot:
         self.sync_genart_fields()
         self.oe_number_rows = normalize_oe_number_rows(self.oe_number_rows)
         self.comparison_number_rows = normalize_comparison_number_rows(self.comparison_number_rows)
+        self.article_list_rows = normalize_article_list_rows(self.article_list_rows)
         self.vehicle_link_rows = normalize_vehicle_link_rows(self.vehicle_link_rows)
         self.attribute_rows = normalize_attribute_rows(self.attribute_rows)
         self.search_terms = normalize_search_terms(self.search_terms)
@@ -1133,6 +1166,43 @@ def normalize_comparison_number_rows(rows: list[ComparisonNumberRow]) -> list[Co
             )
         )
     return normalized
+
+
+def canonical_article_list_type(raw: str) -> str:
+    """'Stückliste' bzw. 'Zubehörliste' aus Eingaben wie 'Stueckliste' oder 'Zubehör'; '' wenn unbekannt."""
+    key = str(raw or "").strip().casefold().replace("ü", "ue").replace("ö", "oe")
+    if key.startswith("stueck"):
+        return ARTICLE_LIST_TYPES[0]
+    if key.startswith("zubehoer"):
+        return ARTICLE_LIST_TYPES[1]
+    return ""
+
+
+def normalize_article_list_rows(rows: list[ArticleListRow]) -> list[ArticleListRow]:
+    """Gültiger Typ, normalisierte Artikelnummer, Menge Standard 1; je Typ und
+    Listenartikel eine Zeile. Erst alle Stücklisten-, dann alle Zubehörzeilen,
+    innerhalb eines Typs in der eingegebenen Reihenfolge (= Sort Nr)."""
+    by_type: dict[str, list[ArticleListRow]] = {list_type: [] for list_type in ARTICLE_LIST_TYPES}
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        list_type = canonical_article_list_type(row.list_type)
+        item_number = normalize_article_number(row.item_number)
+        if not list_type or not item_number:
+            continue
+        dedupe_key = (list_type, item_number.casefold())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        by_type[list_type].append(
+            ArticleListRow(
+                list_type=list_type,
+                item_number=item_number,
+                quantity=str(row.quantity or "").strip() or "1",
+                genart_id=str(row.genart_id or "").strip(),
+                product_group=" ".join(str(row.product_group or "").split()),
+            )
+        )
+    return [row for list_type in ARTICLE_LIST_TYPES for row in by_type[list_type]]
 
 
 def normalize_vehicle_link_rows(rows: list[VehicleLinkRow]) -> list[VehicleLinkRow]:
@@ -2690,6 +2760,20 @@ def format_comparison_number_rows(label: str, rows: list[ComparisonNumberRow]) -
         competitor_label = row.display_competitor_label()
         lines.append(f"{index}. {row.reference_number}")
         lines.append(f"   Mitbewerber: {competitor_label}")
+    return "\n".join(lines)
+
+
+def format_article_list_rows(label: str, rows: list[ArticleListRow]) -> str:
+    normalized = normalize_article_list_rows(rows)
+    lines = [label]
+    if not normalized:
+        lines.append("-")
+        return "\n".join(lines)
+    sort_numbers: dict[str, int] = {}
+    for row in normalized:
+        sort_numbers[row.list_type] = sort_numbers.get(row.list_type, 0) + 1
+        lines.append(f"{row.list_type} {sort_numbers[row.list_type]}. {row.item_number} | Menge {row.quantity}")
+        lines.append(f"   GenArt: {row.genart_id or '-'} | {row.product_group or '-'}")
     return "\n".join(lines)
 
 
@@ -7452,6 +7536,26 @@ def build_comparison_export_rows(bundle: ExportBundle) -> list[list[str]]:
     ]
 
 
+def build_article_list_export_rows(bundle: ExportBundle) -> list[list[str]]:
+    """Stückliste/Zubehörliste: Sort Nr je Typ ab 1 in der Reihenfolge der Maske."""
+    export_rows: list[list[str]] = []
+    sort_numbers: dict[str, int] = {}
+    article_key = normalize_article_number(bundle.article_number).casefold()
+    for row in normalize_article_list_rows(bundle.article_list_rows):
+        label = f"{row.list_type} {row.item_number}"
+        if row.item_number.casefold() == article_key:
+            raise ValueError(f"{label}: Ein Artikel kann nicht in seiner eigenen Liste stehen.")
+        if not re.fullmatch(r"[1-9][0-9]*", row.quantity):
+            raise ValueError(f"{label}: Menge '{row.quantity}' muss eine ganze Zahl ab 1 sein.")
+        if not row.genart_id.isdigit():
+            raise ValueError(f"{label}: Bitte die TecDoc GenArt ID des Listenartikels angeben (Zahl).")
+        sort_numbers[row.list_type] = sort_numbers.get(row.list_type, 0) + 1
+        export_rows.append(
+            [bundle.article_number, row.list_type, row.item_number, row.quantity, row.genart_id, row.product_group, str(sort_numbers[row.list_type])]
+        )
+    return export_rows
+
+
 def build_vehicle_link_export_rows(bundle: ExportBundle) -> list[list[str]]:
     """Je Fahrzeug eine Zeile pro KTyp-Nummer (Topmotive und TecDoc) und GenArt."""
     genart_values = [
@@ -7681,6 +7785,7 @@ def export_bundle(
     web_rows = [append_written_at(row, written_at) for row in build_web_export_rows(bundle)] if bundle.include_web_links else []
     oe_rows = [append_written_at(row, written_at) for row in build_oe_export_rows(bundle)]
     comparison_rows = [append_written_at(row, written_at) for row in build_comparison_export_rows(bundle)]
+    article_list_rows = [append_written_at(row, written_at) for row in build_article_list_export_rows(bundle)]
     usage_number_rows = [append_written_at(row, written_at) for row in build_usage_number_export_rows(bundle)]
     vehicle_link_rows = [append_written_at(row, written_at) for row in build_vehicle_link_export_rows(bundle)]
     attribute_rows = [append_written_at(row, written_at) for row in build_attribute_export_rows(bundle)]
@@ -7697,6 +7802,8 @@ def export_bundle(
             write_workbook(export_dir / OE_FILE[0], OE_FILE[1], OE_HEADERS, oe_rows)
         if comparison_rows:
             write_workbook(export_dir / COMPARISON_FILE[0], COMPARISON_FILE[1], COMPARISON_HEADERS, comparison_rows)
+        if article_list_rows:
+            write_workbook(export_dir / ARTICLE_LIST_FILE[0], ARTICLE_LIST_FILE[1], ARTICLE_LIST_HEADERS, article_list_rows)
         if usage_number_rows:
             write_workbook(export_dir / USAGE_NUMBER_FILE[0], USAGE_NUMBER_FILE[1], USAGE_NUMBER_HEADERS, usage_number_rows)
         if vehicle_link_rows:
@@ -7756,6 +7863,13 @@ def export_bundle(
                 COMPARISON_FILE[1],
                 COMPARISON_HEADERS,
                 comparison_rows,
+                replace_article_keys=article_keys,
+            )
+            write_workbook_with_upsert(
+                export_dir / ARTICLE_LIST_FILE[0],
+                ARTICLE_LIST_FILE[1],
+                ARTICLE_LIST_HEADERS,
+                article_list_rows,
                 replace_article_keys=article_keys,
             )
             write_workbook_with_upsert(
@@ -7834,6 +7948,7 @@ def build_preview(bundle: ExportBundle) -> str:
         "Referenzen",
         f"- OE-Nummern: {len(normalize_oe_number_rows(bundle.oe_number_rows))}",
         f"- Vergleichsnummern: {len(normalize_comparison_number_rows(bundle.comparison_number_rows))}",
+        f"- Stückliste/Zubehör: {len(normalize_article_list_rows(bundle.article_list_rows))}",
         f"- Fahrzeugverknüpfungen: {len(normalize_vehicle_link_rows(bundle.vehicle_link_rows))} Fahrzeuge / {len(build_vehicle_link_export_rows(bundle))} Zeilen",
         f"- Attribute: {len(normalize_attribute_rows(bundle.attribute_rows))}",
         f"- Suchwörter: {len(normalize_search_terms(bundle.search_terms))} (als Gebrauchsnummern, Referenztyp {USAGE_NUMBER_TECDOC_ID})",
@@ -7851,6 +7966,7 @@ def build_preview(bundle: ExportBundle) -> str:
         f"- {GENART_FILE[0]}",
         f"- {OE_FILE[0]}",
         f"- {COMPARISON_FILE[0]}",
+        f"- {ARTICLE_LIST_FILE[0]}",
         f"- {USAGE_NUMBER_FILE[0]}",
         f"- {VEHICLE_LINK_FILE[0]}",
         f"- {ATTRIBUTE_FILE[0]}",
@@ -7936,6 +8052,8 @@ def format_article_snapshot(snapshot: StoredArticleSnapshot) -> str:
         format_oe_number_rows("OE-Nummern", snapshot.oe_number_rows),
         "",
         format_comparison_number_rows("Vergleichsnummern", snapshot.comparison_number_rows),
+        "",
+        format_article_list_rows("Stückliste/Zubehör", snapshot.article_list_rows),
         "",
         format_vehicle_link_rows("Fahrzeugverknüpfungen", snapshot.vehicle_link_rows),
         "",
@@ -8050,6 +8168,23 @@ def load_article_snapshots_from_folder(
                 competitor_name=competitor.name if competitor is not None else "",
                 reference_number=row[3].strip(),
             )
+        )
+
+    article_list_rows = read_workbook_rows(folder / ARTICLE_LIST_FILE[0], ARTICLE_LIST_FILE[1], len(ARTICLE_LIST_HEADERS))
+
+    def article_list_sort_key(row: list[str]) -> int:
+        try:
+            return int(str(row[6]).strip() or 0)
+        except ValueError:
+            return 0
+
+    # Stabil nach Sort Nr sortiert: je Artikel und Typ stehen die Positionen danach in Listenreihenfolge.
+    for row in sorted(article_list_rows, key=article_list_sort_key):
+        article_number = normalize_article_number(row[0])
+        if not article_number:
+            continue
+        ensure_snapshot(article_number).article_list_rows.append(
+            ArticleListRow(list_type=row[1], item_number=row[2], quantity=row[3], genart_id=row[4], product_group=row[5])
         )
 
     vehicle_link_rows = read_workbook_rows(folder / VEHICLE_LINK_FILE[0], VEHICLE_LINK_FILE[1], len(VEHICLE_LINK_HEADERS))
@@ -8182,6 +8317,7 @@ def load_article_snapshots_from_folder(
         snapshot.sync_genart_fields()
         snapshot.oe_number_rows = normalize_oe_number_rows(snapshot.oe_number_rows)
         snapshot.comparison_number_rows = normalize_comparison_number_rows(snapshot.comparison_number_rows)
+        snapshot.article_list_rows = normalize_article_list_rows(snapshot.article_list_rows)
         snapshot.vehicle_link_rows = normalize_vehicle_link_rows(snapshot.vehicle_link_rows)
         snapshot.attribute_rows = normalize_attribute_rows(snapshot.attribute_rows)
         snapshot.search_terms = normalize_search_terms(snapshot.search_terms)
@@ -10432,6 +10568,295 @@ class ComparisonTableFrame(ttk.LabelFrame):
         self.context_menu.grab_release()
 
 
+class ArticleListTableFrame(ttk.LabelFrame):
+    """Stückliste/Zubehörliste des Artikels wie in IMS (Reiter 'Artikelliste(n)')."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_change: Callable[[], None] | None = None,
+        item_info: Callable[[str], tuple[str, list[GenArtSelection]]] | None = None,
+        item_suggestions: Callable[[str], list[str]] | None = None,
+        genart_label: Callable[[str], str] | None = None,
+    ) -> None:
+        super().__init__(master, text="Stückliste / Zubehörliste", padding=14)
+        self.on_change = on_change
+        self.item_info = item_info or (lambda _number: ("", []))
+        self.item_suggestions = item_suggestions or (lambda _query: [])
+        self.genart_label = genart_label or (lambda _genart_id: "")
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
+        self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
+
+        self.list_type_var = tk.StringVar(value=ARTICLE_LIST_TYPES[1])
+        self.item_number_var = tk.StringVar()
+        self.item_label_var = tk.StringVar()
+        self.quantity_var = tk.StringVar(value="1")
+        self.genart_var = tk.StringVar()
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            header,
+            text=(
+                "Stückliste = im Lieferumfang enthalten (mit Menge), Zubehörliste = optionales Zubehör. "
+                "Artikelnummer eingeben oder aus dem Verzeichnis wählen - TecDoc GenArt ID und Produktgruppe "
+                "kommen aus der GenArt des Listenartikels. Die Sort Nr folgt der Reihenfolge (▲/▼)."
+            ),
+            foreground="#5E6472",
+            wraplength=980,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+
+        ttk.Label(header, text="Typ").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        type_row = ttk.Frame(header)
+        type_row.grid(row=1, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Combobox(type_row, textvariable=self.list_type_var, values=ARTICLE_LIST_TYPES, state="readonly", width=16).grid(
+            row=0, column=0
+        )
+        ttk.Label(type_row, text="Menge").grid(row=0, column=1, padx=(16, 8))
+        ttk.Entry(type_row, textvariable=self.quantity_var, width=8).grid(row=0, column=2)
+
+        ttk.Label(header, text="Lieferantenartikelnummer").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.item_entry = ttk.Entry(header, textvariable=self.item_number_var)
+        self.item_entry.grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Label(header, textvariable=self.item_label_var, foreground="#5E6472").grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=4
+        )
+        self.item_suggestion_popup = SearchSuggestionPopup(
+            self,
+            self.item_entry,
+            self.item_suggestions,
+            self._accept_item_suggestion,
+            on_focus_out=self._apply_item_number,
+            min_width=520,
+        )
+
+        ttk.Label(header, text="TecDoc GenArt").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.genart_combo = ttk.Combobox(header, textvariable=self.genart_var)
+        self.genart_combo.grid(row=3, column=1, sticky="ew", pady=4)
+
+        actions = ttk.Frame(header)
+        actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Button(actions, text="Hinzufügen", command=self.add_row).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl aktualisieren", command=self.update_selected_row).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(actions, text="Auswahl entfernen", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(actions, text="▲", width=3, command=lambda: self.move_selected(-1)).grid(row=0, column=3, padx=(0, 4))
+        ttk.Button(actions, text="▼", width=3, command=lambda: self.move_selected(1)).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(actions, text="Leeren", command=self.clear_form).grid(row=0, column=5)
+
+        columns = ("list_type", "sort_nr", "item_number", "item_label", "quantity", "genart_id", "product_group")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=11, selectmode="extended")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        for column, text, width, anchor in (
+            ("list_type", "Typ", 110, "w"),
+            ("sort_nr", "Sort Nr", 70, "center"),
+            ("item_number", "Lieferantenartikelnummer", 180, "w"),
+            ("item_label", "Bezeichnung", 320, "w"),
+            ("quantity", "Menge", 70, "center"),
+            ("genart_id", "TecDoc GenArt ID", 120, "center"),
+            ("product_group", "Produktgruppe", 260, "w"),
+        ):
+            self.tree.heading(column, text=text)
+            self.tree.column(column, width=width, anchor=anchor)
+        self.tree.bind("<<TreeviewSelect>>", self._handle_selection)
+        self.tree.bind("<Button-3>", self._open_context_menu)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+    def _emit_change(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def _accept_item_suggestion(self, value: str) -> None:
+        self.item_number_var.set(value.split(" | ", 1)[0])
+        self._apply_item_number()
+
+    def _apply_item_number(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        """Listenartikel uebernehmen: Bezeichnung anzeigen, GenArts zur Auswahl anbieten."""
+        item_number = normalize_article_number(self.item_number_var.get().split(" | ", 1)[0])
+        self.item_number_var.set(item_number)
+        if not item_number:
+            self.item_label_var.set("")
+            self.genart_combo.configure(values=[])
+            return
+        title, genarts = self.item_info(item_number)
+        self.item_label_var.set(title or "(nicht im Output-Verzeichnis - GenArt bitte eingeben)")
+        choices = [selection.display_label() for selection in genarts if selection.id.strip()]
+        self.genart_combo.configure(values=choices)
+        current_id = self._parse_genart()[0]
+        if choices and current_id not in {selection.id.strip() for selection in genarts}:
+            self.genart_var.set(choices[0])
+
+    def _parse_genart(self) -> tuple[str, str]:
+        """'6220 | Verlängerung, Rangierheber' oder nur '6220' -> (ID, Produktgruppe)."""
+        parts = [part.strip() for part in self.genart_var.get().split("|")]
+        genart_id = parts[0] if parts else ""
+        label = parts[-1] if len(parts) > 1 else ""
+        return genart_id, label or self.genart_label(genart_id)
+
+    def _build_current_row(self) -> ArticleListRow | None:
+        self._apply_item_number()
+        genart_id, product_group = self._parse_genart()
+        row = ArticleListRow(
+            list_type=canonical_article_list_type(self.list_type_var.get()),
+            item_number=self.item_number_var.get().strip(),
+            quantity=self.quantity_var.get().strip() or "1",
+            genart_id=genart_id,
+            product_group=product_group,
+        )
+        if not row.list_type or not row.item_number:
+            messagebox.showwarning(APP_TITLE, "Bitte Typ und Lieferantenartikelnummer angeben.")
+            return None
+        if not re.fullmatch(r"[1-9][0-9]*", row.quantity):
+            messagebox.showwarning(APP_TITLE, "Die Menge muss eine ganze Zahl ab 1 sein.")
+            return None
+        if not row.genart_id.isdigit():
+            messagebox.showwarning(APP_TITLE, "Bitte die TecDoc GenArt ID des Listenartikels angeben (Zahl).")
+            return None
+        return row
+
+    def add_row(self) -> None:
+        row = self._build_current_row()
+        if row is None:
+            return
+        rows = self.get_rows()
+        if any(existing.list_type == row.list_type and existing.item_number.casefold() == row.item_number.casefold() for existing in rows):
+            messagebox.showwarning(APP_TITLE, f"{row.item_number} steht bereits in der {row.list_type} - bitte die Zeile auswählen und aktualisieren.")
+            return
+        self._render(rows + [row], select=(row.list_type, row.item_number))
+        self._emit_change()
+
+    def update_selected_row(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswählen.")
+            return
+        row = self._build_current_row()
+        if row is None:
+            return
+        index = self.tree.index(selected[0])
+        rows = self.get_rows()
+        others = [existing for position, existing in enumerate(rows) if position != index]
+        if any(existing.list_type == row.list_type and existing.item_number.casefold() == row.item_number.casefold() for existing in others):
+            messagebox.showwarning(APP_TITLE, f"{row.item_number} steht bereits in der {row.list_type}.")
+            return
+        rows[index] = row
+        self._render(rows, select=(row.list_type, row.item_number))
+        self._emit_change()
+
+    def move_selected(self, step: int) -> None:
+        """Position innerhalb des eigenen Typs verschieben (bestimmt die Sort Nr)."""
+        selected = self.tree.selection()
+        if len(selected) != 1:
+            return
+        rows = self.get_rows()
+        index = self.tree.index(selected[0])
+        target = index + step
+        if not 0 <= target < len(rows) or rows[target].list_type != rows[index].list_type:
+            return
+        rows[index], rows[target] = rows[target], rows[index]
+        self._render(rows, select=(rows[target].list_type, rows[target].item_number))
+        self._emit_change()
+
+    def remove_selected(self) -> None:
+        selected = set(self.tree.selection())
+        if not selected:
+            return
+        rows = [row for item_id, row in zip(self.tree.get_children(), self.get_rows()) if item_id not in selected]
+        self._render(rows)
+        self.clear_form()
+        self._emit_change()
+
+    def copy_selected_rows(self) -> None:
+        selected_items = list(self.tree.selection())
+        if not selected_items:
+            return
+        lines = ["\t".join(str(value).strip() for value in self.tree.item(item_id, "values")) for item_id in selected_items]
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+
+    def clear_form(self) -> None:
+        self.item_number_var.set("")
+        self.item_label_var.set("")
+        self.quantity_var.set("1")
+        self.genart_var.set("")
+        self.genart_combo.configure(values=[])
+
+    def get_rows(self) -> list[ArticleListRow]:
+        rows = []
+        for item_id in self.tree.get_children():
+            list_type, _sort_nr, item_number, _label, quantity, genart_id, product_group = self.tree.item(item_id, "values")
+            rows.append(
+                ArticleListRow(
+                    list_type=str(list_type),
+                    item_number=str(item_number),
+                    quantity=str(quantity),
+                    genart_id=str(genart_id),
+                    product_group=str(product_group),
+                )
+            )
+        return normalize_article_list_rows(rows)
+
+    def set_rows(self, rows: list[ArticleListRow]) -> None:
+        self._render(rows)
+
+    def _render(self, rows: list[ArticleListRow], select: tuple[str, str] | None = None) -> None:
+        self.tree.delete(*self.tree.get_children())
+        sort_numbers: dict[str, int] = {}
+        target_item = ""
+        for row in normalize_article_list_rows(rows):
+            sort_numbers[row.list_type] = sort_numbers.get(row.list_type, 0) + 1
+            title, _genarts = self.item_info(row.item_number)
+            item_id = self.tree.insert(
+                "",
+                "end",
+                values=(row.list_type, sort_numbers[row.list_type], row.item_number, title, row.quantity, row.genart_id, row.product_group),
+            )
+            if select is not None and (row.list_type, row.item_number.casefold()) == (select[0], select[1].casefold()):
+                target_item = item_id
+        children = self.tree.get_children()
+        if not children:
+            return
+        target_item = target_item or children[0]
+        self.tree.selection_set(target_item)
+        self.tree.focus(target_item)
+        self.tree.see(target_item)
+        self._handle_selection()
+
+    def _handle_selection(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        list_type, _sort_nr, item_number, title, quantity, genart_id, product_group = self.tree.item(selected[0], "values")
+        self.list_type_var.set(str(list_type))
+        self.item_number_var.set(str(item_number))
+        self.item_label_var.set(str(title))
+        self.quantity_var.set(str(quantity))
+        _title, genarts = self.item_info(str(item_number))
+        self.genart_combo.configure(values=[selection.display_label() for selection in genarts if selection.id.strip()])
+        self.genart_var.set(GenArtSelection(id=str(genart_id), bezeichnung=str(product_group)).display_label())
+
+    def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            if item_id not in self.tree.selection():
+                self.tree.selection_set(item_id)
+            self.tree.focus(item_id)
+            self._handle_selection()
+        has_selection = bool(self.tree.selection())
+        self.context_menu.entryconfigure("Zeilen kopieren", state="normal" if has_selection else "disabled")
+        self.context_menu.entryconfigure("Zeilen löschen", state="normal" if has_selection else "disabled")
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.grab_release()
+
+
 class VehicleLinkTableFrame(ttk.LabelFrame):
     def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
         super().__init__(master, text="Fahrzeugverknüpfungen", padding=14)
@@ -12485,6 +12910,7 @@ LIVE_SECTIONS: tuple[str, ...] = (
     "comparison_numbers",
     "search_terms",
     "vehicle_links",
+    "article_lists",
     "attributes",
     "images",
     "documents",
@@ -12499,6 +12925,7 @@ LIVE_SECTION_LABELS = {
     "comparison_numbers": "Vergleichsnummern",
     "search_terms": "Suchwörter",
     "vehicle_links": "Fahrzeuge",
+    "article_lists": "Stückliste/Zubehör",
     "attributes": "Attribute",
     "images": "Bilder",
     "documents": "Dokumente",
@@ -12539,6 +12966,8 @@ def live_section_export_rows(bundle: ExportBundle, section: str) -> list[list[st
         return build_usage_number_export_rows(bundle)
     if section == "vehicle_links":
         return build_vehicle_link_export_rows(bundle)
+    if section == "article_lists":
+        return build_article_list_export_rows(bundle)
     if section == "attributes":
         return build_attribute_export_rows(bundle)
     if section == "images":
@@ -12563,6 +12992,7 @@ LIVE_SECTION_INPUT_FIELDS: dict[str, tuple[str, ...]] = {
     "comparison_numbers": ("comparison_number_rows",),
     "search_terms": ("search_terms",),
     "vehicle_links": ("vehicle_link_rows", "genart_selections"),
+    "article_lists": ("article_list_rows",),
     "attributes": ("attribute_rows",),
     "images": ("image_rows",),
     "documents": ("document_rows",),
@@ -12632,6 +13062,7 @@ def bundle_from_snapshot(
         web_rows=list(snapshot.web_rows),
         oe_number_rows=list(snapshot.oe_number_rows),
         comparison_number_rows=list(snapshot.comparison_number_rows),
+        article_list_rows=list(snapshot.article_list_rows),
         vehicle_link_rows=list(snapshot.vehicle_link_rows),
         attribute_rows=list(snapshot.attribute_rows),
         search_terms=list(snapshot.search_terms),
@@ -13223,6 +13654,7 @@ class ApolloImportApp:
         self.oe_tab = ttk.Frame(self.main_notebook, padding=18)
         self.comparison_tab = ttk.Frame(self.main_notebook, padding=18)
         self.vehicle_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.article_list_tab = ttk.Frame(self.main_notebook, padding=18)
         self.image_tab = ttk.Frame(self.main_notebook, padding=18)
         self.document_tab = ttk.Frame(self.main_notebook, padding=18)
         self.links_tab = ttk.Frame(self.main_notebook, padding=18)
@@ -13240,6 +13672,8 @@ class ApolloImportApp:
         self.main_notebook.add(self.oe_tab, text="✎ OE-Nummern")
         self.main_notebook.add(self.comparison_tab, text="✎ Vergleichsnummern")
         self.main_notebook.add(self.vehicle_tab, text="✎ Fahrzeuge")
+        # Hinten anhaengen: der Sitzungszustand merkt sich den Reiter als Index.
+        self.main_notebook.add(self.article_list_tab, text="✎ Stückliste/Zubehör")
 
         self._build_project_tab()
         self._build_short_tab()
@@ -13305,6 +13739,13 @@ class ApolloImportApp:
                 "Fahrzeuge (optional)",
                 self.vehicle_tab,
                 "Motorcode(s) eingeben (mehrere mit Semikolon trennen) und 'Fahrzeuge hinzufügen' klicken.",
+            ),
+            (
+                "listen",
+                "Stückliste/Zubehör (optional)",
+                self.article_list_tab,
+                "Stückliste = im Lieferumfang (mit Menge), Zubehörliste = optionales Zubehör. "
+                "GenArt und Produktgruppe kommen aus der GenArt des Listenartikels.",
             ),
             (
                 "bilder",
@@ -13406,6 +13847,7 @@ class ApolloImportApp:
             f"OE-Nummern: {len(self.oe_frame.get_rows())}",
             f"Vergleichsnummern: {len(self.comparison_frame.get_rows())}",
             f"Fahrzeuge: {len(self.vehicle_link_frame.get_rows())}",
+            f"Stückliste/Zubehör: {len(self.article_list_frame.get_rows())}",
             f"Bilder: {len(self.image_frame.get_rows())}",
             f"Dokumente: {len(self.document_frame.get_rows())}",
         ]
@@ -13592,6 +14034,36 @@ class ApolloImportApp:
                 )
             )
         return normalize_comparison_number_rows(rows)
+
+    def _article_list_rows_to_state(self, rows: list[ArticleListRow]) -> list[dict[str, str]]:
+        return [
+            {
+                "list_type": row.list_type,
+                "item_number": row.item_number,
+                "quantity": row.quantity,
+                "genart_id": row.genart_id,
+                "product_group": row.product_group,
+            }
+            for row in normalize_article_list_rows(rows)
+        ]
+
+    def _article_list_rows_from_state(self, payload: object) -> list[ArticleListRow]:
+        if not isinstance(payload, list):
+            return []
+        rows: list[ArticleListRow] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                ArticleListRow(
+                    list_type=str(item.get("list_type", "")),
+                    item_number=str(item.get("item_number", "")),
+                    quantity=str(item.get("quantity", "")),
+                    genart_id=str(item.get("genart_id", "")),
+                    product_group=str(item.get("product_group", "")),
+                )
+            )
+        return normalize_article_list_rows(rows)
 
     def _vehicle_link_rows_to_state(self, rows: list[VehicleLinkRow]) -> list[dict[str, str]]:
         return [
@@ -13806,6 +14278,15 @@ class ApolloImportApp:
                         "reference_number": self.comparison_frame.reference_number_var.get(),
                     },
                 },
+                "article_lists": {
+                    "rows": self._article_list_rows_to_state(self.article_list_frame.get_rows()),
+                    "form": {
+                        "list_type": self.article_list_frame.list_type_var.get(),
+                        "item_number": self.article_list_frame.item_number_var.get(),
+                        "quantity": self.article_list_frame.quantity_var.get(),
+                        "genart": self.article_list_frame.genart_var.get(),
+                    },
+                },
                 "vehicle_links": {
                     "rows": self._vehicle_link_rows_to_state(self.vehicle_link_frame.get_rows()),
                     "form": {
@@ -14014,6 +14495,18 @@ class ApolloImportApp:
                         self.comparison_frame.competitor_code_var.set(str(form.get("competitor_code", "")))
                         self.comparison_frame.competitor_name_var.set(str(form.get("competitor_name", "")))
                         self.comparison_frame.reference_number_var.set(str(form.get("reference_number", "")))
+
+                article_list_payload = references.get("article_lists")
+                if isinstance(article_list_payload, dict):
+                    self.article_list_frame.set_rows(self._article_list_rows_from_state(article_list_payload.get("rows")))
+                    form = article_list_payload.get("form")
+                    if isinstance(form, dict):
+                        self.article_list_frame.list_type_var.set(
+                            canonical_article_list_type(str(form.get("list_type", ""))) or ARTICLE_LIST_TYPES[1]
+                        )
+                        self.article_list_frame.item_number_var.set(str(form.get("item_number", "")))
+                        self.article_list_frame.quantity_var.set(str(form.get("quantity", "")) or "1")
+                        self.article_list_frame.genart_var.set(str(form.get("genart", "")))
 
                 vehicle_payload = references.get("vehicle_links")
                 if isinstance(vehicle_payload, dict):
@@ -15112,7 +15605,7 @@ if ($copied) {{
         )
         ttk.Button(browser_header, text="Liste aktualisieren", command=self.refresh_preview).grid(row=0, column=3)
 
-        columns = ("article", "source", "short_id", "long_id", "genart", "attr", "oe", "comparison", "images", "documents", "videos", "links")
+        columns = ("article", "source", "short_id", "long_id", "genart", "attr", "oe", "comparison", "lists", "images", "documents", "videos", "links")
         self.browser_content_frame = ttk.Frame(browser_frame)
         self.browser_content_frame.grid(row=1, column=0, sticky="nsew")
         self.browser_content_frame.columnconfigure(0, weight=1)
@@ -15159,6 +15652,7 @@ if ($copied) {{
         self.article_browser_tree.heading("attr", text="Attr.")
         self.article_browser_tree.heading("oe", text="OE")
         self.article_browser_tree.heading("comparison", text="Vgl.")
+        self.article_browser_tree.heading("lists", text="Listen")
         self.article_browser_tree.heading("images", text="Bilder")
         self.article_browser_tree.heading("documents", text="Dokumente")
         self.article_browser_tree.heading("videos", text="Videos")
@@ -15171,6 +15665,7 @@ if ($copied) {{
         self.article_browser_tree.column("attr", width=60, anchor="center")
         self.article_browser_tree.column("oe", width=60, anchor="center")
         self.article_browser_tree.column("comparison", width=60, anchor="center")
+        self.article_browser_tree.column("lists", width=60, anchor="center")
         self.article_browser_tree.column("images", width=70, anchor="center")
         self.article_browser_tree.column("documents", width=90, anchor="center")
         self.article_browser_tree.column("videos", width=70, anchor="center")
@@ -15342,6 +15837,8 @@ if ($copied) {{
         self.comparison_tab.rowconfigure(0, weight=1)
         self.vehicle_tab.columnconfigure(0, weight=1)
         self.vehicle_tab.rowconfigure(0, weight=1)
+        self.article_list_tab.columnconfigure(0, weight=1)
+        self.article_list_tab.rowconfigure(0, weight=1)
         self.search_term_tab.columnconfigure(0, weight=1)
         self.search_term_tab.rowconfigure(0, weight=1)
 
@@ -15370,6 +15867,40 @@ if ($copied) {{
             on_change=lambda: self._write_live_section("vehicle_links"),
         )
         self.vehicle_link_frame.grid(row=0, column=0, sticky="nsew")
+
+        self.article_list_frame = ArticleListTableFrame(
+            self.article_list_tab,
+            on_change=lambda: self._write_live_section("article_lists"),
+            item_info=self._article_list_item_info,
+            item_suggestions=self._article_list_item_suggestions,
+            genart_label=self._article_list_genart_label,
+        )
+        self.article_list_frame.grid(row=0, column=0, sticky="nsew")
+
+    def _article_list_item_info(self, item_number: str) -> tuple[str, list[GenArtSelection]]:
+        """Kurzbezeichnung und GenArts eines Listenartikels aus dem Artikelverzeichnis."""
+        snapshot = self.article_browser_records.get(normalize_article_number(item_number))
+        if snapshot is None:
+            return "", []
+        title = snapshot.short_texts.de or snapshot.short_texts.uni or "(ohne Kurzbezeichnung)"
+        return title, list(snapshot.genart_selections)
+
+    def _article_list_item_suggestions(self, query: str) -> list[str]:
+        tokens = [token.casefold() for token in query.split()]
+        suggestions: list[str] = []
+        for article_number in sorted(self.article_browser_records):
+            snapshot = self.article_browser_records[article_number]
+            title = snapshot.short_texts.de or snapshot.short_texts.uni
+            label = f"{article_number} | {title}" if title else article_number
+            if all(token in label.casefold() for token in tokens):
+                suggestions.append(label)
+                if len(suggestions) >= 200:
+                    break
+        return suggestions
+
+    def _article_list_genart_label(self, genart_id: str) -> str:
+        option = self.genart_registry.options_by_id.get(genart_id.strip())
+        return option.bezeichnung if option is not None else ""
 
     def _build_media_tabs(self) -> None:
         self.image_tab.columnconfigure(0, weight=1)
@@ -16810,6 +17341,7 @@ if ($copied) {{
             web_rows=bundle.web_rows,
             oe_number_rows=bundle.oe_number_rows,
             comparison_number_rows=bundle.comparison_number_rows,
+            article_list_rows=bundle.article_list_rows,
             vehicle_link_rows=bundle.vehicle_link_rows,
             attribute_rows=bundle.attribute_rows,
             search_terms=list(bundle.search_terms),
@@ -16851,6 +17383,7 @@ if ($copied) {{
                 )
                 for row in snapshot.comparison_number_rows
             ],
+            article_list_rows=list(snapshot.article_list_rows),
             vehicle_link_rows=[
                 VehicleLinkRow(
                     vehicle_type_id=row.vehicle_type_id,
@@ -16908,6 +17441,7 @@ if ($copied) {{
                     len(snapshot.attribute_rows),
                     len(snapshot.oe_number_rows),
                     len(snapshot.comparison_number_rows),
+                    len(snapshot.article_list_rows),
                     len(snapshot.image_rows),
                     len(snapshot.document_rows),
                     len(snapshot.video_rows),
@@ -16977,6 +17511,8 @@ if ($copied) {{
         for comparison_row in snapshot.comparison_number_rows:
             parts.append(comparison_row.reference_number)
             parts.append(comparison_row.competitor_name)
+        for list_row in snapshot.article_list_rows:
+            parts.append(list_row.item_number)
         parts.extend(snapshot.search_terms)
         blob = "\n".join(part for part in parts if part).casefold()
         self._article_search_blob_cache[article_number] = (weakref.ref(snapshot), blob)
@@ -17050,6 +17586,7 @@ if ($copied) {{
             GENART_FILE[0],
             OE_FILE[0],
             COMPARISON_FILE[0],
+            ARTICLE_LIST_FILE[0],
             USAGE_NUMBER_FILE[0],
             VEHICLE_LINK_FILE[0],
             ATTRIBUTE_FILE[0],
@@ -17114,6 +17651,7 @@ if ($copied) {{
             snapshot.sync_genart_fields()
             snapshot.oe_number_rows = list(bundle.oe_number_rows)
             snapshot.comparison_number_rows = list(bundle.comparison_number_rows)
+            snapshot.article_list_rows = list(bundle.article_list_rows)
             snapshot.vehicle_link_rows = list(bundle.vehicle_link_rows)
             snapshot.attribute_rows = list(bundle.attribute_rows)
             snapshot.search_terms = list(bundle.search_terms)
@@ -17188,6 +17726,8 @@ if ($copied) {{
                 )
                 for row in bundle.comparison_number_rows
             ]
+        if section in {"article_lists", "all"}:
+            snapshot.article_list_rows = list(bundle.article_list_rows)
         if section in {"vehicle_links", "all"}:
             snapshot.vehicle_link_rows = [
                 VehicleLinkRow(
@@ -17283,6 +17823,15 @@ if ($copied) {{
             build_comparison_export_rows(bundle),
         )
 
+    def _write_article_list_live(self, bundle: ExportBundle, output_root: Path) -> None:
+        replace_article_rows_preserving_timestamps(
+            output_root / ARTICLE_LIST_FILE[0],
+            ARTICLE_LIST_FILE[1],
+            ARTICLE_LIST_HEADERS,
+            bundle.article_number,
+            build_article_list_export_rows(bundle),
+        )
+
     def _write_usage_number_live(self, bundle: ExportBundle, output_root: Path) -> None:
         replace_article_rows_preserving_timestamps(
             output_root / USAGE_NUMBER_FILE[0],
@@ -17372,6 +17921,7 @@ if ($copied) {{
             attempt("comparison_numbers", lambda: self._write_comparison_live(bundle, output_root))
             attempt("search_terms", lambda: self._write_usage_number_live(bundle, output_root))
             attempt("vehicle_links", lambda: self._write_vehicle_link_live(bundle, output_root))
+            attempt("article_lists", lambda: self._write_article_list_live(bundle, output_root))
             if "attributes" in sections:
                 # Der Attribut-Export ersetzt alle Zeilen des Artikels und raeumt dabei
                 # auch Alt-Suchwortzeilen (9595) mit ab.
@@ -18042,6 +18592,8 @@ if ($copied) {{
             oe_source = self._fetch_source("oe_numbers")
             comparison_source = self._fetch_source("comparison_numbers")
             vehicle_source = self._fetch_source("vehicle_links")
+            article_list_source = self._fetch_source("article_lists")
+            self.article_list_frame.set_rows(list(article_list_source.article_list_rows) if article_list_source is not None else [])
             self.oe_frame.set_rows(list(oe_source.oe_number_rows) if oe_source is not None else [])
             self.comparison_frame.set_rows(
                 list(comparison_source.comparison_number_rows) if comparison_source is not None else []
@@ -19663,6 +20215,7 @@ if ($copied) {{
         self.search_term_frame.set_terms(snapshot.search_terms)
         self.oe_frame.set_rows(snapshot.oe_number_rows)
         self.comparison_frame.set_rows(snapshot.comparison_number_rows)
+        self.article_list_frame.set_rows(snapshot.article_list_rows)
         self.vehicle_link_frame.set_rows(snapshot.vehicle_link_rows)
         self.image_frame.set_rows(snapshot.image_rows)
         self.document_frame.set_rows(snapshot.document_rows)
@@ -19801,6 +20354,7 @@ if ($copied) {{
                 (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
                 (OE_FILE, OE_HEADERS),
                 (COMPARISON_FILE, COMPARISON_HEADERS),
+                (ARTICLE_LIST_FILE, ARTICLE_LIST_HEADERS),
                 (USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS),
                 (VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS),
                 (IMAGE_FILE, IMAGE_HEADERS),
@@ -20037,6 +20591,7 @@ if ($copied) {{
             attribute_key_values_by_group=self.attribute_key_values_by_group,
             oe_number_rows=self.oe_frame.get_rows(),
             comparison_number_rows=self.comparison_frame.get_rows(),
+            article_list_rows=self.article_list_frame.get_rows(),
             vehicle_link_rows=self.vehicle_link_frame.get_rows(),
             image_rows=self.image_frame.get_rows(),
             document_rows=self.document_frame.get_rows(),
