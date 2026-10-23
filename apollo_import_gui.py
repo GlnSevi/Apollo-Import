@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.41"
+APP_VERSION = "0.1.42"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -2507,6 +2507,28 @@ def detect_article_brand_with_source(
                 foreign = _brand_match_in_text(lead, brands, skip_default=True)
                 if foreign:
                     return finish(foreign, source)
+            # Ebenso ein Link-Label, das mit der Fremdmarke beginnt ('Oetiker -
+            # Lochbandklemmen 259 - DualHook'), oder einzelne Medien im Ordner
+            # einer Fremdmarke neben der Kunzer-Mehrheit (DualHook 18500260 ff.).
+            # Labels wie 'Anleitung Oetiker-Zange' zaehlen nicht.
+            for label in _brand_signal_list(signals, "shop_link_labels"):
+                label = " ".join(label.split())
+                foreign = next(
+                    (
+                        brand_name
+                        for brand_name, aliases in brands
+                        if brand_name.casefold() != DEFAULT_BRAND_NAME.casefold()
+                        and any(_brand_alias_pattern(alias).match(label) for alias in aliases)
+                    ),
+                    "",
+                )
+                if foreign:
+                    return finish(foreign, "links")
+            media_links = _brand_signal_list(signals, "image_links") + _brand_signal_list(signals, "document_links")
+            for media_folder in kunzer_media_folders_from_links(media_links):
+                foreign = _brand_match_in_text(media_folder, brands, skip_default=True)
+                if foreign:
+                    return finish(foreign, "medienordner")
             return finish(name, "medienordner")
 
     for segment in _brand_signal_list(signals, "category_path"):
@@ -5468,8 +5490,15 @@ def kunzer_media_folder_from_links(links: list[str]) -> str:
     Bei mehreren Ordnern gewinnt der haeufigste (bei Gleichstand der zuerst
     gesehene). Interne tote Pfade wie 's:' werden ignoriert. '' wenn unbekannt.
     """
+    folders = kunzer_media_folders_from_links(links)
+    # max() liefert bei Gleichstand das erste Element - Dicts behalten die Einfuegereihenfolge.
+    return max(folders, key=folders.__getitem__) if folders else ""
+
+
+def kunzer_media_folders_from_links(links: list[str]) -> dict[str, int]:
+    """Alle Medienordner der restapi.kunzer.de-Links mit Anzahl, in Reihenfolge
+    des ersten Auftretens (Regeln wie kunzer_media_folder_from_links)."""
     counts: dict[str, int] = {}
-    order: list[str] = []
     for link in links:
         try:
             parsed = urlparse(str(link or "").strip())
@@ -5484,12 +5513,8 @@ def kunzer_media_folder_from_links(links: list[str]) -> str:
         folder = " ".join(segments[0].split()).casefold()
         if not folder or folder.endswith(":"):
             continue
-        if folder not in counts:
-            order.append(folder)
         counts[folder] = counts.get(folder, 0) + 1
-    if not counts:
-        return ""
-    return max(order, key=lambda name: (counts[name], -order.index(name)))
+    return counts
 
 
 _FLIGHT_ROW_HEADER = re.compile(rb"([0-9a-fA-F]+):(T([0-9a-fA-F]+),)?")
