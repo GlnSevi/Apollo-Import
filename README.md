@@ -198,7 +198,7 @@ Geschrieben wird live in `Artikellisten.xlsx` (Blatt `Artikellisten`): `Artikeln
 
 ## Attribute automatisch finden
 
-Die Attribut-Findung arbeitet hybrid in zwei Stufen und wird ueber den Button `Attribute automatisch ausfuellen` im Attribute-Tab oder automatisch nach dem Kunzer-Laden gestartet.
+Die Attribut-Findung arbeitet hybrid in zwei Stufen und wird ueber den Button `Attribute automatisch ausfuellen` im Attribute-Tab oder automatisch nach dem Kunzer-Laden gestartet - Letzteres nur, wenn `Attribute` im Abrufumfang angehakt ist (bis v0.1.45 lief sie nach jedem `Artikel anlegen`, auch bei reinem Bild-Umfang, und verursachte dabei KI-Kosten). Der KI-Nachlauf fuer Suchwoerter laeuft davon unabhaengig.
 
 **Stufe 1 - Regeln (immer aktiv, kostenlos):** Erkannt werden `Label: Wert`- und Tab-getrennte Zeilen aus Technische-Daten-Bloecken, z. B.:
 

@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.45"
+APP_VERSION = "0.1.46"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -16602,20 +16602,24 @@ if ($copied) {{
         # KI-Nachlauf vormerken (nur fuer diesen Artikel; ohne Key/Option laeuft nichts).
         self._search_term_ai_followup_article = article if self.search_term_ai_var.get() else ""
 
-    def _start_autofill_after_fetch(self) -> None:
+    def _start_autofill_after_fetch(self, scrape_options: dict[str, bool] | None = None) -> None:
         """Suchwoerter: Nachlauf 200 ms nach dem Kunzer-Laden (ersetzt den direkten
         Aufruf von _start_attribute_autofill in _apply_kunzer_result).
 
         1. Suchwoerter nachschreiben: bei reinem Medien-Umfang schreibt
            _apply_kunzer_result keine Suchwoerter; sonst ist der Bereich schon
            eingereiht und der Aufruf ein No-op (Fingerabdruck-Vergleich).
-        2. Attribut-Findung wie bisher starten.
-        3. Laeuft sie nicht an (kein Katalog, kein Text, anderer Hintergrund-
-           vorgang), den KI-Nachlauf fuer Suchwoerter direkt anstossen - sonst
-           folgt er am Ende von _finish_attribute_autofill.
+        2. Attribut-Findung starten - nur wenn 'Attribute' im Abrufumfang
+           angehakt ist (bis v0.1.45 lief sie nach jedem Abruf, auch bei reinem
+           Bild-Umfang, und verursachte dabei KI-Kosten).
+        3. Laeuft sie nicht an (nicht angehakt, kein Katalog, kein Text, anderer
+           Hintergrundvorgang), den KI-Nachlauf fuer Suchwoerter direkt anstossen -
+           sonst folgt er am Ende von _finish_attribute_autofill.
         """
         self._write_live_section("search_terms")
-        self._start_attribute_autofill(auto=True)
+        attributes_wanted = scrape_options.get("attributes", False) if scrape_options is not None else self.batch_attribute_var.get()
+        if attributes_wanted:
+            self._start_attribute_autofill(auto=True)
         if not self.background_task_running and self._search_term_ai_followup_article:
             self._start_search_term_autofill(auto=True)
 
@@ -18657,9 +18661,10 @@ if ($copied) {{
                 f"weil eine vorhandene Attributzeile ungültig ist:\n\n{attribute_warning}\n\n"
                 "Bitte im Tab 'Attribute' korrigieren; danach wird automatisch gespeichert.",
             )
-        # Nach dem Laden automatisch die Attribut-Findung starten (Regeln + KI).
-        # Suchwoerter: ueber den Wrapper, der danach den KI-Nachlauf fuer Suchwoerter anstoesst.
-        self.root.after(200, self._start_autofill_after_fetch)
+        # Nach dem Laden die Attribut-Findung starten (Regeln + KI), sofern im
+        # Abrufumfang angehakt. Suchwoerter: ueber den Wrapper, der danach den
+        # KI-Nachlauf fuer Suchwoerter anstoesst.
+        self.root.after(200, lambda: self._start_autofill_after_fetch(scrape_options))
 
     def _translate_loaded_texts(self) -> None:
         client = self._build_deepl_client()
