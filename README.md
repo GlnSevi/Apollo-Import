@@ -92,6 +92,8 @@ Wenn `DEEPL_API_KEY` gesetzt ist oder der Key in der GUI eingetragen wurde, koen
 
 Die GenArt wird nach dem Laden bewusst nicht automatisch gesetzt, sondern manuell ueber das GenArt-Suchfeld oder den Button `Suchen...` ausgewaehlt.
 
+Abrufergebnisse von kunzer.de werden innerhalb einer Programmsitzung zwischengespeichert (spart den zweiten Seitenaufruf, z. B. fuer die Attribut-Findung). Ein erneutes `Artikel anlegen` fuer denselben Artikel holt ab v0.1.45 trotzdem immer den aktuellen Shop-Stand (vorher kam bis zum Neustart das alte Ergebnis zurueck - ein im Shop nachtraeglich ergaenztes Bild wurde so nicht gefunden), und jeder Massenimport startet mit leerem Zwischenspeicher.
+
 ## Artikelverzeichnis
 
 Die bisherige reine Text-Vorschau wurde durch ein `Artikelverzeichnis` ersetzt. Dort werden nur Artikel aus den aktuellen Output-Dateien tabellarisch gelistet.

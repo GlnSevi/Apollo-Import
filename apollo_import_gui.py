@@ -112,7 +112,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.44"
+APP_VERSION = "0.1.45"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -5770,6 +5770,23 @@ class KunzerScraper:
 
         encoded = quote(normalized, safe=".-")
         return f"https://www.kunzer.de/shop/p/{encoded}"
+
+    def forget(self, article_number_or_url: str) -> None:
+        """Zwischengespeichertes Ergebnis eines Artikels verwerfen.
+
+        Der Zwischenspeicher haelt Ergebnisse fuer die gesamte Laufzeit; ein vom
+        Nutzer bewusst erneuter Abruf (z. B. nachdem im Shop ein Bild ergaenzt
+        wurde) muss trotzdem den aktuellen Shop-Stand holen.
+        """
+        value = article_number_or_url.strip()
+        key = normalize_article_number(value).casefold()
+        for url, cached in list(self._result_cache.items()):
+            if url == value or cached.product_url == value or normalize_article_number(cached.article_number).casefold() == key:
+                del self._result_cache[url]
+
+    def clear_cache(self) -> None:
+        """Alle zwischengespeicherten Ergebnisse verwerfen (Start eines Massenimports)."""
+        self._result_cache.clear()
 
     def scrape_product(self, article_number_or_url: str) -> KunzerScrapeResult:
         target_url = self.resolve_product_url(article_number_or_url)
@@ -18676,6 +18693,9 @@ if ($copied) {{
                 return
 
         def worker() -> tuple[KunzerScrapeResult, dict[str, str] | None, dict[str, str] | None]:
+            # Bewusster Abruf durch den Nutzer: immer den aktuellen Shop-Stand holen,
+            # nicht das in dieser Sitzung zwischengespeicherte Ergebnis.
+            self.kunzer_scraper.forget(identifier)
             result = self.kunzer_scraper.scrape_product(identifier)
             if deepl_client is None:
                 return result, None, None
@@ -19317,6 +19337,9 @@ if ($copied) {{
             def post(done: int, detail: str) -> None:
                 progress_queue.put(("progress", (done, total, detail, time.monotonic() - started_at)))
 
+            # Jeder Lauf holt den aktuellen Shop-Stand - der Zwischenspeicher dient nur
+            # den Wiederholungen innerhalb desselben Laufs.
+            self.kunzer_scraper.clear_cache()
             try:
                 for index, item in enumerate(items, start=1):
                     if cancel_event.is_set():
