@@ -29,6 +29,12 @@ import unicodedata
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Callable, Iterator, TypeVar
+
+# Laeuft diese Datei als Skript oder EXE, heisst das Modul '__main__'. Unter seinem
+# Dateinamen registriert, bekommt `import apollo_import_gui` (z. B. aus taf_sync)
+# dieses Modul, statt die ganze Datei ein zweites Mal auszufuehren (doppelte
+# Klassen, Sperren und Caches). Beim normalen Import ist das ein No-op.
+sys.modules.setdefault("apollo_import_gui", sys.modules[__name__])
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
@@ -112,7 +118,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.46"
+APP_VERSION = "0.1.47"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -13419,6 +13425,14 @@ class ApolloImportApp:
         self._closing = False
         self.article_browser_context_menu: tk.Menu | None = None
         self.background_task_running = False
+        # Zuletzt gewaehlter IMS-Exportordner (Startordner fuer den naechsten Dialog).
+        self._last_ims_export_dir = ""
+        # True, solange die IMS-Uebernahme die Output-Dateien abgleicht: Verzeichnis
+        # und Maske duerfen dann keinen halben Stand lesen (_refresh_article_browser).
+        self._ims_sync_running = False
+        # Maske nach der IMS-Uebernahme noch aus den Dateien fuellen, sobald das
+        # Verzeichnis neu gelesen werden konnte (_run_deferred_article_browser_reload).
+        self._ims_sync_mask_reload_pending = False
         self.pending_article_browser_selection = ""
         self.project_tab_compact_mode: bool | None = None
         self.article_browser_compact_mode: bool | None = None
@@ -13924,6 +13938,7 @@ class ApolloImportApp:
         worker: Callable[[], object],
         on_success: Callable[[object], None],
         error_status_prefix: str,
+        on_error: Callable[[Exception], None] | None = None,
     ) -> bool:
         if self.background_task_running:
             self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
@@ -13941,6 +13956,12 @@ class ApolloImportApp:
 
         def finish_error(exc: Exception) -> None:
             self._set_background_task_state(False)
+            if on_error is not None:
+                # Aufraeumen im UI-Thread (z. B. Zustand zuruecksetzen), bevor die Meldung blockiert.
+                try:
+                    on_error(exc)
+                except Exception:  # pragma: no cover - Aufraeumen darf die Fehlermeldung nicht verschlucken
+                    pass
             messagebox.showwarning(APP_TITLE, str(exc))
             self.status_var.set(f"{error_status_prefix}: {exc}")
 
@@ -14636,6 +14657,15 @@ class ApolloImportApp:
         if self._closing:
             return
         self._closing = True
+        # Nur solange der Abgleich selbst laeuft (nicht mehr beim Neuladen danach).
+        if self._ims_sync_running and self.background_task_running and not messagebox.askyesno(
+            APP_TITLE,
+            "Die IMS-Übernahme läuft noch. Trotzdem beenden?\n\n"
+            "Der Abgleich bricht dann mittendrin ab (jede Excel-Datei ist entweder fertig "
+            "oder unverändert, Bericht und Protokoll fehlen); die Sicherung liegt im Sicherungsordner.",
+        ):
+            self._closing = False
+            return
         try:
             completed = self._flush_live_writes(reason="Schließen: ")
             # Zuvor gescheiterte Bereiche (z. B. Datei war in Excel geoeffnet und ist
@@ -15621,6 +15651,9 @@ if ($copied) {{
             row=0, column=2, padx=(0, 8)
         )
         ttk.Button(browser_header, text="Liste aktualisieren", command=self.refresh_preview).grid(row=0, column=3)
+        ttk.Button(browser_header, text="IMS-Export übernehmen…", command=self._import_ims_export).grid(
+            row=0, column=4, padx=(8, 0)
+        )
 
         columns = ("article", "source", "short_id", "long_id", "genart", "attr", "oe", "comparison", "lists", "images", "documents", "videos", "links")
         self.browser_content_frame = ttk.Frame(browser_frame)
@@ -17328,10 +17361,12 @@ if ($copied) {{
         self._normalize_genart_selection()
 
     def _resolve_output_root(self) -> Path:
-        output_root = Path(self.output_dir_var.get().strip())
-        if not output_root:
+        # Vor dem Path-Bau pruefen: Path("") ist Path(".") und damit "wahr" - ein
+        # leerer Ausgabeordner lief frueher stillschweigend ins Arbeitsverzeichnis.
+        output_text = self.output_dir_var.get().strip()
+        if not output_text:
             raise ValueError("Bitte einen Ausgabeordner angeben.")
-        return output_root
+        return Path(output_text)
 
     @contextmanager
     def _suspend_live_write(self):
@@ -18014,6 +18049,11 @@ if ($copied) {{
         with perf_timer(perf_name):
             try:
                 output_root = self._resolve_output_root()
+            except ValueError as exc:
+                # Ohne Ausgabeordner kann nichts gespeichert werden - das soll man sehen.
+                self.status_var.set(f"Live-Speichern nicht möglich: {exc}")
+                return False
+            try:
                 bundle = self.collect_bundle()
             except ValueError:
                 return False
@@ -18254,6 +18294,12 @@ if ($copied) {{
         self._article_browser_reload_scheduled = False
         if self._article_browser_reload_pending and self.live_writer.is_idle():
             self._refresh_article_browser()
+            if self._ims_sync_mask_reload_pending and not self._article_browser_reload_pending:
+                # Nachgeholtes Neuladen nach der IMS-Uebernahme: jetzt auch die Maske
+                # aus den Dateien fuellen, sonst bliebe sie am alten Stand verankert
+                # und der naechste Fokuswechsel loeschte die ergaenzten Zeilen wieder.
+                self._ims_sync_mask_reload_pending = False
+                self._reload_restored_article_from_output()
 
     def _flush_live_writes(self, reason: str = "", timeout_seconds: float = LIVE_WRITE_FLUSH_TIMEOUT_SECONDS) -> bool:
         """Wartet mit laufender Oberflaeche, bis alle Live-Schreibauftraege fertig sind.
@@ -20062,15 +20108,18 @@ if ($copied) {{
     @perf_logged("_refresh_article_browser")
     def _refresh_article_browser(self) -> None:
         records: dict[str, StoredArticleSnapshot] = {}
-        output_folder = Path(self.output_dir_var.get().strip())
+        output_text = self.output_dir_var.get().strip()
+        output_folder = Path(output_text)
         signature: tuple[tuple[str, int, int], ...] = ()
 
-        if output_folder.exists():
-            if self.article_browser_cache_dir == str(output_folder) and not self.live_writer.is_idle():
-                # Der Hintergrund-Schreiber ist gerade an den Output-Dateien: die
-                # Ordner-Signatur ist absichtlich im Fluss, und eine halb
-                # geschriebene Excel-Datei darf nicht gelesen werden. Eintrag und
-                # Signatur zieht der Abschluss des Auftrags nach (_on_live_write_done).
+        # Leerer Ausgabeordner: Path("") waere "." und listete das Arbeitsverzeichnis.
+        if output_text and output_folder.exists():
+            if self._ims_sync_running or (self.article_browser_cache_dir == str(output_folder) and not self.live_writer.is_idle()):
+                # Der Hintergrund-Schreiber (oder die IMS-Uebernahme) ist gerade an
+                # den Output-Dateien: die Ordner-Signatur ist absichtlich im Fluss,
+                # und ein halb abgeglichener Ordner darf nicht gelesen werden. Eintrag
+                # und Signatur zieht der Abschluss des Auftrags nach
+                # (_on_live_write_done bzw. das Ende der IMS-Uebernahme).
                 if self.article_browser_cache_signature is None:
                     # Ein Neuladen wurde angefordert (Katalog/KTyp), kann jetzt aber
                     # nicht ausgefuehrt werden: Wunsch merken, der Auftrags-Abschluss
@@ -20266,6 +20315,10 @@ if ($copied) {{
 
     @perf_logged("load_selected_article_from_browser")
     def load_selected_article_from_browser(self) -> None:
+        if self._ims_sync_running:
+            # Die Dateien werden gerade abgeglichen: ein halber Stand darf nicht in die Maske.
+            self.status_var.set("IMS-Übernahme läuft noch - bitte danach aus dem Verzeichnis laden.")
+            return
         selection = self.article_browser_tree.selection()
         if not selection:
             messagebox.showwarning(APP_TITLE, "Bitte zuerst einen Artikel im Verzeichnis auswählen.")
@@ -20633,6 +20686,200 @@ if ($copied) {{
             self._ensure_ids_for_article(current_article)
         self._refresh_article_browser()
 
+    def _ims_sync_catalogs(self) -> dict[str, str]:
+        """Katalogpfade aus den Einstellungen (nicht die Modul-Standardwerte)."""
+        return {
+            "genart_catalog_path": self.genart_source_path_var.get().strip(),
+            "attribute_catalog_path": self.attribute_source_path_var.get().strip(),
+            "competitor_catalog_path": self.competitor_source_path_var.get().strip(),
+            "vehicle_catalog_path": self.vehicle_source_path_var.get().strip(),
+        }
+
+    def _unsaved_live_sections(self) -> list[str]:
+        """Bereiche des geladenen Artikels, deren Maskenstand nicht in den Output-Dateien steht.
+
+        Nach Schreiben + Flush bleibt so etwas nur nach einem fachlichen Fehler
+        (z. B. OE-Zeile ohne Hersteller), einer in Excel gesperrten Datei oder
+        bei einem noch nie gespeicherten Entwurf zurueck. Die Maske wird nach der
+        IMS-Uebernahme aus den Dateien neu gefuellt und wuerde solche Bereiche
+        sonst verwerfen.
+        """
+        article_number = normalize_article_number(self.article_number_var.get())
+        if not article_number:
+            return []
+        # Ein Artikel, der nach Schreiben + Flush nicht im Verzeichnis steht, ist ein
+        # ungespeicherter Entwurf (z. B. fachlicher Fehler): fuer ihn sind alle
+        # gespeicherten Fingerabdruecke None, also gilt jeder Bereich als offen -
+        # kommt er aus dem Export dazu, wuerde das Neuladen ihn sonst ueberschreiben.
+        try:
+            bundle = self.collect_bundle()
+        except ValueError:
+            return list(LIVE_SECTIONS)
+        expected: dict[str, str | None] = dict(self._live_saved_fingerprints(article_number, set(LIVE_SECTIONS)))
+        expected.update(self.live_writer.completed_fingerprints(article_number))
+        expected.update(self.live_writer.expected_fingerprints(article_number))
+        unsaved = {section for section in LIVE_SECTIONS if expected.get(section) != live_section_fingerprint(bundle, section)[0]}
+        unsaved |= self._live_failed_sections.get(article_number, set())
+        return [section for section in LIVE_SECTIONS if section in unsaved]
+
+    def _prepare_output_for_ims_sync(self) -> bool:
+        """Schreibt offene Aenderungen der Maske, leert die Warteschlange und prueft,
+        dass nichts Ungespeichertes zurueckbleibt. Rueckgabe False mit Meldung, wenn
+        die Uebernahme nicht starten darf."""
+        self._write_live_database()
+        if not self._flush_live_writes(reason="IMS-Übernahme: "):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Noch nicht gespeicherte Änderungen konnten nicht geschrieben werden.\n\n"
+                "Bitte kurz warten und erneut versuchen.",
+            )
+            return False
+        unsaved = self._unsaved_live_sections()
+        if unsaved:
+            article_number = normalize_article_number(self.article_number_var.get())
+            if article_number not in self.article_browser_records:
+                detail = (
+                    f"Der Artikel {article_number} in der Maske ist noch nicht gespeichert.\n\n"
+                    "Bitte zuerst speichern (Fehler siehe Statuszeile) oder die Artikelnummer leeren"
+                )
+            else:
+                detail = (
+                    "Die Maske hat noch nicht gespeicherte Bereiche: "
+                    f"{format_live_section_labels(unsaved)}\n\n"
+                    "Bitte zuerst korrigieren bzw. speichern (siehe Statuszeile)"
+                )
+            messagebox.showwarning(
+                APP_TITLE,
+                f"{detail} und die IMS-Übernahme dann erneut starten - sonst würde das "
+                "Neuladen der Maske aus den Dateien diesen Stand verwerfen.",
+            )
+            return False
+        return True
+
+    def _import_ims_export(self) -> None:
+        """Button 'IMS-Export übernehmen…' im Artikelverzeichnis.
+
+        Liest einen kompletten Apollo-IMS-Export (TAF 2.7) und ergaenzt die
+        Output-Dateien: die GUI gewinnt je Artikel und Datei, Abweichungen landen
+        nur im Bericht. Sicherung, Abgleich und Bericht laufen im Hintergrund
+        unter der Schreibsperre; solange ist das Laden aus dem Verzeichnis
+        gesperrt, danach werden Verzeichnis und Maske neu geladen.
+        """
+        if self.background_task_running or self.batch_import_running or self._ims_sync_running:
+            self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
+            return
+        try:
+            output_root = self._resolve_output_root()
+            if not output_root.is_dir():
+                raise ValueError(f"Der Ausgabeordner wurde nicht gefunden:\n{output_root}")
+            backup_dir = ims_sync_backup_dir(output_root)
+            catalogs = self._ims_sync_catalogs()
+            check_ims_sync_catalogs(catalogs)
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        initial_dir = self._last_ims_export_dir or str(output_root.parent)
+        selected = filedialog.askdirectory(title="IMS-Export (TAF 2.7) wählen", initialdir=initial_dir, mustexist=True)
+        if not selected:
+            return
+        export_dir = Path(selected)
+        if export_dir.name == IMS_SYNC_DATA_SUPPLIER and is_ims_export_dir(export_dir.parent):
+            # Der Datenordner 0757 selbst wurde gewaehlt: die Medien-Zips liegen daneben.
+            export_dir = export_dir.parent
+        if not is_ims_export_dir(export_dir):
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Der gewählte Ordner ist kein IMS-Export:\n{export_dir}\n\n"
+                f"Erwartet wird der Exportordner mit dem Unterordner {IMS_SYNC_DATA_SUPPLIER} (200.dat, 030.dat, …).",
+            )
+            return
+        if not messagebox.askokcancel(
+            APP_TITLE,
+            f"IMS-Export übernehmen?\n\nExport:\n{export_dir}\n\nAusgabeordner:\n{output_root}\n\n"
+            "Regel: Die GUI gewinnt je Artikel und Datei. Vorhandene Einträge bleiben unverändert, "
+            "nur in der GUI fehlende Artikel bzw. Bereiche kommen aus dem Export dazu. "
+            "Abweichungen werden im Bericht aufgelistet. Einzige Änderung an vorhandenen "
+            "Einträgen: fehlende Text-Modul-IDs werden ergänzt (im Bericht unter Hinweise).\n\n"
+            f"Vorher werden alle Output-Dateien gesichert nach:\n{backup_dir}",
+        ):
+            return
+        # Offene Aenderungen der Maske zuerst schreiben und die Warteschlange leeren:
+        # ein noch wartender Auftrag darf die gleich ergaenzten Dateien nicht ueberholen,
+        # und die Maske wird danach aus den Dateien neu gefuellt.
+        if not self._prepare_output_for_ims_sync():
+            return
+        if self.background_task_running or self.batch_import_running:
+            # Waehrend der Dialoge/des Wartens wurde etwas anderes gestartet.
+            messagebox.showwarning(APP_TITLE, "Inzwischen läuft ein anderer Hintergrundvorgang. Bitte danach erneut starten.")
+            return
+        self._ims_sync_running = True
+        self._ims_sync_mask_reload_pending = False
+
+        def worker() -> ImsSyncResult:
+            # Schreibsperre im Arbeits-Thread nehmen und dort wieder freigeben (RLock);
+            # Live-Auftraege, die waehrenddessen entstehen, warten auf die Sperre.
+            with WORKBOOK_WRITE_LOCK:
+                return sync_ims_export_into_output(export_dir, output_root, catalogs=catalogs)
+
+        def reload_from_output() -> None:
+            # Neue Text-Modul-IDs aus dem Export kennen (keine Doppelvergabe), dann
+            # Verzeichnis und Maske aus den geaenderten Dateien neu laden (wie beim
+            # Programmstart). Die Maske muss immer nachgezogen werden: bliebe sie am
+            # alten Verzeichnis-Eintrag verankert, gaelten die gerade ergaenzten
+            # Zeilen beim naechsten Fokuswechsel als geloescht und wuerden entfernt.
+            self._ims_sync_mask_reload_pending = False
+            total_count, _warnings = self.id_registry.load_from_folder(output_root, clear_existing=False)
+            self.known_id_count_var.set(f"{total_count} IDs geladen")
+            self._article_browser_reload_pending = True
+            self.refresh_preview()
+            if self._article_browser_reload_pending:
+                # Verzeichnis konnte noch nicht gelesen werden (Live-Auftrag laeuft):
+                # das nachgeholte Neuladen fuellt dann auch die Maske.
+                self._ims_sync_mask_reload_pending = True
+                self.status_var.set("IMS-Export übernommen - Maske wird nach dem laufenden Speichern neu geladen.")
+            else:
+                self._reload_restored_article_from_output()
+
+        def on_success(result: object) -> None:
+            try:
+                if not isinstance(result, ImsSyncResult):
+                    return
+                self._last_ims_export_dir = str(export_dir)
+                self.status_var.set(
+                    f"IMS-Export übernommen: {result.appended_rows} Zeilen ergänzt, "
+                    f"{result.conflicts} Abweichungen im Bericht ({result.duration_seconds:.1f} s)."
+                )
+                messagebox.showinfo(APP_TITLE, result.dialog_text())
+                # Waehrend der Uebernahme eingereihte Live-Auftraege zuerst abschliessen
+                # (Flag bleibt solange gesetzt: kein zweiter Start, kein Laden aus dem
+                # Verzeichnis); ein Zeitueberlauf ist kein Fehler, dann laedt das
+                # nachgeholte Neuladen die Maske.
+                self._flush_live_writes(reason="IMS-Übernahme: ")
+            finally:
+                self._ims_sync_running = False
+            try:
+                reload_from_output()
+            except Exception as exc:  # pragma: no cover - Uebernahme ist fertig, nur das Neuladen scheiterte
+                self.status_var.set(f"IMS-Export übernommen, Neuladen fehlgeschlagen: {exc} - Artikel bitte aus dem Verzeichnis neu laden.")
+
+        def on_error(_exc: Exception) -> None:
+            self._ims_sync_running = False
+            # Teilweise ergaenzte Dateien: neue IDs kennen, Verzeichnis und Maske neu lesen.
+            try:
+                reload_from_output()
+            except Exception:
+                pass
+
+        if not self._run_background_task(
+            "IMS-Export wird übernommen … (Sicherung, Abgleich, Bericht)",
+            worker,
+            on_success,
+            "IMS-Übernahme fehlgeschlagen",
+            on_error=on_error,
+        ):
+            self._ims_sync_running = False
+            messagebox.showwarning(APP_TITLE, "Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten und erneut starten.")
+
     def export_current_bundle(self) -> bool:
         try:
             bundle = self.collect_bundle()
@@ -20676,7 +20923,302 @@ if ($copied) {{
         return True
 
 
+# ---------------------------------------------------------------------------
+# IMS-Export (TAF 2.7) in die Output-Dateien uebernehmen
+# ---------------------------------------------------------------------------
+
+IMS_SYNC_BACKUP_SUFFIX = "-Sicherungen"
+IMS_SYNC_REPORT_PREFIX = "TAF-Sync-Bericht_"
+IMS_SYNC_LOG_PREFIX = "TAF-Sync-Protokoll_"
+IMS_SYNC_DATA_SUPPLIER = "0757"
+IMS_SYNC_CLI_FLAG = "--ims-sync"
+
+
+IMS_SYNC_CATALOG_LABELS = {
+    "genart_catalog_path": "GenArt-Katalog (Genarten.xlsx)",
+    "attribute_catalog_path": "Attribut-Katalog (Attribute alle.xlsx)",
+    "competitor_catalog_path": "Hersteller-/Mitbewerber-Katalog (KHer.csv)",
+    "vehicle_catalog_path": "KTyp-Katalog (KTyp.xlsx)",
+}
+
+
+def ims_sync_backup_dir(output_dir: Path | str) -> Path:
+    """Sicherungsordner neben dem Ausgabeordner (G:\\Apollo\\GUI -> G:\\Apollo\\GUI-Sicherungen)."""
+    output_dir = Path(output_dir)
+    if not output_dir.name:
+        # Laufwerks- oder Freigabewurzel (G:\, \\server\share): kein Nachbarordner moeglich.
+        raise ValueError(f"Der Ausgabeordner darf keine Laufwerks- oder Freigabewurzel sein: {output_dir}")
+    return output_dir.parent / f"{output_dir.name}{IMS_SYNC_BACKUP_SUFFIX}"
+
+
+def default_ims_sync_catalogs() -> dict[str, Path]:
+    """Katalogpfade fuer die Kommandozeile (die GUI uebergibt ihre Einstellungen)."""
+    return {
+        "genart_catalog_path": DEFAULT_GENART_SOURCE,
+        "attribute_catalog_path": DEFAULT_ATTRIBUTE_SOURCE,
+        "competitor_catalog_path": DEFAULT_COMPETITOR_SOURCE,
+        "vehicle_catalog_path": DEFAULT_VEHICLE_SOURCE,
+    }
+
+
+def check_ims_sync_catalogs(catalogs: dict[str, Path | str | None]) -> None:
+    """Bricht vor Sicherung und Abgleich ab, wenn ein Katalog fehlt.
+
+    taf_sync wuerde sonst nur einen Hinweis schreiben und z. B. ohne KHer.csv alle
+    Referenznummern als OE-Nummern anlegen - und weil die GUI je Artikel gewinnt,
+    liesse sich das mit einem zweiten Lauf nicht mehr reparieren.
+    """
+    unknown = sorted(set(catalogs) - set(IMS_SYNC_CATALOG_LABELS))
+    if unknown:
+        raise ValueError(f"Unbekannte Katalog-Schluessel: {', '.join(unknown)}")
+    missing_keys = sorted(set(IMS_SYNC_CATALOG_LABELS) - set(catalogs))
+    if missing_keys:
+        raise ValueError(f"Katalog nicht angegeben: {', '.join(IMS_SYNC_CATALOG_LABELS[key] for key in missing_keys)}")
+
+    def is_file(path: Path | str | None) -> bool:
+        if not path:
+            return False
+        try:
+            return Path(path).is_file()
+        except OSError:
+            return False
+
+    missing = [
+        f"{IMS_SYNC_CATALOG_LABELS[key]}: {path or '(nicht konfiguriert)'}"
+        for key, path in catalogs.items()
+        if not is_file(path)
+    ]
+    if missing:
+        raise ValueError("Katalog fehlt - IMS-Übernahme nicht gestartet:\n" + "\n".join(missing))
+
+
+def _unique_ims_sync_stamp(backup_dir: Path, stamp: str) -> str:
+    """Haengt -2, -3 ... an, wenn der Sicherungsordner schon einen Lauf mit diesem Stempel hat."""
+    candidate = stamp
+    counter = 1
+    while (backup_dir / f"{IMS_SYNC_LOG_PREFIX}{candidate}.txt").exists() or (
+        backup_dir / f"{IMS_SYNC_REPORT_PREFIX}{candidate}.xlsx"
+    ).exists():
+        counter += 1
+        candidate = f"{stamp}-{counter}"
+    return candidate
+
+
+def is_ims_export_dir(folder: Path | str) -> bool:
+    """True, wenn der Ordner ein TAF-Export ist (Unterordner 0757 mit 200.dat oder direkt 200.dat)."""
+    folder = Path(folder)
+    return (folder / IMS_SYNC_DATA_SUPPLIER / "200.dat").is_file() or (folder / "200.dat").is_file()
+
+
+def backup_output_files(output_dir: Path | str, backup_dir: Path | str, stamp: str) -> list[Path]:
+    """Kopiert alle Excel-Dateien des Ausgabeordners als <Name>_Sicherung_<Stempel>.xlsx in den Sicherungsordner."""
+    import shutil
+
+    output_dir = Path(output_dir)
+    backup_dir = Path(backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for source in sorted(output_dir.glob("*.xlsx")):
+        if source.name.startswith("~$"):
+            # Excel-Sperrdatei einer gerade geoeffneten Mappe
+            continue
+        target = backup_dir / f"{source.stem}_Sicherung_{stamp}{source.suffix}"
+        shutil.copy2(source, target)
+        copied.append(target)
+    return copied
+
+
+@dataclass
+class ImsSyncResult:
+    export_dir: Path
+    output_dir: Path
+    backup_dir: Path
+    backup_files: list[Path]
+    report_path: Path
+    log_path: Path
+    summary_lines: list[str]
+    export_articles: int
+    appended_rows: int
+    conflicts: int
+    identical_conflicts: int
+    hints: int
+    duration_seconds: float
+
+    def dialog_text(self) -> str:
+        return (
+            "IMS-Export übernommen.\n\n"
+            f"Export: {self.export_dir}\n"
+            f"Artikel im Export: {self.export_articles}\n"
+            f"Ausgabeordner: {self.output_dir}\n\n"
+            f"Ergänzt: {self.appended_rows} Zeilen aus dem Export\n"
+            f"Abweichungen (GUI behalten): {self.conflicts}, davon inhaltsgleich {self.identical_conflicts}\n"
+            f"Hinweise: {self.hints}\n\n"
+            f"Sicherung: {len(self.backup_files)} Dateien in\n{self.backup_dir}\n"
+            f"Bericht: {self.report_path.name}\n"
+            f"Laufzeit: {self.duration_seconds:.1f} s"
+        )
+
+
+def _load_taf_sync_module():
+    """Laedt taf_sync (liegt neben dieser Datei bzw. im EXE-Bundle).
+
+    taf_sync importiert apollo_import_gui zurueck; dass es dabei dieses Modul
+    bekommt und die Datei nicht ein zweites Mal ausfuehrt, stellt die
+    sys.modules-Registrierung am Dateianfang sicher.
+    """
+    try:
+        import taf_sync
+    except ModuleNotFoundError:
+        # Skriptstart im isolierten Modus (python -I): der Skriptordner liegt
+        # dann nicht auf sys.path - das Nachbarmodul von Hand auffindbar machen.
+        module_dir = str(Path(__file__).resolve().parent)
+        if module_dir not in sys.path:
+            sys.path.insert(0, module_dir)
+        import taf_sync
+
+    return taf_sync
+
+
+def sync_ims_export_into_output(
+    export_dir: Path | str,
+    output_dir: Path | str,
+    *,
+    media: bool = True,
+    stamp: str | None = None,
+    backup_dir: Path | str | None = None,
+    catalogs: dict[str, Path | str | None] | None = None,
+) -> ImsSyncResult:
+    """Uebernimmt einen IMS-TAF-Export in die Output-Dateien der GUI.
+
+    Regel: die GUI gewinnt je Artikel und Datei - vorhandene Zeilen bleiben
+    unveraendert (nur leere Text-Modul-IDs werden gefuellt), nur in der GUI
+    fehlende Artikel bzw. Bereiche kommen aus dem Export dazu. Vorher werden
+    alle Excel-Dateien des Ausgabeordners in den Sicherungsordner kopiert; dort
+    entstehen auch der Excel-Bericht (Konflikte, Hinweise) und ein Textprotokoll.
+    catalogs: Pfade wie in den Einstellungen (Schluessel siehe
+    IMS_SYNC_CATALOG_LABELS), sonst die Modul-Standardpfade; ein fehlender
+    Katalog bricht vor der Sicherung ab. Der Aufrufer haelt WORKBOOK_WRITE_LOCK
+    und sorgt dafuer, dass keine Live-Auftraege mehr warten.
+    """
+    started = time.perf_counter()
+    export_dir = Path(export_dir)
+    output_dir = Path(output_dir)
+    if not is_ims_export_dir(export_dir):
+        raise ValueError(f"Kein IMS-Export (Unterordner {IMS_SYNC_DATA_SUPPLIER} mit 200.dat fehlt): {export_dir}")
+    if not output_dir.is_dir():
+        raise ValueError(f"Ausgabeordner nicht gefunden: {output_dir}")
+    catalog_paths = dict(catalogs) if catalogs is not None else dict(default_ims_sync_catalogs())
+    check_ims_sync_catalogs(catalog_paths)
+    locked = sorted(path.name[2:] for path in output_dir.glob("~$*.xlsx"))
+    if locked:
+        # Eine in Excel geoeffnete Mappe liesse den Abgleich mittendrin scheitern.
+        raise ValueError(
+            "Diese Output-Dateien sind in Excel geöffnet (oder eine Sperrdatei ~$… ist liegen geblieben): "
+            + ", ".join(locked)
+            + "\nBitte schließen bzw. die Sperrdatei löschen und die Übernahme erneut starten."
+        )
+    taf_sync = _load_taf_sync_module()
+    now = datetime.now()
+    backup_dir = Path(backup_dir) if backup_dir is not None else ims_sync_backup_dir(output_dir)
+    stamp = _unique_ims_sync_stamp(backup_dir, stamp or now.strftime("%Y%m%d-%H%M%S"))
+    # Erst lesen, dann sichern: ein unlesbarer Export soll keine Sicherung hinterlassen.
+    export = taf_sync.read_taf_export(export_dir)
+    backup_files = backup_output_files(output_dir, backup_dir, stamp)
+    report_path = backup_dir / f"{IMS_SYNC_REPORT_PREFIX}{stamp}.xlsx"
+    try:
+        report = taf_sync.merge_taf_into_output(
+            export,
+            output_dir,
+            media=media,
+            written_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+            report_path=report_path,
+            **{key: Path(value) for key, value in catalog_paths.items() if value},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"{exc}\n\nDie Output-Dateien können teilweise geändert sein. "
+            f"Die Sicherung mit Stempel {stamp} liegt in:\n{backup_dir}"
+        ) from exc
+    summary_lines = [
+        f"Export gelesen: {len(export.articles)} Artikel, "
+        + ", ".join(f"{table}={count}" for table, count in export.record_counts.items()),
+        f"Sicherung: {len(backup_files)} Dateien nach {backup_dir} (Stempel {stamp})",
+        *report.summary_lines(),
+    ]
+    log_path = backup_dir / f"{IMS_SYNC_LOG_PREFIX}{stamp}.txt"
+    log_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    return ImsSyncResult(
+        export_dir=export_dir,
+        output_dir=output_dir,
+        backup_dir=backup_dir,
+        backup_files=backup_files,
+        report_path=report_path,
+        log_path=log_path,
+        summary_lines=summary_lines,
+        export_articles=len(export.articles),
+        appended_rows=sum(stats.appended for stats in report.files.values()),
+        conflicts=len(report.conflicts),
+        identical_conflicts=sum(1 for conflict in report.conflicts if conflict.identical),
+        hints=len(report.hints),
+        duration_seconds=time.perf_counter() - started,
+    )
+
+
+def run_ims_sync_cli(argv: list[str]) -> int:
+    """Kommandozeile ohne Oberflaeche: --ims-sync <Exportordner> <Ausgabeordner> [--no-media].
+
+    Macht dasselbe wie der Button in der GUI (Sicherung, Abgleich, Bericht,
+    Protokoll); die Zusammenfassung landet auf der Konsole und im Protokoll des
+    Sicherungsordners (die EXE hat keine Konsole).
+    """
+    positional = [argument for argument in argv if not argument.startswith("--")]
+    options = {argument for argument in argv if argument.startswith("--")}
+    if sys.stdout is not None:
+        # Pfade und Umlaute duerfen auf einer cp1252-Konsole keinen Traceback ausloesen.
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    def fail(code: int, message: str) -> int:
+        print(message)
+        if sys.stdout is None:
+            # Fenster-EXE ohne Konsole: die Meldung waere sonst unsichtbar.
+            _write_ims_sync_error_file(message, positional[1] if len(positional) > 1 else None)
+        return code
+
+    if len(positional) != 2 or options - {"--no-media"}:
+        return fail(2, f"Aufruf: {IMS_SYNC_CLI_FLAG} <Exportordner> <Ausgabeordner> [--no-media]")
+    try:
+        with WORKBOOK_WRITE_LOCK:
+            result = sync_ims_export_into_output(positional[0], positional[1], media="--no-media" not in options)
+    except Exception as exc:
+        return fail(1, f"IMS-Übernahme fehlgeschlagen: {exc}")
+    for line in result.summary_lines:
+        print(line)
+    return 0
+
+
+def _write_ims_sync_error_file(message: str, output_dir: str | None) -> None:
+    """Schreibt eine CLI-Fehlermeldung als TAF-Sync-Fehler_<Stempel>.txt in den
+    Sicherungsordner (sonst ins Arbeitsverzeichnis); darf selbst nie scheitern."""
+    try:
+        target_dir = Path.cwd()
+        if output_dir:
+            try:
+                target_dir = ims_sync_backup_dir(Path(output_dir))
+            except ValueError:
+                pass
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        (target_dir / f"TAF-Sync-Fehler_{stamp}.txt").write_text(message + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == IMS_SYNC_CLI_FLAG:
+        sys.exit(run_ims_sync_cli(sys.argv[2:]))
     root = tk.Tk()
     app = ApolloImportApp(root)
     root.mainloop()

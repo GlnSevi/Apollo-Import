@@ -6,3 +6,4 @@ apollo_import_perf.log*
 build/
 dist/
 .claude/settings.local.json
+output-Sicherungen/
