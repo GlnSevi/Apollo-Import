@@ -118,7 +118,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.48"
+APP_VERSION = "0.1.49"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -184,6 +184,11 @@ DEFAULT_BRAND_NAME = "KUNZER"
 # Dieselmotor 10-40 bar' steckt der Messbereich sonst nirgends.
 AI_MIN_TEXT_LENGTH = 200
 AI_SHORT_TEXT_MIN_LENGTH = 15
+# Massenimport: so lange wartet die App auf einen KI-Batch der Anthropic Batch
+# API. Danach wird der Batch NICHT abgebrochen (er laeuft bei Anthropic weiter
+# und ist bezahlt), sondern als offen gemeldet - die Ergebnisse koennen spaeter
+# ueber 'KI-Batch abholen' eingesammelt werden (KI_BATCH_RESUME_FILE).
+AI_BATCH_WAIT_TIMEOUT_SECONDS = 2 * 3600
 # GS1-Basisnummer der Kunzer GmbH: EAN mit diesem Praefix = Kunzer-Eigenartikel.
 KUNZER_EAN_PREFIX = "4260174"
 # Kanonische Namen = 'Product Brand Name' in Apollo - genau diese Schreibweise
@@ -310,6 +315,11 @@ LOOKUP_TEXT_REPLACEMENTS = (
 )
 ATTRIBUTE_KEY_VALUE_FORMAT_KEYS = {"schluesselwert"}
 SESSION_STATE_FILE = Path.cwd() / "apollo_import_gui_state.json"
+# Sicherung eines offenen KI-Batches (Massenimport): die gesammelten KI-Anfragen
+# samt Artikeldaten und die Batch-IDs bei Anthropic. Wird vor dem Einreichen
+# geschrieben und erst geloescht, wenn alle Artikel finalisiert sind - so gehen
+# die Ergebnisse bei Timeout, Absturz oder Neustart nicht verloren.
+KI_BATCH_RESUME_FILE = Path.cwd() / "apollo_import_ki_batch.pkl"
 APP_ICON_PNG_RELATIVE_PATH = Path("assets") / "apollo_import_logo.png"
 APP_ICON_ICO_RELATIVE_PATH = Path("assets") / "apollo_import_logo.ico"
 GITHUB_REPO_FULL_NAME = "GlnSevi/Apollo-Import"
@@ -3402,6 +3412,49 @@ def _read_catalog_cache(cache_path: Path, header: dict[str, object]) -> object |
         return None
 
 
+def write_ki_batch_resume_file(payload: dict[str, object]) -> None:
+    """Sicherung eines offenen KI-Batches atomar schreiben (erst .tmp, dann umbenennen).
+
+    payload: entries (die pending_ai-Eintraege des Massenimports), chunks
+    (je eingereichtem Batch: batch_id + Schluessel), options, output_root,
+    run_label, created_at, model, template_ids, reference_article.
+    """
+    tmp_path = KI_BATCH_RESUME_FILE.with_suffix(".tmp")
+    try:
+        with open(tmp_path, "wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, KI_BATCH_RESUME_FILE)
+    except BaseException:
+        # Halbe Datei (Pickle-Fehler, Platte voll) nicht neben der EXE liegen lassen.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def load_ki_batch_resume_file() -> dict[str, object] | None:
+    """Sicherung eines offenen KI-Batches lesen; None bei fehlender oder unlesbarer Datei."""
+    try:
+        with open(KI_BATCH_RESUME_FILE, "rb") as handle:
+            # Gleiche Klassenaufloesung wie beim Katalog-Cache (__main__ vs. Importname).
+            payload = _CatalogCacheUnpickler(handle).load()
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        return None
+    return payload
+
+
+def delete_ki_batch_resume_file() -> None:
+    """Sicherung eines offenen KI-Batches entfernen (fehlende Datei ist kein Fehler)."""
+    for path in (KI_BATCH_RESUME_FILE, KI_BATCH_RESUME_FILE.with_suffix(".tmp")):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _write_catalog_cache(cache_path: Path, header: dict[str, object], payload: object) -> bool:
     """Schreibt Kopf und Daten atomar (Temp-Datei + os.replace); Fehler werden geschluckt."""
     temp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
@@ -3965,12 +4018,28 @@ PDF_TEXT_MAX_PAGES = 10
 PDF_TEXT_MAX_CHARS = 15000
 
 
+def pdf_page_mentions_article(page_text: str, article_number: str) -> bool:
+    """True, wenn die Artikelnummer (ohne Leerzeichen, Gross/Klein egal) im Seitentext vorkommt."""
+    needle = re.sub(r"\s+", "", str(article_number or "")).upper()
+    if len(needle) < 3:
+        return False
+    return needle in re.sub(r"\s+", "", page_text).upper()
+
+
 def extract_pdf_text(
     source: str | Path,
     max_pages: int = PDF_TEXT_MAX_PAGES,
     max_chars: int = PDF_TEXT_MAX_CHARS,
+    article_number: str = "",
 ) -> str:
     """Liest Text aus einem PDF (lokaler Pfad oder URL) für die Attribut-Findung.
+
+    Mit article_number werden bei mehrseitigen PDFs nur die Seiten verwendet, auf
+    denen die Artikelnummer steht; steht sie auf keiner Seite, wird das PDF
+    ignoriert. Anlass: die WES-Broschüre hängt an jedem WES-Artikel, und die
+    Attribut-Findung übernahm daraus die Werte fremder Produkte (Kabellänge des
+    Adapters, Länge von Modul 1) für 54 Artikel. Einseitige PDFs (Datenblätter)
+    gelten immer als artikelbezogen.
 
     Gescannte PDFs ohne Textebene liefern einen leeren String. Fehler beim Laden
     oder Parsen werden bewusst geschluckt, damit die Attribut-Findung nie an
@@ -3991,9 +4060,12 @@ def extract_pdf_text(
         try:
             parts: list[str] = []
             total = 0
+            restrict_to_article = bool(str(article_number or "").strip()) and len(document) > 1
             for page_index in range(min(len(document), max_pages)):
                 page_text = document[page_index].get_text().strip()
                 if not page_text:
+                    continue
+                if restrict_to_article and not pdf_page_mentions_article(page_text, article_number):
                     continue
                 parts.append(page_text)
                 total += len(page_text)
@@ -5285,6 +5357,35 @@ class ClaudeExtractionError(RuntimeError):
     pass
 
 
+class ClaudeBatchPendingError(ClaudeExtractionError):
+    """Ein KI-Batch war nach der Wartezeit noch nicht fertig.
+
+    Der Batch laeuft bei Anthropic weiter (nicht abgebrochen); batch_id und die
+    Schluessel der betroffenen Anfragen erlauben das spaetere Abholen.
+    timed_out=False: der Batch existiert bei Anthropic, konnte aber nicht
+    abgefragt werden (Key ungueltig, keine Verbindung) - ebenfalls kein Grund,
+    ihn fuer die App aufzugeben.
+    """
+
+    def __init__(self, message: str, batch_id: str, keys: list[str], timed_out: bool = True) -> None:
+        super().__init__(message)
+        self.batch_id = batch_id
+        self.keys = list(keys)
+        self.timed_out = timed_out
+
+
+def format_wait_duration(seconds: float) -> str:
+    """Wartezeit fuer Anzeigen: '45 s', '12 min', '2 h' oder '2 h 30 min'."""
+    total = max(int(seconds), 0)
+    if total >= 3600:
+        hours, rest = divmod(total, 3600)
+        minutes = rest // 60
+        return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+    if total >= 60:
+        return f"{total // 60} min"
+    return f"{total} s"
+
+
 class ClaudeAttributeClient:
     """Ruft die Claude API (Anthropic) für die Attribut-Extraktion auf.
 
@@ -5446,12 +5547,24 @@ class ClaudeAttributeClient:
         progress: Callable[[str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         chunk_size: int = 300,
+        on_submitted: Callable[[int, str, list[str]], None] | None = None,
+        existing_batch_ids: list[str] | None = None,
     ) -> dict[str, list[dict[str, object]] | ClaudeExtractionError]:
         """Viele Extraktionen über die Anthropic Batch API (50 % Rabatt, gleiche Qualität).
 
         requests: Liste aus (Schlüssel, User-Message). Rückgabe je Schlüssel
         entweder die Extraktionsliste oder ein ClaudeExtractionError. Ein
         Abbruch über cancel_check füllt offene Schlüssel mit Abbruch-Fehlern.
+
+        on_submitted(chunk_index, batch_id, keys) wird direkt nach dem Einreichen
+        eines Batches gerufen (Sicherung fuer das spaetere Abholen).
+        existing_batch_ids: je Chunk eine bereits eingereichte Batch-ID (oder
+        ''): dann wird der Batch abgeholt statt neu eingereicht.
+        Ist ein Batch nach AI_BATCH_WAIT_TIMEOUT_SECONDS noch nicht fertig, wird
+        er NICHT abgebrochen, sondern als ClaudeBatchPendingError (Batch-ID +
+        Schluessel des Chunks) gemeldet - der Aufrufer holt ihn spaeter ab.
+        Dasselbe gilt (timed_out=False), wenn ein bereits existierender Batch
+        wegen Key- oder Verbindungsfehler nicht abgefragt werden kann.
         """
         anthropic = _get_anthropic()
         if anthropic is None:
@@ -5462,7 +5575,18 @@ class ClaudeAttributeClient:
         results: dict[str, list[dict[str, object]] | ClaudeExtractionError] = {}
         chunks = [requests[start : start + chunk_size] for start in range(0, len(requests), chunk_size)]
         for chunk_index, chunk in enumerate(chunks, start=1):
+            chunk_keys = [key for key, _message in chunk]
+            existing_id = ""
+            if existing_batch_ids and chunk_index <= len(existing_batch_ids):
+                existing_id = str(existing_batch_ids[chunk_index - 1] or "").strip()
             if cancel_check is not None and cancel_check():
+                if existing_id:
+                    # Abbruch beim Abholen: den schon eingereichten Batch auch bei
+                    # Anthropic stornieren, sonst liefe er bezahlt und unabgeholt weiter.
+                    try:
+                        client.messages.batches.cancel(existing_id)
+                    except Exception:
+                        pass
                 for key, _message in chunk:
                     results[key] = ClaudeExtractionError("Abgebrochen - Anfrage nicht mehr gestartet.")
                 continue
@@ -5485,13 +5609,29 @@ class ClaudeAttributeClient:
                         },
                     }
                 )
+            # Sobald der Batch bei Anthropic existiert (abgeholt oder eingereicht), darf
+            # ein Key-/Verbindungsfehler ihn nicht mehr verlieren: dann wird er als
+            # offener Batch gemeldet statt regelbasiert abgeschlossen (bezahlte Ergebnisse).
+            pending_batch_id = existing_id
             try:
-                batch = client.messages.batches.create(requests=batch_requests)
-                if progress is not None:
-                    progress(f"KI-Batch {chunk_index}/{len(chunks)}: {len(chunk)} Anfragen eingereicht ...")
+                if existing_id:
+                    # Abholen: Batch wurde in einem frueheren Lauf eingereicht.
+                    batch = client.messages.batches.retrieve(existing_id)
+                    if progress is not None:
+                        progress(
+                            f"KI-Batch {chunk_index}/{len(chunks)}: Batch {existing_id} wird abgeholt "
+                            f"({len(chunk)} Anfragen, Anthropic: {batch.processing_status}) ..."
+                        )
+                else:
+                    batch = client.messages.batches.create(requests=batch_requests)
+                    pending_batch_id = str(batch.id)
+                    if on_submitted is not None:
+                        on_submitted(chunk_index, str(batch.id), chunk_keys)
+                    if progress is not None:
+                        progress(f"KI-Batch {chunk_index}/{len(chunks)}: {len(chunk)} Anfragen eingereicht ...")
                 cancel_requested = False
                 waited_seconds = 0.0
-                while True:
+                while batch.processing_status != "ended":
                     time.sleep(15)
                     waited_seconds += 15
                     batch = client.messages.batches.retrieve(batch.id)
@@ -5500,12 +5640,31 @@ class ClaudeAttributeClient:
                     if cancel_check is not None and cancel_check() and not cancel_requested:
                         client.messages.batches.cancel(batch.id)
                         cancel_requested = True
-                    if waited_seconds > 2 * 3600:
-                        raise ClaudeExtractionError("Batch-Verarbeitung dauert zu lange (Timeout nach 2 Stunden).")
+                    if waited_seconds > AI_BATCH_WAIT_TIMEOUT_SECONDS:
+                        if cancel_requested:
+                            # Abbruch laeuft bereits bei Anthropic ('canceling'): kein offener
+                            # Batch zum Abholen, sondern ein normaler Abbruch-Fehler - der
+                            # Aufrufer finalisiert regelbasiert und entfernt die Sicherung.
+                            raise ClaudeExtractionError(
+                                f"Abgebrochen - Batch {batch.id} nach {format_wait_duration(waited_seconds)} "
+                                f"noch nicht beendet (Anthropic: {batch.processing_status})."
+                            )
+                        # Bewusst kein cancel: der Batch ist bezahlt und laeuft bei
+                        # Anthropic weiter - die Ergebnisse werden spaeter abgeholt.
+                        raise ClaudeBatchPendingError(
+                            f"KI-Batch {batch.id} nach {format_wait_duration(waited_seconds)} noch nicht fertig "
+                            f"(Anthropic: {batch.processing_status}).",
+                            str(batch.id),
+                            chunk_keys,
+                        )
                     if progress is not None and waited_seconds % 60 < 15:
                         counts = batch.request_counts
                         done = counts.succeeded + counts.errored + counts.canceled + counts.expired
-                        progress(f"KI-Batch {chunk_index}/{len(chunks)}: {done}/{len(chunk)} verarbeitet ...")
+                        progress(
+                            f"KI-Batch {chunk_index}/{len(chunks)}: {done}/{len(chunk)} verarbeitet"
+                            f" – wartet seit {format_wait_duration(waited_seconds)}"
+                            f" (Anthropic: {batch.processing_status}) ..."
+                        )
                 for item in client.messages.batches.results(batch.id):
                     key = id_to_key.get(item.custom_id)
                     if key is None:
@@ -5527,22 +5686,57 @@ class ClaudeAttributeClient:
                         results[key] = ClaudeExtractionError(f"Batch-Fehler: {item.result.error}")
                     else:
                         results[key] = ClaudeExtractionError(f"Batch-Ergebnis: {item.result.type}")
+            except ClaudeBatchPendingError:
+                # Offener Batch: nach oben melden, der Aufrufer sichert die Batch-ID.
+                raise
             except ClaudeExtractionError as exc:
                 for key, _message in chunk:
                     results.setdefault(key, exc)
-            except anthropic.AuthenticationError:
+            except anthropic.AuthenticationError as exc:
+                if pending_batch_id:
+                    raise ClaudeBatchPendingError(
+                        f"KI-Batch {pending_batch_id} konnte nicht abgerufen werden: Claude API Key ungültig oder fehlt.",
+                        pending_batch_id,
+                        chunk_keys,
+                        timed_out=False,
+                    ) from exc
                 error = ClaudeExtractionError("Claude API Key ungültig oder fehlt.")
                 for key, _message in chunk:
                     results.setdefault(key, error)
             except anthropic.APIStatusError as exc:
+                if pending_batch_id and getattr(exc, "status_code", 0) != 404:
+                    # Voruebergehender API-Fehler (429/5xx/529) beim Abfragen eines schon
+                    # eingereichten Batches: der Batch existiert weiter - Sicherung behalten.
+                    raise ClaudeBatchPendingError(
+                        f"KI-Batch {pending_batch_id} konnte nicht abgerufen werden: "
+                        f"Claude API Fehler (HTTP {exc.status_code}): {exc.message}",
+                        pending_batch_id,
+                        chunk_keys,
+                        timed_out=False,
+                    ) from exc
                 error = ClaudeExtractionError(f"Claude API Fehler (HTTP {exc.status_code}): {exc.message}")
                 for key, _message in chunk:
                     results.setdefault(key, error)
-            except anthropic.APIConnectionError:
+            except anthropic.APIConnectionError as exc:
+                if pending_batch_id:
+                    raise ClaudeBatchPendingError(
+                        f"KI-Batch {pending_batch_id} konnte nicht abgerufen werden: Keine Verbindung zur Claude API.",
+                        pending_batch_id,
+                        chunk_keys,
+                        timed_out=False,
+                    ) from exc
                 error = ClaudeExtractionError("Keine Verbindung zur Claude API.")
                 for key, _message in chunk:
                     results.setdefault(key, error)
             except Exception as exc:  # pragma: no cover - Batch darf den Lauf nie hart kippen
+                if pending_batch_id:
+                    # z. B. Verbindungsabbruch beim Lesen der Ergebnisse: Batch bleibt abholbar.
+                    raise ClaudeBatchPendingError(
+                        f"KI-Batch {pending_batch_id} konnte nicht abgerufen werden: {exc}",
+                        pending_batch_id,
+                        chunk_keys,
+                        timed_out=False,
+                    ) from exc
                 error = ClaudeExtractionError(f"Batch-Verarbeitung fehlgeschlagen: {exc}")
                 for key, _message in chunk:
                     results.setdefault(key, error)
@@ -13479,6 +13673,9 @@ class ApolloImportApp:
             self.refresh_preview()
         self._reload_restored_article_from_output()
         self._apply_pending_session_selection()
+        self._update_ki_batch_resume_button()
+        # Offenen KI-Batch (Sicherungsdatei) erst anbieten, wenn das Fenster steht.
+        self.root.after(300, self._offer_ki_batch_resume_at_start)
         log_perf("ApolloImportApp.__init__ gesamt", time.perf_counter() - init_started, always=True)
 
     def _configure_style(self) -> None:
@@ -15540,6 +15737,14 @@ if ($copied) {{
             state="disabled",
         )
         self.batch_delete_list_button.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        # Nur aktiv, wenn eine Sicherung eines offenen KI-Batches liegt (KI_BATCH_RESUME_FILE).
+        self.batch_resume_button = ttk.Button(
+            batch_button_row,
+            text="KI-Batch abholen",
+            command=self.resume_ki_batch_from_file,
+            state="disabled",
+        )
+        self.batch_resume_button.grid(row=0, column=4, sticky="w", padx=(8, 0))
 
         self.batch_progress_bar = ttk.Progressbar(batch_import_frame, mode="determinate")
         self.batch_progress_bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 0))
@@ -16417,7 +16622,7 @@ if ($copied) {{
                     worker_pdf_sources = collect_pdf_sources_from_media_rows(
                         [MediaRow(link) for link in scrape.document_links]
                     )
-            pdf_texts = [extract_pdf_text(source) for source in worker_pdf_sources]
+            pdf_texts = [extract_pdf_text(source, article_number=article_number) for source in worker_pdf_sources]
             return run_hybrid_attribute_extraction(
                 worker_text,
                 [pdf_text for pdf_text in pdf_texts if pdf_text],
@@ -19101,21 +19306,62 @@ if ($copied) {{
 
         self._start_batch_import(items, run_label="Aktualisierung")
 
-    def _start_batch_import(self, items: list[CsvImportItem], run_label: str) -> None:
+    def _start_batch_import(
+        self, items: list[CsvImportItem], run_label: str, resume: dict[str, object] | None = None
+    ) -> None:
+        """Massenimport im Hintergrund; mit resume (Inhalt der KI_BATCH_RESUME_FILE)
+        wird statt Phase A nur der offene KI-Batch abgeholt und finalisiert."""
         if self.background_task_running or self.batch_import_running:
             self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
             return
 
         try:
             output_root = self._resolve_output_root()
-            options = self._get_scrape_options()
+            options = self._get_scrape_options() if resume is None else dict(resume.get("options") or {})  # type: ignore[arg-type]
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
             return
 
+        # Offener KI-Batch: Eintraege in der Reihenfolge der eingereichten Batches
+        # (custom_id -> Schluessel wird ueber die Position im Chunk aufgeloest).
+        resume_entries: list[dict[str, object]] = []
+        resume_chunks: list[dict[str, object]] = []
+        # Abholen: aktueller Artikelbestand (seit dem Einreichen geloeschte Artikel
+        # werden nicht wieder angelegt) und beim letzten Abholen bereits
+        # finalisierte Eintraege (Abbruch mitten in der Finalisierung).
+        known_articles_worker: set[str] = set()
+        already_finalized_keys: set[str] = set()
+        if resume is not None:
+            stored_root = str(resume.get("output_root") or "")
+            if os.path.normcase(os.path.abspath(stored_root)) != os.path.normcase(os.path.abspath(str(output_root))):
+                messagebox.showwarning(
+                    APP_TITLE,
+                    f"Der offene KI-Batch gehört zum Ausgabeordner\n{stored_root}\n\n"
+                    f"eingestellt ist aber\n{output_root}\n\n"
+                    "Bitte den Ausgabeordner umstellen und dann 'KI-Batch abholen' erneut anklicken.",
+                )
+                return
+            resume_chunks = [dict(chunk) for chunk in (resume.get("chunks") or []) if isinstance(chunk, dict)]  # type: ignore[union-attr]
+            entries_by_key = {str(entry["key"]): entry for entry in resume.get("entries") or [] if isinstance(entry, dict)}  # type: ignore[union-attr]
+            for chunk in resume_chunks:
+                for key in chunk.get("keys") or []:  # type: ignore[union-attr]
+                    entry = entries_by_key.pop(str(key), None)
+                    if entry is not None:
+                        resume_entries.append(entry)
+            resume_entries.extend(entries_by_key.values())
+            if not resume_entries:
+                messagebox.showwarning(APP_TITLE, "Der offene KI-Batch enthält keine Artikel mehr - die Sicherung wird entfernt.")
+                delete_ki_batch_resume_file()
+                self._update_ki_batch_resume_button()
+                return
+            options["attributes"] = True
+            self._refresh_article_browser()
+            known_articles_worker = {normalize_article_number(article) for article in self.article_browser_records}
+            already_finalized_keys = {str(key) for key in (resume.get("finalized_keys") or [])}  # type: ignore[union-attr]
+
         deepl_client: DeepLClient | None = None
         try:
-            if options["short_text"] or options["long_text"]:
+            if resume is None and (options["short_text"] or options["long_text"]):
                 deepl_client = self._build_deepl_client()
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
@@ -19130,6 +19376,15 @@ if ($copied) {{
                 )
                 return
             claude_client = self._build_claude_client()
+            if resume is not None:
+                if claude_client is None:
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        "Der offene KI-Batch kann ohne Claude API Key nicht abgeholt werden "
+                        "(Projekt-Tab > APIs oder Umgebungsvariable ANTHROPIC_API_KEY).",
+                    )
+                    return
+                options["attributes_web"] = False
             if options.get("attributes_web"):
                 if claude_client is None:
                     options["attributes_web"] = False
@@ -19145,11 +19400,35 @@ if ($copied) {{
                     ):
                         options["attributes_web"] = False
         attribute_web_worker = bool(options.get("attributes") and options.get("attributes_web") and claude_client is not None)
+        if (
+            resume is None
+            and claude_client is not None
+            and len(items) > 3
+            and not attribute_web_worker
+            and path_exists_safe(KI_BATCH_RESUME_FILE)
+        ):
+            # Ein neuer KI-Batch wuerde die Sicherung des offenen Batches ueberschreiben.
+            # Nur im Batch-Modus fragen (ab 4 Artikeln ohne Internet-Recherche, vgl.
+            # ai_batch_mode im Worker) - kleine Laeufe rufen die KI je Artikel direkt auf.
+            pending_payload = load_ki_batch_resume_file() or {}
+            if not messagebox.askyesno(
+                APP_TITLE,
+                f"Ein KI-Batch vom {pending_payload.get('created_at') or '?'} mit "
+                f"{len(pending_payload.get('entries') or [])} Artikeln ist noch offen und wurde noch nicht abgeholt.\n"
+                "Ein neuer Lauf mit KI-Batch überschreibt diese Sicherung - die Ergebnisse des alten Batches "
+                "wären für die App verloren.\n\n"
+                f"{run_label} trotzdem starten?\n(Nein = zuerst 'KI-Batch abholen')",
+            ):
+                return
         # Attribut-Vorlage aus dem Referenzartikel (Attribute ausser Marke/Altbestand).
         template_ids_worker: list[str] | None = None
         reference_lines_worker: list[str] = []
         reference_article_worker = ""
-        if options.get("attributes") and options.get("attributes_reference"):
+        if resume is not None:
+            # Vorlage des urspruenglichen Laufs (nur noch fuer Lernschleife und Abschlussdialog).
+            template_ids_worker = [str(cid) for cid in (resume.get("template_ids") or [])] or None  # type: ignore[union-attr]
+            reference_article_worker = str(resume.get("reference_article") or "")
+        elif options.get("attributes") and options.get("attributes_reference"):
             reference_article_worker = normalize_article_number(self.batch_attribute_reference_article_var.get())
             reference_record = self.article_browser_records.get(reference_article_worker) if reference_article_worker else None
             template_rows = [
@@ -19203,7 +19482,7 @@ if ($copied) {{
             if snapshot.genart_selections
         }
         search_term_client: ClaudeAttributeClient | None = None
-        if self.batch_search_term_ai_var.get():
+        if resume is None and self.batch_search_term_ai_var.get():
             search_term_client = claude_client if claude_client is not None else self._build_claude_client()
             if search_term_client is None:
                 self.status_var.set("Suchwort-KI im Massenimport übersprungen: kein Claude API Key - nur Regeln.")
@@ -19239,7 +19518,7 @@ if ($copied) {{
         if output_root.exists():
             self.id_registry.load_from_folder(output_root, clear_existing=False)
 
-        total = len(items)
+        total = len(resume_entries) if resume is not None else len(items)
         refresh_media = self.batch_refresh_media_var.get()
         self.batch_run_label = run_label
         self.batch_cancel_event = threading.Event()
@@ -19249,7 +19528,10 @@ if ($copied) {{
         # damit die App während des Batches normal bedienbar wirkt. Das Flag
         # verhindert trotzdem parallele Einzel-Imports.
         self.background_task_running = True
-        self.status_var.set(f"{run_label} gestartet: {total} Artikel werden im Hintergrund abgerufen ...")
+        if resume is not None:
+            self.status_var.set(f"{run_label}: Ergebnisse für {total} Artikel werden bei Anthropic abgeholt ...")
+        else:
+            self.status_var.set(f"{run_label} gestartet: {total} Artikel werden im Hintergrund abgerufen ...")
         # Während des Batches darf das Live-Speichern nicht parallel in
         # dieselben Output-Dateien schreiben.
         self.live_write_suspended = True
@@ -19390,7 +19672,8 @@ if ($copied) {{
                 brand_values_by_article = read_article_attribute_values(output_root / ATTRIBUTE_FILE[0], BRAND_CRITERIA_ID)
             except Exception:  # pragma: no cover - defekte Datei darf den Lauf nicht kippen
                 attribute_ids_by_article = {}
-            if options.get("attributes"):
+            if options.get("attributes") and resume is None:
+                # Beim Abholen steckt die Produktgruppe bereits in den gesicherten Eintraegen.
                 article_product_groups = load_article_product_groups(find_latest_article_list_source())
 
             def run_brand_step(result: KunzerScrapeResult, bundle: ExportBundle) -> None:
@@ -19474,7 +19757,9 @@ if ($copied) {{
 
             # Ab dieser Groesse laufen die KI-Aufrufe gesammelt ueber die
             # Anthropic Batch API (50 % Rabatt, gleiche Qualitaet).
-            pending_ai: list[dict[str, object]] = []
+            # Beim Abholen (resume): die gesicherten Eintraege des urspruenglichen Laufs,
+            # Phase A entfaellt (items ist leer).
+            pending_ai: list[dict[str, object]] = list(resume_entries)
             # Internet-Recherche laeuft je Artikel direkt (Websuche), nicht ueber die Batch API.
             ai_batch_mode = claude_client is not None and total > 3 and not attribute_web_worker
 
@@ -19492,7 +19777,11 @@ if ($copied) {{
                     pdf_sources = collect_pdf_sources_from_media_rows(
                         [MediaRow(link) for link in result.document_links]
                     )
-                pdf_texts = [text for text in (extract_pdf_text(source) for source in pdf_sources) if text]
+                pdf_texts = [
+                    text
+                    for text in (extract_pdf_text(source, article_number=bundle.article_number) for source in pdf_sources)
+                    if text
+                ]
                 existing_ids = set(attribute_ids_by_article.get(bundle.article_number, set()))
                 product_group = article_product_groups.get(normalize_article_number(bundle.article_number), "")
                 if attribute_web_worker and claude_client is not None and not ai_disabled:
@@ -19754,48 +20043,172 @@ if ($copied) {{
 
             # Phase B: gesammelte KI-Anfragen über die Batch API verarbeiten
             # und die Artikel danach finalisieren (schreiben bzw. berichten).
+            # Vor dem Einreichen wird die Sicherung KI_BATCH_RESUME_FILE geschrieben
+            # (Eintraege + Batch-IDs); sie bleibt nur liegen, wenn ein Batch nach
+            # der Wartezeit noch offen ist (ClaudeBatchPendingError) - sonst wird
+            # sie nach der Finalisierung bzw. nach einem Abbruch geloescht.
+            keep_resume_file = False
+            resume_file_written = False
+            finalized_articles: list[str] = []
+            # Schluessel der Eintraege, die keine Finalisierung mehr brauchen (geschrieben,
+            # uebersprungen oder schon beim letzten Abholen erledigt) - fuer die Sicherung,
+            # falls die Finalisierung mittendrin abbricht.
+            finalized_keys: list[str] = []
+            batch_results: dict[str, list[dict[str, object]] | ClaudeExtractionError] | None = None
+            resume_payload: dict[str, object] = {}
+
+            def save_resume_file() -> None:
+                try:
+                    write_ki_batch_resume_file(resume_payload)
+                except Exception as exc:  # pragma: no cover - Sicherung darf den Lauf nicht kippen
+                    summary["error_messages"].append(
+                        f"Sicherung des offenen KI-Batch ({KI_BATCH_RESUME_FILE.name}) fehlgeschlagen: {exc}"
+                    )
+
             if pending_ai:
                 try:
                     if cancel_event.is_set() or claude_client is None:
                         # Abbruch: keine KI-Kosten mehr - Regel-Ergebnisse trotzdem abschließen.
                         for entry in pending_ai:
                             finalize_attribute_step(entry["bundle"], entry["hybrid"], str(entry["product_group"]))
+                            finalized_articles.append(str(entry["bundle"].article_number))
                     else:
                         post(
                             int(summary["processed"]),
                             f"{len(pending_ai)} KI-Anfragen werden als Batch verarbeitet (50 % Rabatt) ...",
                         )
+                        resume_payload.update(
+                            {
+                                "version": 1,
+                                "app": APP_VERSION,
+                                "created_at": (str(resume.get("created_at") or "") if resume is not None else "")
+                                or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "run_label": str(resume.get("run_label") or run_label) if resume is not None else run_label,
+                                "output_root": str(output_root),
+                                "options": dict(options),
+                                "model": claude_client.model,
+                                "template_ids": list(template_ids_worker or []),
+                                "reference_article": reference_article_worker,
+                                # Je eingereichtem Batch: {'batch_id', 'keys'} in Chunk-Reihenfolge.
+                                "chunks": [dict(chunk) for chunk in resume_chunks],
+                                "entries": pending_ai,
+                                # Beim letzten Abholen bereits finalisierte Eintraege (bleiben erledigt).
+                                "finalized_keys": sorted(already_finalized_keys),
+                            }
+                        )
+
+                        def remember_batch_id(chunk_index: int, batch_id: str, keys: list[str]) -> None:
+                            chunks = resume_payload["chunks"]
+                            assert isinstance(chunks, list)
+                            while len(chunks) < chunk_index:
+                                chunks.append({"batch_id": "", "keys": []})
+                            chunks[chunk_index - 1] = {"batch_id": batch_id, "keys": list(keys)}
+                            save_resume_file()
+
+                        save_resume_file()
+                        resume_file_written = True
                         try:
                             batch_results = claude_client.extract_attributes_many(
                                 [(str(entry["key"]), str(entry["user_message"])) for entry in pending_ai],
                                 progress=lambda message: post(int(summary["processed"]), message),
                                 cancel_check=cancel_event.is_set,
+                                on_submitted=remember_batch_id,
+                                existing_batch_ids=[str(chunk.get("batch_id") or "") for chunk in resume_chunks] or None,
                             )
-                        except ClaudeExtractionError as exc:
-                            batch_results = {str(entry["key"]): exc for entry in pending_ai}
-                        for entry in pending_ai:
-                            hybrid = entry["hybrid"]
-                            outcome = batch_results.get(str(entry["key"]))
-                            if isinstance(outcome, list):
-                                hybrid.ai_used = True
-                                apply_ai_extractions(
-                                    hybrid,
-                                    outcome,
-                                    entry["candidates"],
-                                    attribute_mapping_worker,
-                                    attribute_options_by_id_worker,
-                                    attribute_key_values_worker,
-                                    entry["existing_ids"],
+                        except ClaudeBatchPendingError as exc:
+                            # Der Batch laeuft bei Anthropic weiter (oder konnte nicht abgefragt
+                            # werden): nichts finalisieren (die Attribute dieser Artikel bleiben
+                            # unangetastet), Sicherung behalten.
+                            keep_resume_file = True
+                            batch_results = None
+                            open_count = sum(1 for entry in pending_ai if str(entry["key"]) not in already_finalized_keys)
+                            if exc.timed_out:
+                                summary["error_messages"].append(
+                                    f"KI-Batch {exc.batch_id} nach {format_wait_duration(AI_BATCH_WAIT_TIMEOUT_SECONDS)} "
+                                    f"noch nicht fertig - die Attribute von {open_count} Artikeln koennen spaeter "
+                                    "abgeholt werden (Massenimport > KI-Batch abholen)"
                                 )
                             else:
-                                hybrid.ai_error = (
-                                    str(outcome) if outcome is not None else "Kein Batch-Ergebnis erhalten."
+                                summary["error_messages"].append(
+                                    f"{exc} - Sicherung bleibt liegen, die Attribute von {open_count} Artikeln "
+                                    "koennen spaeter abgeholt werden (Massenimport > KI-Batch abholen)"
                                 )
-                            finalize_attribute_step(entry["bundle"], hybrid, str(entry["product_group"]))
+                        except ClaudeExtractionError as exc:
+                            batch_results = {str(entry["key"]): exc for entry in pending_ai}
+                        if batch_results is not None:
+                            for entry in pending_ai:
+                                entry_key = str(entry["key"])
+                                article_number = str(entry["bundle"].article_number)
+                                hybrid = entry["hybrid"]
+                                if entry_key in already_finalized_keys:
+                                    # Beim letzten Abholen bereits geschrieben (Abbruch mitten in
+                                    # der Finalisierung): nicht noch einmal anhaengen/berichten.
+                                    finalized_keys.append(entry_key)
+                                    finalized_articles.append(article_number)
+                                    continue
+                                if resume is not None and normalize_article_number(article_number) not in known_articles_worker:
+                                    # Seit dem Einreichen in der GUI geloescht: die Attributzeilen
+                                    # wuerden den Artikel sonst in der Attribute.xlsx wieder anlegen.
+                                    summary["media_warnings"].append(
+                                        (article_number, "Beim Abholen uebersprungen: Artikel ist nicht mehr im Ausgabeordner")
+                                    )
+                                    finalized_keys.append(entry_key)
+                                    continue
+                                outcome = batch_results.get(entry_key)
+                                if resume is not None:
+                                    # Seit dem Einreichen (manuell) gepflegte Attribute des Artikels
+                                    # zaehlen als belegt - Zusatzinfos rutschen dann in den naechsten Slot.
+                                    entry["existing_ids"] = set(entry["existing_ids"]) | set(
+                                        attribute_ids_by_article.get(entry["bundle"].article_number, set())
+                                    )
+                                if isinstance(outcome, list):
+                                    if not entry.get("ai_applied"):
+                                        hybrid.ai_used = True
+                                        apply_ai_extractions(
+                                            hybrid,
+                                            outcome,
+                                            entry["candidates"],
+                                            attribute_mapping_worker,
+                                            attribute_options_by_id_worker,
+                                            attribute_key_values_worker,
+                                            entry["existing_ids"],
+                                        )
+                                        # Merker fuer die Sicherung: bricht die Finalisierung gleich ab,
+                                        # darf die KI-Antwort beim naechsten Abholen nicht ein zweites
+                                        # Mal eingearbeitet werden (doppelte Zusatzinfo-Slots).
+                                        entry["ai_applied"] = True
+                                else:
+                                    hybrid.ai_error = (
+                                        str(outcome) if outcome is not None else "Kein Batch-Ergebnis erhalten."
+                                    )
+                                finalize_attribute_step(entry["bundle"], hybrid, str(entry["product_group"]))
+                                finalized_articles.append(article_number)
+                                finalized_keys.append(entry_key)
                 except Exception as exc:  # pragma: no cover - Batch darf den Lauf nie hart kippen
-                    summary["error_messages"].append(f"KI-Batch unerwartet beendet: {exc}")
+                    message = f"KI-Batch unerwartet beendet: {exc}"
+                    if batch_results is not None and len(finalized_keys) < len(pending_ai):
+                        # Ergebnisse liegen vor, aber nicht alle Artikel sind finalisiert (typisch:
+                        # Attribute.xlsx in Excel geoeffnet). Sicherung mit den erledigten
+                        # Schluesseln behalten - die Batch-Ergebnisse bleiben bei Anthropic abrufbar.
+                        keep_resume_file = True
+                        resume_payload["finalized_keys"] = list(finalized_keys)
+                        save_resume_file()
+                        message += (
+                            f" - Sicherung bleibt liegen, die Attribute von {len(pending_ai) - len(finalized_keys)} "
+                            "Artikeln koennen erneut abgeholt werden (Massenimport > KI-Batch abholen)"
+                        )
+                    summary["error_messages"].append(message)
+                # Nur die eigene Sicherung entfernen (bzw. die abgeholte); eine fremde
+                # Sicherung aus einem frueheren Lauf bleibt bei Abbruch vor Phase B liegen.
+                if (resume_file_written or resume is not None) and not keep_resume_file:
+                    delete_ki_batch_resume_file()
 
             summary["cancelled"] = cancel_event.is_set()
+            if resume is not None:
+                # Abholen: 'verarbeitet' = alle gesicherten Artikel, 'erfolgreich' = finalisierte.
+                summary["processed"] = total
+                summary["success_count"] = len(finalized_articles)
+                summary["updated_articles"] = list(dict.fromkeys(finalized_articles))
 
             # Suchwoerter: EIN Schreibvorgang fuer alle gesammelten Artikel (auch nach
             # Abbruch - die verarbeiteten Artikel sind fertig). Gleiche Sperre wie der
@@ -19821,6 +20234,12 @@ if ($copied) {{
             def write_result_list(path: Path, sheet_name: str, headers: list[str], rows: list[list[str]]) -> str:
                 """Ergebnisliste schreiben; bei gesperrter Datei Ausweichname
                 plus sichtbare Warnung im Abschlussdialog."""
+                if resume is not None:
+                    # Abholen: die Listen des urspruenglichen Laufs ergaenzen statt ersetzen.
+                    try:
+                        rows = prepare_existing_rows_for_write(path, sheet_name, headers) + rows
+                    except Exception:  # pragma: no cover - unlesbare Liste: nur die neuen Zeilen
+                        pass
                 written_path, warning = write_workbook_with_fallback(path, sheet_name, headers, rows)
                 if warning:
                     summary["error_messages"].append(warning)
@@ -19834,8 +20253,9 @@ if ($copied) {{
                     ["Artikelnummer", "Fehler"],
                     [[article_number, error_text] for article_number, error_text in summary["failed_items"]],
                 )
-            elif not summary["cancelled"]:
-                # Sauberer Lauf: veraltete Fehlerliste vom letzten Mal entfernen.
+            elif not summary["cancelled"] and resume is None:
+                # Sauberer Lauf: veraltete Fehlerliste vom letzten Mal entfernen
+                # (nicht beim Abholen - die Listen gehoeren zum urspruenglichen Lauf).
                 try:
                     error_list_path.unlink(missing_ok=True)
                 except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
@@ -19849,7 +20269,7 @@ if ($copied) {{
                     ["Artikelnummer", "Hinweis"],
                     [[article_number, warning] for article_number, warning in summary["media_warnings"]],
                 )
-            elif not summary["cancelled"]:
+            elif not summary["cancelled"] and resume is None:
                 try:
                     warning_list_path.unlink(missing_ok=True)
                 except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
@@ -19863,7 +20283,7 @@ if ($copied) {{
                     ATTRIBUTE_REVIEW_HEADERS,
                     summary["attribute_review_rows"],
                 )
-            elif options.get("attributes") and not summary["cancelled"]:
+            elif options.get("attributes") and not summary["cancelled"] and resume is None:
                 try:
                     review_list_path.unlink(missing_ok=True)
                 except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
@@ -19877,7 +20297,7 @@ if ($copied) {{
                     ATTRIBUTE_REPORT_HEADERS,
                     summary["attribute_report_rows"],
                 )
-            elif options.get("attributes") and not summary["cancelled"]:
+            elif options.get("attributes") and not summary["cancelled"] and resume is None:
                 try:
                     report_path.unlink(missing_ok=True)
                 except Exception:  # pragma: no cover - Aufräumen darf den Lauf nie kippen
@@ -19922,6 +20342,51 @@ if ($copied) {{
         self.batch_cancel_button.configure(state="disabled")
         self.batch_progress_var.set(f"{self.batch_run_label} wird nach dem aktuellen Artikel abgebrochen ...")
         self.status_var.set(f"{self.batch_run_label} wird abgebrochen ...")
+
+    def _update_ki_batch_resume_button(self) -> None:
+        """'KI-Batch abholen' nur anbieten, wenn die Sicherung eines offenen Batches liegt."""
+        if self.batch_import_running:
+            state = "disabled"
+        else:
+            state = "normal" if path_exists_safe(KI_BATCH_RESUME_FILE) else "disabled"
+        self.batch_resume_button.configure(state=state)
+
+    def resume_ki_batch_from_file(self) -> None:
+        """Ergebnisse eines offenen KI-Batches (Sicherungsdatei) abholen und die Artikel finalisieren."""
+        if self.background_task_running or self.batch_import_running:
+            self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
+            return
+        payload = load_ki_batch_resume_file()
+        if payload is None:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Es liegt kein offener KI-Batch vor (oder die Sicherungsdatei ist nicht lesbar):\n"
+                f"{KI_BATCH_RESUME_FILE}",
+            )
+            self._update_ki_batch_resume_button()
+            return
+        self._start_batch_import([], run_label="KI-Batch abholen", resume=payload)
+
+    def _offer_ki_batch_resume_at_start(self) -> None:
+        """Beim Programmstart einen offenen KI-Batch (Sicherungsdatei) zum Abholen anbieten.
+
+        'Nein' laesst die Sicherung liegen - der Button 'KI-Batch abholen' im
+        Massenimport bleibt dann aktiv.
+        """
+        if self._closing or not path_exists_safe(KI_BATCH_RESUME_FILE):
+            return
+        payload = load_ki_batch_resume_file()
+        if payload is None:
+            return
+        entries = payload.get("entries") or []
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"Ein KI-Batch vom {payload.get('created_at') or '?'} mit {len(entries)} Artikeln ist noch offen "
+            f"({payload.get('run_label') or 'Massenimport'}, Ausgabeordner: {payload.get('output_root') or '?'}).\n\n"
+            "Ergebnisse jetzt abholen?\n(Nein = später über 'KI-Batch abholen' im Massenimport)",
+        ):
+            return
+        self._start_batch_import([], run_label="KI-Batch abholen", resume=payload)
 
     def _open_path_in_default_app(self, path: str) -> None:
         try:
@@ -20032,6 +20497,7 @@ if ($copied) {{
             self.batch_update_button.configure(state="disabled")
             self.batch_cancel_button.configure(state="normal")
             self.batch_delete_list_button.configure(state="disabled")
+            self.batch_resume_button.configure(state="disabled")
             self.batch_progress_bar.configure(maximum=max(total, 1), value=0)
             self.batch_progress_var.set(f"0/{total} Artikel verarbeitet")
             self.batch_progress_bar.grid()
@@ -20040,6 +20506,7 @@ if ($copied) {{
             self.batch_import_button.configure(state="normal")
             self.batch_update_button.configure(state="normal")
             self.batch_cancel_button.configure(state="disabled")
+            self._update_ki_batch_resume_button()
 
     def _apply_batch_progress(self, done: int, total: int, detail: str, elapsed: float) -> None:
         if not self.batch_import_running:
@@ -20074,18 +20541,39 @@ if ($copied) {{
         self.last_batch_updated_articles = list(summary.get("updated_articles") or [])
         self.batch_delete_list_button.configure(state="normal" if self.last_batch_updated_articles else "disabled")
 
-        if last_bundle:
-            # Den zusammengeführten Eintrag aus der Artikelliste laden (nicht das
-            # rohe Scrape-Ergebnis): so zeigt der Editor auch die nicht abgerufenen
-            # Datenarten und die gepflegten Daten des Artikels korrekt an.
-            snapshot = self.article_browser_records.get(last_bundle.article_number)
-            if snapshot is not None:
-                with self._suspend_live_write():
-                    self._apply_article_snapshot(snapshot)
+        # Maske nach dem Lauf: der normale Massenimport zeigt den letzten Artikel.
+        # Beim Abholen eines KI-Batches bleibt der geladene Artikel - wurden seine
+        # Attribute gerade geschrieben, muss die Maske den neuen Dateistand zeigen,
+        # sonst schreibt das naechste Live-Speichern (Eingabe, Fokusverlust,
+        # Artikelwechsel, Schliessen) die alten Zeilen zurueck und loescht die
+        # abgeholten KI-Attribute wieder.
+        reload_article = normalize_article_number(last_bundle.article_number) if last_bundle else ""
+        mask_article = normalize_article_number(self._mask_article_number)
+        mask_unsaved: list[str] = []
+        updated_articles = {normalize_article_number(article) for article in self.last_batch_updated_articles}
+        if not reload_article and mask_article and mask_article in updated_articles:
+            # Vor dem Neuladen des Verzeichnisses pruefen: danach gilt der neue
+            # Dateistand als gespeichert, und jede Abweichung der Maske zaehlt als offen.
+            if normalize_article_number(self.article_number_var.get()) == mask_article:
+                mask_unsaved = self._unsaved_live_sections()
+            else:
+                mask_unsaved = list(LIVE_SECTIONS)
+            if not mask_unsaved:
+                reload_article = mask_article
 
         # Bewusst kein refresh_preview(): das würde für den geladenen Artikel
         # sofort Text-IDs generieren, auch wenn Texte nicht im Abrufumfang waren.
         self._refresh_article_browser()
+        if reload_article:
+            # Den zusammengeführten Eintrag aus der Artikelliste laden (nicht das
+            # rohe Scrape-Ergebnis): so zeigt der Editor auch die nicht abgerufenen
+            # Datenarten und die gepflegten Daten des Artikels korrekt an - erst NACH
+            # dem Neuladen, damit auch die in Phase B (KI-Batch) geschriebenen
+            # Attribute in der Maske stehen und nicht beim naechsten Speichern verloren gehen.
+            snapshot = self.article_browser_records.get(reload_article)
+            if snapshot is not None:
+                with self._suspend_live_write():
+                    self._apply_article_snapshot(snapshot)
         # Suchwoerter: der Worker hat die Gebrauchsnummern.xlsx direkt geschrieben; das
         # Verzeichnis ist durch das Neuladen oben aktuell, die Maske des geladenen
         # Artikels aber noch auf dem Stand vor dem Schreiben - Suchwoerter und
@@ -20148,6 +20636,13 @@ if ($copied) {{
         attribute_template = str(summary.get("attribute_template") or "")
         if attribute_template:
             error_list_hint += f"\n\nAttribut-Vorlage (Referenzartikel): {attribute_template}"
+        if mask_unsaved:
+            error_list_hint += (
+                f"\n\nACHTUNG: Die Maske zeigt {mask_article} noch im Stand vor dem Lauf und enthält "
+                f"ungespeicherte Änderungen ({format_live_section_labels(mask_unsaved)}). "
+                "Bitte den Artikel aus dem Verzeichnis neu laden, bevor weiter gespeichert wird - "
+                "sonst würden die gerade geschriebenen Attribute überschrieben."
+            )
         discontinued_items = list(summary.get("discontinued_items") or [])
         if discontinued_items:
             shown = ", ".join(discontinued_items[:10]) + (" …" if len(discontinued_items) > 10 else "")
