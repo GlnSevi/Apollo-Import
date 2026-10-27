@@ -118,7 +118,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.47"
+APP_VERSION = "0.1.48"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -13433,6 +13433,13 @@ class ApolloImportApp:
         # Maske nach der IMS-Uebernahme noch aus den Dateien fuellen, sobald das
         # Verzeichnis neu gelesen werden konnte (_run_deferred_article_browser_reload).
         self._ims_sync_mask_reload_pending = False
+        # Artikel, dessen Daten die Maske gerade zeigt (geladen, abgerufen oder
+        # wiederhergestellt). Weicht die getippte Artikelnummer davon ab, ist das
+        # ein Artikelwechsel und kein Umbenennen (_switch_mask_article).
+        self._mask_article_number = ""
+        # Meldung eines gerade abgebrochenen Artikelwechsels; der naechste Klick auf
+        # 'Artikel anlegen' zeigt sie statt den alten Artikel abzurufen.
+        self._mask_switch_aborted = ""
         self.pending_article_browser_selection = ""
         self.project_tab_compact_mode: bool | None = None
         self.article_browser_compact_mode: bool | None = None
@@ -14468,6 +14475,7 @@ class ApolloImportApp:
             if isinstance(article, dict):
                 article_number = normalize_article_number(str(article.get("article_number", "")))
                 self.article_number_var.set(article_number)
+                self._mask_article_number = article_number
                 self.short_module_id_var.set(str(article.get("short_module_id", "")))
                 self.long_module_id_var.set(str(article.get("long_module_id", "")))
                 self.kunzer_product_url_var.set(str(article.get("kunzer_product_url", "")))
@@ -18351,12 +18359,272 @@ if ($copied) {{
     @perf_logged("_on_article_entry_focus_out")
     def _on_article_entry_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
         article_number = normalize_article_number(self.article_number_var.get())
+        previous = self._mask_article_number
+        self._mask_switch_aborted = ""
         if not article_number:
+            if previous:
+                # Nummer geleert, waehrend die Maske noch einen Artikel zeigt: der
+                # Artikel wird verlassen (siehe _release_mask_article).
+                self._release_mask_article(previous)
             return
         self.article_number_var.set(article_number)
+        if previous and article_number != previous:
+            self._switch_mask_article(previous, article_number)
+            return
+        if not previous:
+            self._adopt_article_number(article_number)
+            return
         if self._has_german_text():
             self._ensure_ids_for_article(article_number)
         self._write_live_database()
+
+    def _adopt_article_number(self, article_number: str) -> None:
+        """Erste Artikelnummer fuer eine Maske ohne geladenen Artikel (frischer Start, Entwurf).
+
+        Bis v0.1.47 wurde der Maskeninhalt hier ohne Pruefung unter der Nummer
+        gespeichert: eine leere Maske ueberschrieb damit einen vorhandenen Artikel
+        mit Leerstand, und eine neue Nummer bekam sofort 13 leere Bereiche
+        (Phantom-Eintrag im Verzeichnis). Jetzt: vorhandene Nummer in die leere
+        Maske laden; Entwurf + vorhandene Nummer nur nach Rueckfrage ueberschreiben;
+        neue Nummer + leere Maske nur verankern (geschrieben wird, sobald etwas
+        eingegeben ist); Entwurf + neue Nummer wie bisher unter der Nummer
+        speichern. Danach gehoert die Maske zu dieser Nummer - jede weitere
+        Aenderung der Nummer ist ein Artikelwechsel (_switch_mask_article).
+        """
+        if self._ims_sync_running:
+            self.status_var.set("IMS-Übernahme läuft noch - Artikelnummer bitte danach vergeben.")
+            return
+        self._refresh_article_browser()
+        snapshot = self._stored_article_snapshot(article_number)
+        mask_empty = self._mask_is_empty()
+        if snapshot is not None:
+            if mask_empty or messagebox.askyesno(
+                APP_TITLE,
+                f"{article_number} ist bereits im Verzeichnis gespeichert.\n\n"
+                "Gespeicherten Stand in die Maske laden?\n\n"
+                "Nein = gespeicherten Stand mit dem Maskeninhalt überschreiben.",
+            ):
+                with self._suspend_live_write():
+                    self._apply_article_snapshot(snapshot)
+                self.status_var.set(f"{article_number}: gespeicherten Artikel in die Maske geladen.")
+                return
+        elif mask_empty:
+            self._clear_mask_for_new_article(article_number)
+            self.status_var.set(f"{article_number}: neuer Artikel - gespeichert wird, sobald etwas eingegeben ist.")
+            return
+        else:
+            # Entwurf + neue Nummer: den Leerstand als gespeicherten Stand verankern,
+            # damit nur die befuellten Bereiche geschrieben werden - nicht auch leere
+            # Kurzbezeichnungs-/Textzeilen ohne IDs fuer einen Entwurf, der z. B. nur
+            # Attribute enthaelt.
+            empty_bundle = ExportBundle(
+                article_number=article_number,
+                short_module_id="",
+                long_module_id="",
+                short_texts=TranslationSet(),
+                short_auto_uni=True,
+                long_texts=TranslationSet(),
+                long_auto_uni=True,
+                attribute_key_values_by_group=self.attribute_key_values_by_group,
+            )
+            self._live_fingerprints[article_number] = (None, live_section_fingerprints(empty_bundle))
+        if self._has_german_text():
+            self._ensure_ids_for_article(article_number)
+        self._write_live_database()
+        # Ab jetzt gehoert die Maske zu dieser Nummer - auch wenn nichts zu schreiben war.
+        self._mask_article_number = article_number
+
+    def _release_mask_article(self, previous: str) -> None:
+        """Die Artikelnummer wurde geleert, waehrend die Maske `previous` zeigt.
+
+        Bisher blieb die Maske dann stillschweigend an `previous` gebunden: ohne
+        Nummer wurde nichts geschrieben, und die naechste getippte Nummer sicherte
+        die inzwischen gemachten Eingaben als 'offene Aenderungen' im ALTEN Artikel,
+        bevor sie die Maske fuer die neue Nummer leerte - die Eingaben landeten
+        unbemerkt im falschen Artikel. Jetzt gilt das Leeren der Nummer als
+        Verlassen des Artikels: offene Aenderungen unter `previous` sichern, dann
+        die Maske leeren (Entwurfsmodus ohne geladenen Artikel).
+        """
+        unsaved = self._save_mask_article_before_leaving(previous)
+        if unsaved:
+            self._report_switch_aborted(previous, unsaved)
+            return
+        self._clear_mask_for_new_article("")
+        self.status_var.set(f"Maske geleert ({previous} bleibt gespeichert) - neue Artikelnummer eingeben.")
+
+    def _switch_mask_article(self, previous: str, article_number: str) -> None:
+        """Die Artikelnummer wurde in der gefuellten Maske auf einen anderen Artikel geaendert.
+
+        Bis v0.1.47 schrieb der Fokuswechsel den kompletten Maskeninhalt (also den
+        alten Artikel) unter der neuen Nummer, und 'Artikel anlegen' liess diese
+        Kopie als 'gespeicherten Stand' stehen - 800WSG01.1.6 bekam so alle
+        Attribute von 800WSG01.1.5. Eine bereits vorhandene Nummer wurde mit dem
+        Maskeninhalt ueberschrieben. Jetzt gilt ein Artikelwechsel: offene
+        Aenderungen gehoeren noch zum alten Artikel, danach wird die neue Nummer
+        wie aus dem Verzeichnis geladen (vorhanden) oder die Maske fuer den neuen
+        Artikel geleert. Der alte Artikel bleibt gespeichert.
+        """
+        if self._ims_sync_running:
+            # Waehrend der IMS-Uebernahme ist das Verzeichnis nicht verlaesslich
+            # (kein Abgleich mit den Dateien): der Wechsel wuerde einen gerade
+            # ergaenzten Artikel fuer neu halten. Beim alten Artikel bleiben.
+            self.article_number_var.set(previous)
+            self.status_var.set("IMS-Übernahme läuft noch - Artikelwechsel bitte danach.")
+            return
+        # 0) Verzeichnis gegen die Dateien abgleichen, solange der Hintergrund-
+        #    Schreiber noch nicht durch Schritt 1 beschaeftigt ist: waehrend er
+        #    schreibt, entfaellt die Signatur-Pruefung, und ein von aussen (zweite
+        #    Instanz) angelegter Artikel gaelte faelschlich als neu - die Maske
+        #    wuerde geleert und die naechste Eingabe seine Zeilen loeschen.
+        #    Den Lade-Anker des alten Artikels dabei behalten: ersetzt der Abgleich
+        #    seinen Verzeichnis-Eintrag (Fremdaenderung durch eine zweite Instanz),
+        #    sollen in Schritt 1 nur die eigenen Eingaben als offen gelten - nicht
+        #    die unveraenderte Maske gegen den neuen Dateistand, sonst wuerde sie
+        #    die Fremdaenderung zurueckschreiben.
+        stale_anchor = self._live_fingerprints.get(previous)
+        self._refresh_article_browser()
+        record = self.article_browser_records.get(previous)
+        if stale_anchor is not None and stale_anchor[0] is not None and stale_anchor[0] is not record:
+            self._live_fingerprints[previous] = (record, dict(stale_anchor[1]))
+        # 1) Offene Aenderungen unter der alten Nummer sichern (Dirty-Check: ohne
+        #    Aenderung wird nichts geschrieben). Was nicht gesichert werden kann
+        #    (fachlicher Fehler, kein Ausgabeordner), darf nicht stillschweigend
+        #    verloren gehen: dann bleibt die Maske beim alten Artikel.
+        unsaved = self._save_mask_article_before_leaving(previous)
+        if unsaved:
+            self._report_switch_aborted(previous, unsaved)
+            return
+        self.article_number_var.set(article_number)
+        # 2) Vorhandener Artikel (Verzeichnis oder noch nicht geschriebener
+        #    Auftrag): wie 'Ausgewaehlten Artikel laden'.
+        snapshot = self._stored_article_snapshot(article_number)
+        if snapshot is not None:
+            with self._suspend_live_write():
+                self._apply_article_snapshot(snapshot)
+            self.status_var.set(f"{article_number}: gespeicherten Artikel in die Maske geladen ({previous} bleibt gespeichert).")
+            return
+        # 3) Neuer Artikel: leere Maske, noch nichts schreiben.
+        self._clear_mask_for_new_article(article_number)
+        self.status_var.set(f"{article_number}: neuer Artikel, Maske geleert ({previous} bleibt gespeichert).")
+
+    def _save_mask_article_before_leaving(self, previous: str) -> list[str]:
+        """Offene Aenderungen der Maske unter `previous` sichern, bevor die Maske
+        einen anderen Artikel zeigt. Die Artikelnummer steht danach auf `previous`.
+
+        Rueckgabe: Bereiche, die NICHT gesichert werden konnten - fachlicher Fehler
+        (z. B. OE-Nummer ohne Hersteller; _submit_live_write laesst solche Bereiche
+        weg) oder kein Ausgabeordner. Sie stehen nur in der Maske und gingen beim
+        Wechsel verloren. Bereiche, die ein eingereihter Auftrag noch schreibt
+        (auch Nachholer frueher gescheiterter Bereiche), zaehlen als gesichert.
+        """
+        self.article_number_var.set(previous)
+        self._write_live_database()
+        queued = self.live_writer.expected_fingerprints(previous)
+        return [section for section in self._unsaved_live_sections() if section not in queued]
+
+    def _report_switch_aborted(self, previous: str, unsaved: list[str]) -> None:
+        # Den Grund aus _submit_live_write (fachlicher Fehler / kein Ausgabeordner) mitnehmen.
+        detail = self.status_var.get()
+        hint = f" {detail}" if detail.startswith("Live-Speichern") else ""
+        message = f"Artikelwechsel abgebrochen: {format_live_section_labels(unsaved)} von {previous} nicht gespeichert.{hint}"
+        self.status_var.set(message)
+        # Der Klick, der den Fokusverlust ausloeste (z. B. 'Artikel anlegen'), laeuft
+        # gleich noch - mit der zurueckgesetzten alten Nummer. Er soll den Abbruch
+        # sichtbar machen statt stillschweigend den alten Artikel abzurufen.
+        self._mask_switch_aborted = message
+
+    def _consume_switch_abort(self) -> bool:
+        """True (mit Warnung), wenn gerade ein Artikelwechsel abgebrochen wurde;
+        der auf den Fokusverlust folgende Klick wird damit einmal abgefangen."""
+        message = self._mask_switch_aborted
+        self._mask_switch_aborted = ""
+        if not message:
+            return False
+        messagebox.showwarning(APP_TITLE, f"{message}\n\nBitte zuerst korrigieren, dann die Artikelnummer erneut ändern.")
+        return True
+
+    def _stored_article_snapshot(self, article_number: str) -> StoredArticleSnapshot | None:
+        """Gespeicherter Stand eines Artikels fuer die Maske: der Verzeichnis-Eintrag,
+        sonst das Bundle eines noch nicht geschriebenen Auftrags (ein gerade
+        angelegter Artikel steht erst nach dem Schreiben im Verzeichnis - wie bei
+        _resolve_fetch_sources). None = unbekannter Artikel."""
+        # Fertige Auftraege zuerst abholen, damit der Eintrag aktuell ist.
+        self._poll_live_write_results()
+        snapshot = self.article_browser_records.get(article_number)
+        if snapshot is not None:
+            return snapshot
+        queued = self.live_writer.latest_bundle(article_number)
+        if queued is None:
+            return None
+        return self._snapshot_from_bundle(queued, Path(self.output_dir_var.get().strip()))
+
+    def _mask_is_empty(self) -> bool:
+        """True, wenn die Maske keine Artikeldaten enthaelt (Texte, GenArt, Zeilen,
+        Suchwoerter); Artikelnummer und IDs zaehlen nicht."""
+        for text_frame in (self.short_text_frame, self.long_text_frame):
+            if any(str(value or "").strip() for value in vars(text_frame.get_value()).values()):
+                return False
+        if self._get_selected_genart_selections() or self.search_term_frame.get_terms():
+            return False
+        row_frames = (
+            self.attribute_frame,
+            self.oe_frame,
+            self.comparison_frame,
+            self.article_list_frame,
+            self.vehicle_link_frame,
+            self.image_frame,
+            self.document_frame,
+            self.video_frame,
+            self.web_frame,
+        )
+        return not any(frame.get_rows() for frame in row_frames)
+
+    def _clear_mask_for_new_article(self, article_number: str) -> None:
+        """Leert alle Bereiche der Maske fuer einen neuen Artikel.
+
+        Die Artikelnummer wird auf `article_number` gesetzt ("" = Entwurfsmodus ohne
+        geladenen Artikel). Geschrieben wird nichts: die leere Maske wird als
+        gespeicherter Stand des (noch nicht vorhandenen) Artikels verankert, damit
+        ein Fokusverlust ohne Eingabe oder eine Tippfehler-Korrektur der Nummer
+        keinen leeren Phantom-Artikel schreibt - erst ein befuellter Bereich gilt
+        als geaendert.
+        """
+        with self._suspend_live_write():
+            self.article_number_var.set(article_number)
+            self.current_id_article_number = ""
+            self.short_module_id_var.set("")
+            self.long_module_id_var.set("")
+            self._set_selected_genart_selections([])
+            self.genart_display_var.set("")
+            self.genart_suggestion_var.set("GenArt bitte über das Suchfeld oder 'Suchen...' auswählen.")
+            self.short_text_frame.set_value(TranslationSet(), auto_uni=True)
+            self.long_text_frame.set_value(TranslationSet(), auto_uni=True)
+            self.attribute_frame.set_rows([])
+            self.search_term_frame.set_terms([])
+            self.oe_frame.set_rows([])
+            self.comparison_frame.set_rows([])
+            self.article_list_frame.set_rows([])
+            self.vehicle_link_frame.set_rows([])
+            self.image_frame.set_rows([])
+            self.document_frame.set_rows([])
+            self.video_frame.set_rows([])
+            self.web_frame.set_rows([])
+            self.kunzer_product_url_var.set("")
+            self._mask_article_number = article_number
+            # Nachholer eines frueheren, nie gespeicherten Standes dieser Nummer verfallen -
+            # sie wuerden sonst die leere Maske als Bereich erzwingen.
+            self._live_failed_sections.pop(article_number, None)
+            # Leere Maske als gespeicherten Stand verankern (Eintrag ohne Verzeichnis-
+            # Snapshot; _live_saved_fingerprints behaelt ihn, solange der Artikel nicht
+            # im Verzeichnis steht). Vergliche der Dirty-Check gegen 'unbekannt' (None),
+            # schriebe der naechste Fokusverlust alle 13 Bereiche leer.
+            try:
+                empty_bundle = self.collect_bundle(ensure_ids=False)
+            except ValueError:
+                # Keine Artikelnummer (Entwurfsmodus): nichts zu verankern.
+                self._live_fingerprints.pop(article_number, None)
+            else:
+                self._live_fingerprints[article_number] = (None, live_section_fingerprints(empty_bundle))
 
     def _resolve_ids_for_article(self, article_number: str) -> tuple[str, str]:
         article_key = normalize_article_number(article_number)
@@ -18571,6 +18839,7 @@ if ($copied) {{
                 self.article_number_var.set(result.article_number)
             else:
                 self.article_number_var.set(normalize_article_number(result.article_number))
+            self._mask_article_number = normalize_article_number(self.article_number_var.get())
             if scrape_options["short_text"] or scrape_options["long_text"]:
                 self._ensure_ids_for_article(self.article_number_var.get())
             else:
@@ -18720,6 +18989,8 @@ if ($copied) {{
         self.long_text_frame.apply_translations(long_translations)
 
     def _load_from_kunzer(self, article_number_or_url: str) -> None:
+        if self._consume_switch_abort():
+            return
         identifier = article_number_or_url.strip()
         if not identifier:
             messagebox.showwarning(APP_TITLE, "Bitte eine Artikelnummer oder Kunzer Produkt-URL eingeben.")
@@ -20275,6 +20546,7 @@ if ($copied) {{
             snapshot = self._snapshot_from_bundle(queued_bundle, snapshot.source_folder)
         self.article_number_var.set(snapshot.article_number)
         self.current_id_article_number = snapshot.article_number
+        self._mask_article_number = snapshot.article_number
         self.short_module_id_var.set(snapshot.short_module_id)
         self.long_module_id_var.set(snapshot.long_module_id)
         self.id_registry.remember_article_ids(snapshot.article_number, snapshot.short_module_id, snapshot.long_module_id)
@@ -20307,8 +20579,14 @@ if ($copied) {{
         # nicht irgendeinen Formularstand. Der Snapshot selbst ist der Anker:
         # wird der Verzeichnis-Eintrag spaeter von anderer Seite ersetzt, leitet
         # _live_saved_fingerprints neu von dort ab.
+        # Anker ist der Verzeichnis-Eintrag, nicht der (evtl. aus einem wartenden
+        # Auftrag gebildete) Snapshot: _live_saved_fingerprints behaelt den Eintrag
+        # nur, solange entry[0] der Verzeichnis-Eintrag ist. Fuer einen noch nicht
+        # geschriebenen Artikel (kein Eintrag) bleibt (None, Fingerabdruecke) -
+        # sonst gaelten alle nicht eingereihten Bereiche als unbekannt, und der
+        # naechste Fokusverlust haengte leere Text-/Kurzbezeichnungszeilen an.
         self._live_fingerprints[snapshot.article_number] = (
-            snapshot,
+            self.article_browser_records.get(snapshot.article_number),
             live_section_fingerprints(bundle_from_snapshot(snapshot, self.attribute_key_values_by_group)),
         )
         self.status_var.set(f"Artikel geladen: {snapshot.article_number} ({snapshot.source_label})")
@@ -20454,9 +20732,22 @@ if ($copied) {{
         for article_number in article_numbers:
             self.article_browser_records.pop(article_number, None)
             self._article_search_blob_cache.pop(article_number, None)
+            # Gemerkte Platten-Staende und Nachholer des geloeschten Artikels verfallen.
+            self._live_fingerprints.pop(article_number, None)
+            self._live_failed_sections.pop(article_number, None)
+        mask_cleared = False
+        if self._mask_article_number in article_numbers or normalize_article_number(self.article_number_var.get()) in article_numbers:
+            # Die Maske zeigte einen geloeschten Artikel: leeren (Entwurfsmodus ohne
+            # Artikel). Sonst gaelte ihr Inhalt beim naechsten Fokusverlust oder
+            # Artikelwechsel als offene Aenderung ohne gespeicherten Stand und wuerde
+            # den geloeschten Artikel in allen Dateien wieder anlegen.
+            self._clear_mask_for_new_article("")
+            mask_cleared = True
         self._load_known_ids(initial=True)
         self._refresh_article_browser()
-        self.status_var.set(f"{len(article_numbers)} Artikel aus den Output-Dateien gelöscht.")
+        self.status_var.set(
+            f"{len(article_numbers)} Artikel aus den Output-Dateien gelöscht." + (" Maske geleert." if mask_cleared else "")
+        )
 
     def import_search_terms_from_file(self) -> None:
         """Tab Suchwoerter > "Aus Datei importieren…": Suchwoerter fuer viele Artikel aus XLSX/CSV.
