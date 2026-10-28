@@ -118,7 +118,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.49"
+APP_VERSION = "0.1.50"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -1901,6 +1901,21 @@ def restrict_hybrid_to_template(result: "HybridAttributeResult", template_ids: l
     result.learned_entries = []
 
 
+def missing_template_ids(
+    template_ids: list[str] | set[str], existing_criteria_ids: set[str], result: "HybridAttributeResult"
+) -> set[str]:
+    """Vorlage-Attribute, die weder vorhanden noch sicher gefunden sind.
+
+    Gemeinsame Stelle fuer Einzel- und Massenpfad: solange hier etwas fehlt,
+    wird die KI gefragt (unabhaengig von der Textlaenge), und am Ende meldet
+    die Statuszeile bzw. der Bericht genau diese IDs als nicht gefunden."""
+    return (
+        {str(criteria_id).strip() for criteria_id in template_ids}
+        - {str(criteria_id).strip() for criteria_id in existing_criteria_ids}
+        - {suggestion.option.criteria_id for suggestion in result.accepted}
+    )
+
+
 def run_hybrid_attribute_extraction(
     text: str,
     pdf_texts: list[str],
@@ -1924,6 +1939,12 @@ def run_hybrid_attribute_extraction(
     liegt und der Wert die lokale Validierung besteht. Mit `web_research=True`
     darf die KI zusätzlich per Websuche recherchieren. Läuft ohne GUI-Zugriffe
     und ist damit in Hintergrund-Threads nutzbar.
+
+    Mit `candidate_ids` (Attribut-Vorlage aus dem Referenzartikel) gilt fuer
+    Einzelartikel dasselbe wie im Massenimport: Regel-Treffer ausserhalb der
+    Vorlage wandern in die Pruefung, die KI laeuft nur, solange Vorlage-Attribute
+    fehlen, und bekommt genau die Vorlage als Kandidaten (plus `reference_lines`
+    als Formatbeispiel); nach der KI wird erneut auf die Vorlage beschraenkt.
     """
     result, combined = run_rule_attribute_pass(
         text, pdf_texts, mapping, attribute_options_by_id, attribute_key_values_by_group, existing_criteria_ids
@@ -1936,8 +1957,7 @@ def run_hybrid_attribute_extraction(
     if candidate_ids is not None:
         # Vorlage: die KI immer fragen, solange Vorlage-Attribute fehlen - unabhaengig
         # von der Textlaenge (genau diese Angaben will man fuer jeden Artikel haben).
-        missing = set(candidate_ids) - existing_criteria_ids - {s.option.criteria_id for s in result.accepted}
-        if claude_client is None or not missing:
+        if claude_client is None or not missing_template_ids(candidate_ids, existing_criteria_ids, result):
             return result
     elif claude_client is None or (not web_research and not result.unmatched and len(combined) < min_ai_text_length):
         return result
@@ -1970,7 +1990,8 @@ def run_hybrid_attribute_extraction(
         attribute_key_values_by_group, existing_criteria_ids,
     )
     if candidate_ids is not None:
-        result.learned_entries = []
+        # Nach der KI erneut auf die Vorlage beschraenken (verwirft auch gelernte Zuordnungen).
+        restrict_hybrid_to_template(result, candidate_ids)
     return result
 
 
@@ -13607,6 +13628,9 @@ class ApolloImportApp:
         # Oberflaeche sammelt nur das Bundle ein und reiht den Auftrag ein.
         self.live_writer = LiveWriter(self._run_live_write_job)
         self._live_write_poll_after_id: str | None = None
+        # Statusmeldung, die nach dem Abschluss laufender Live-Auftraege erneut gesetzt
+        # wird (siehe _set_status_after_live_writes); nur die juengste gilt.
+        self._status_after_live_writes_text = ""
         # Gespeicherter Stand je Artikel: (Verzeichnis-Snapshot, {Bereich: Fingerabdruck}).
         # Der Snapshot dient als Gueltigkeitsanker - ersetzt ihn jemand anderes
         # (Neuladen vom Datentraeger, Batch-Upsert), wird neu vom Eintrag abgeleitet.
@@ -15809,7 +15833,7 @@ if ($copied) {{
         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             scope_frame,
-            text="Attribute nach Referenzartikel (alle Artikel des Laufs)",
+            text="Attribute nach Referenzartikel (Massenimport und Einzelartikel)",
             variable=self.batch_attribute_reference_var,
         ).grid(row=7, column=0, sticky="w", pady=(6, 0))
         reference_row = ttk.Frame(scope_frame)
@@ -16557,11 +16581,73 @@ if ($copied) {{
         elif added == 0:
             self.status_var.set("Keine neuen Attribute übernommen.")
 
+    def _resolve_reference_attribute_template(self) -> tuple[str, list[str] | None, list[str], str]:
+        """Attribut-Vorlage aus dem Referenzartikel (Option 'Attribute nach Referenzartikel').
+
+        Gemeinsam fuer Massenimport und Einzelartikel (Button 'Attribute
+        automatisch ausfuellen', Findung nach 'Artikel anlegen'). Liest Haken und
+        Artikelnummer aus dem Abrufumfang und die Attributzeilen des Referenz-
+        artikels aus dem Verzeichnis (spiegelt die Output-Dateien).
+
+        Rueckgabe: (Referenzartikel, Vorlage-IDs, Referenzzeilen fuer die KI,
+        Fehlertext). Ohne Haken ist die Vorlage None. Vorlage = Kriterien-IDs der
+        Attributzeilen ausser Marke (8988) und Altbestand (9595), nur bekannte
+        Katalog-IDs; Referenzzeilen 'ID | Label: Wert [bis Wert] ' mit Schluessel-
+        Bezeichnung aus der Werteliste ('1 | Einohrklemme'). Hat der Referenz-
+        artikel keine Attribute: Vorlage None und Fehlertext (der Aufrufer meldet
+        und bricht ab).
+        """
+        if not self.batch_attribute_reference_var.get():
+            return "", None, [], ""
+        reference_article = normalize_article_number(self.batch_attribute_reference_article_var.get())
+        reference_record = self.article_browser_records.get(reference_article) if reference_article else None
+        template_rows = [
+            row
+            for row in (reference_record.attribute_rows if reference_record is not None else [])
+            if row.criteria_id.strip()
+            and row.criteria_id.strip() not in {BRAND_CRITERIA_ID, LEGACY_SEARCH_TERM_CRITERIA_ID}
+            and row.criteria_id.strip() in self.attribute_options_by_id
+        ]
+        if not template_rows:
+            error_text = (
+                f"Referenzartikel '{reference_article or self.batch_attribute_reference_article_var.get()}' "
+                "hat im Output keine Attribute (außer der Marke).\n\n"
+                "Bitte die Artikelnummer prüfen bzw. den Referenzartikel zuerst pflegen - oder die Option "
+                "'Attribute nach Referenzartikel' im Abrufumfang abschalten."
+            )
+            return reference_article, None, [], error_text
+        template_ids = list(dict.fromkeys(row.criteria_id.strip() for row in template_rows))
+
+        def reference_value_text(row: AttributeRow) -> str:
+            # Schluesselwerte stehen in der Datei als Schluessel ('1') - fuer die KI
+            # mit Bezeichnung aus der Werteliste ('1 | Einohrklemme').
+            value = row.value.strip()
+            option = self.attribute_options_by_id.get(row.criteria_id.strip())
+            if option is not None and is_attribute_key_value_format(option.value_format):
+                for group in option.key_value_group_candidates():
+                    for key_value in self.attribute_key_values_by_group.get(group, []):
+                        if key_value.key_value_id.strip() == value and key_value.label.strip():
+                            return f"{value} | {key_value.label.strip()}"
+            return value
+
+        reference_lines = [
+            f"{row.criteria_id} | {row.label}: {reference_value_text(row)}"
+            + (f" bis {row.value_to}" if row.value_to.strip() else "")
+            for row in template_rows
+        ]
+        return reference_article, template_ids, reference_lines, ""
+
     def _start_attribute_autofill(self, auto: bool = False, web_research: bool = False) -> None:
         """Startet die hybride Attribut-Findung (Regeln + optionale KI) im Hintergrund.
 
         Mit `web_research=True` recherchiert die KI zusätzlich per Websuche
         (Herstellerseiten, Datenblätter) - teurer, deshalb nur per Button.
+
+        Ist 'Attribute nach Referenzartikel' im Abrufumfang angehakt, gilt die
+        Vorlage des Referenzartikels auch hier (bis v0.1.49 nur im Massenimport):
+        Treffer ausserhalb der Vorlage gehen in die Pruefung, die KI laeuft nur,
+        solange Vorlage-Attribute fehlen. Fehlt der Referenzartikel, meldet der
+        Button einen Hinweis; nach 'Artikel anlegen' (auto) nur die Statuszeile.
         """
         text = "\n".join(
             part
@@ -16585,6 +16671,15 @@ if ($copied) {{
         if not self.attribute_options_by_id:
             if not auto:
                 messagebox.showwarning(APP_TITLE, "Es ist keine Attributliste geladen (Datenstämme im Projekt-Tab).")
+            return
+        reference_article, template_ids, reference_lines, template_error = self._resolve_reference_attribute_template()
+        if template_error:
+            if auto:
+                # Nur Statuszeile (kein Modal nach dem Abruf) - und zwar so, dass das
+                # noch laufende Live-Schreiben des Abrufs sie nicht gleich ueberdeckt.
+                self._set_status_after_live_writes(f"Attribut-Findung übersprungen: {template_error.splitlines()[0]}")
+            else:
+                messagebox.showwarning(APP_TITLE, template_error)
             return
 
         claude_client = self._build_claude_client()
@@ -16636,12 +16731,16 @@ if ($copied) {{
                 article_number=article_number,
                 product_group=product_group,
                 min_ai_text_length=min_ai_text_length,
+                candidate_ids=template_ids,
+                reference_lines=reference_lines,
             )
 
         def on_success(payload: object) -> None:
             result = payload
             if isinstance(result, HybridAttributeResult):
-                self._finish_attribute_autofill(result, auto=auto)
+                self._finish_attribute_autofill(
+                    result, auto=auto, template_ids=template_ids, reference_article=reference_article
+                )
 
         if web_research:
             mode_hint = "Regeln + KI mit Internet-Recherche"
@@ -16651,6 +16750,8 @@ if ($copied) {{
             mode_hint = "nur Regeln, kein API Key"
         if scrape_needed and cached_scrape is None:
             mode_hint += ", inkl. Kunzer-Abruf"
+        if template_ids is not None:
+            mode_hint += f", Vorlage {reference_article}: {len(template_ids)} Attribute"
         self._run_background_task(
             f"Attribute werden automatisch ermittelt ({mode_hint}) ...",
             worker,
@@ -16658,7 +16759,20 @@ if ($copied) {{
             "Attribut-Findung fehlgeschlagen",
         )
 
-    def _finish_attribute_autofill(self, result: HybridAttributeResult, auto: bool) -> None:
+    def _finish_attribute_autofill(
+        self,
+        result: HybridAttributeResult,
+        auto: bool,
+        template_ids: list[str] | None = None,
+        reference_article: str = "",
+    ) -> None:
+        """Ergebnis der Attribut-Findung in die Maske uebernehmen (UI-Thread).
+
+        Sichere Treffer werden add-only in die Maske geschrieben und live
+        gespeichert, unsichere (inkl. Treffer 'nicht in der Vorlage') gehen in den
+        Bestaetigungsdialog. Mit `template_ids` (Attribut-Vorlage) nennt die
+        Statuszeile die Vorlage-Attribute, die weder vorhanden noch gefunden sind.
+        """
         added = 0
         if result.accepted:
             existing = self.attribute_frame.get_rows()
@@ -16673,9 +16787,35 @@ if ($copied) {{
             if new_rows:
                 self.attribute_frame.set_rows(existing + new_rows)
                 added = len(new_rows)
-                self._write_live_section(
-                    "attributes", status_message=f"{added} Attribut(e) automatisch übernommen"
+
+        status_parts = [f"Attribute: {added} automatisch übernommen"]
+        if result.review:
+            status_parts.append(f"{len(result.review)} zur Prüfung")
+        if template_ids is not None:
+            # Vorlage (Referenzartikel): offen gebliebene Vorlage-Attribute nennen -
+            # weder vorhanden (Maske nach dem Schreiben) noch sicher gefunden.
+            mask_ids = {row.criteria_id.strip() for row in self.attribute_frame.get_rows() if row.criteria_id.strip()}
+            unfilled = [cid for cid in template_ids if cid in missing_template_ids(template_ids, mask_ids, result)]
+            template_label = f"Vorlage {reference_article}" if reference_article else "Vorlage"
+            if unfilled:
+                status_parts.append(
+                    f"{template_label}: {len(unfilled)} von {len(template_ids)} Attributen nicht gefunden "
+                    f"({', '.join(unfilled)})"
                 )
+            else:
+                status_parts.append(f"{template_label}: alle {len(template_ids)} Attribute belegt")
+        if result.ai_error:
+            status_parts.append(f"KI-Fehler: {result.ai_error}")
+        elif result.ai_used:
+            status_parts.append(f"KI genutzt ({result.ai_usage_text})" if result.ai_usage_text else "KI genutzt")
+        else:
+            status_parts.append("nur Regeln")
+        status_text = " | ".join(status_parts)
+        if added:
+            # Der Abschluss des Hintergrund-Schreibens zeigt dieselbe Zusammenfassung
+            # (bis v0.1.49 nur 'n Attribut(e) automatisch übernommen'), damit Pruefung
+            # und Vorlage-Meldung nicht wenige Sekunden spaeter ueberdeckt werden.
+            self._write_live_section("attributes", status_message=status_text)
 
         if result.learned_entries:
             source_text = self.attribute_mapping_source_path_var.get().strip() or str(DEFAULT_ATTRIBUTE_MAPPING_SOURCE)
@@ -16695,16 +16835,10 @@ if ($copied) {{
                     if not auto:
                         messagebox.showwarning(APP_TITLE, f"Zuordnung konnte nicht gespeichert werden:\n{exc}")
 
-        status_parts = [f"Attribute: {added} automatisch übernommen"]
-        if result.review:
-            status_parts.append(f"{len(result.review)} zur Prüfung")
-        if result.ai_error:
-            status_parts.append(f"KI-Fehler: {result.ai_error}")
-        elif result.ai_used:
-            status_parts.append(f"KI genutzt ({result.ai_usage_text})" if result.ai_usage_text else "KI genutzt")
-        else:
-            status_parts.append("nur Regeln")
-        self.status_var.set(" | ".join(status_parts))
+        # Ohne uebernommene Zeile (added == 0) gibt es keinen Attribute-Auftrag, der die
+        # Zusammenfassung traegt - das Live-Schreiben des Abrufs (auto) wuerde sie mit
+        # 'Live gespeichert: ...' ueberdecken, gerade wenn die Vorlage-Meldung gebraucht wird.
+        self._set_status_after_live_writes(status_text)
 
         if result.ai_error and not auto:
             messagebox.showwarning(APP_TITLE, f"KI-Attribut-Findung fehlgeschlagen (Regeln liefen trotzdem):\n{result.ai_error}")
@@ -18335,6 +18469,33 @@ if ($copied) {{
         # Aenderung (typisch: Fokusverlust im Artikelnummer-Feld) passiert nichts.
         return self._submit_live_write(set(LIVE_SECTIONS), status_message, "_write_live_database")
 
+    def _set_status_after_live_writes(self, text: str) -> None:
+        """Statuszeile setzen und nach Abschluss laufender Live-Auftraege erneut setzen.
+
+        Der Abschluss des Hintergrund-Schreibens ('Live gespeichert: ...') kommt
+        asynchron und wuerde die Meldung sonst kurz darauf ueberdecken - z. B.
+        die Vorlage-Meldung der Attribut-Findung nach 'Artikel anlegen', waehrend
+        der Abruf selbst noch geschrieben wird. Ersetzt wird nur die
+        Erfolgsmeldung des Schreibens: 'Live-Speichern fehlgeschlagen ...' und
+        jede andere inzwischen gesetzte Meldung bleiben stehen.
+        """
+        self.status_var.set(text)
+        self._status_after_live_writes_text = text
+        if not self.live_writer.is_idle():
+            self.root.after(LIVE_WRITE_POLL_INTERVAL_MS, lambda: self._restore_status_after_live_writes(text))
+
+    def _restore_status_after_live_writes(self, text: str) -> None:
+        if text != self._status_after_live_writes_text:
+            return  # Inzwischen wurde eine neuere Meldung vorgemerkt.
+        if not self.live_writer.is_idle():
+            self.root.after(LIVE_WRITE_POLL_INTERVAL_MS, lambda: self._restore_status_after_live_writes(text))
+            return
+        current = self.status_var.get()
+        # Nur die reine Erfolgsmeldung ersetzen - der Hinweis auf einen inzwischen
+        # gewechselten Ausgabeordner soll stehen bleiben.
+        if current.startswith("Live gespeichert") and "anderer Ausgabeordner" not in current:
+            self.status_var.set(text)
+
     def _schedule_live_write_poll(self) -> None:
         if self._live_write_poll_after_id is None:
             self._live_write_poll_after_id = self.root.after(LIVE_WRITE_POLL_INTERVAL_MS, self._poll_live_write_results)
@@ -19429,42 +19590,12 @@ if ($copied) {{
             template_ids_worker = [str(cid) for cid in (resume.get("template_ids") or [])] or None  # type: ignore[union-attr]
             reference_article_worker = str(resume.get("reference_article") or "")
         elif options.get("attributes") and options.get("attributes_reference"):
-            reference_article_worker = normalize_article_number(self.batch_attribute_reference_article_var.get())
-            reference_record = self.article_browser_records.get(reference_article_worker) if reference_article_worker else None
-            template_rows = [
-                row
-                for row in (reference_record.attribute_rows if reference_record is not None else [])
-                if row.criteria_id.strip()
-                and row.criteria_id.strip() not in {BRAND_CRITERIA_ID, LEGACY_SEARCH_TERM_CRITERIA_ID}
-                and row.criteria_id.strip() in self.attribute_options_by_id
-            ]
-            if not template_rows:
-                messagebox.showwarning(
-                    APP_TITLE,
-                    f"Referenzartikel '{reference_article_worker or self.batch_attribute_reference_article_var.get()}' "
-                    "hat im Output keine Attribute (außer der Marke).\n\n"
-                    "Bitte die Artikelnummer prüfen bzw. den Referenzartikel zuerst pflegen - oder die Option "
-                    "'Attribute nach Referenzartikel' im Abrufumfang abschalten.",
-                )
+            reference_article_worker, template_ids_worker, reference_lines_worker, template_error = (
+                self._resolve_reference_attribute_template()
+            )
+            if template_error:
+                messagebox.showwarning(APP_TITLE, template_error)
                 return
-            template_ids_worker = list(dict.fromkeys(row.criteria_id.strip() for row in template_rows))
-            def reference_value_text(row: AttributeRow) -> str:
-                # Schluesselwerte stehen in der Datei als Schluessel ('1') - fuer die KI
-                # mit Bezeichnung aus der Werteliste ('1 | Einohrklemme').
-                value = row.value.strip()
-                option = self.attribute_options_by_id.get(row.criteria_id.strip())
-                if option is not None and is_attribute_key_value_format(option.value_format):
-                    for group in option.key_value_group_candidates():
-                        for key_value in self.attribute_key_values_by_group.get(group, []):
-                            if key_value.key_value_id.strip() == value and key_value.label.strip():
-                                return f"{value} | {key_value.label.strip()}"
-                return value
-
-            reference_lines_worker = [
-                f"{row.criteria_id} | {row.label}: {reference_value_text(row)}"
-                + (f" bis {row.value_to}" if row.value_to.strip() else "")
-                for row in template_rows
-            ]
         min_ai_text_length_worker = AI_SHORT_TEXT_MIN_LENGTH if options.get("attributes_short_text") else AI_MIN_TEXT_LENGTH
         # Kopien für den Worker-Thread: keine Tk-/App-Zugriffe aus dem Thread.
         attribute_mapping_worker = dict(self.attribute_mapping)
@@ -19814,10 +19945,7 @@ if ($copied) {{
                 )
                 if template_ids_worker is not None:
                     restrict_hybrid_to_template(hybrid, template_ids_worker)
-                    missing_template_ids = (
-                        set(template_ids_worker) - existing_ids - {s.option.criteria_id for s in hybrid.accepted}
-                    )
-                    wants_ai = bool(combined) and bool(missing_template_ids)
+                    wants_ai = bool(combined) and bool(missing_template_ids(template_ids_worker, existing_ids, hybrid))
                 else:
                     wants_ai = bool(combined) and bool(hybrid.unmatched or len(combined) >= min_ai_text_length_worker)
                 client_available = claude_client is not None and not ai_disabled
@@ -19866,8 +19994,12 @@ if ($copied) {{
                 """Validierte Ergebnisse schreiben bzw. berichten (auch rules-only)."""
                 nonlocal ai_disabled
                 if template_ids_worker is not None:
-                    # Vorlage: nichts dauerhaft in die Zuordnungsdatei lernen.
-                    hybrid.learned_entries = []
+                    # Vorlage: wie im Einzelpfad (run_hybrid_attribute_extraction) auch nach
+                    # der KI auf die Vorlage beschraenken - die Verteilung von Zusatzinfos
+                    # auf freie Slots (9202 -> 9213 -> 9220) kann sonst eine ID ausserhalb
+                    # der Vorlage als sicher liefern. Verwirft auch gelernte Zuordnungen
+                    # (nichts dauerhaft in die Zuordnungsdatei lernen).
+                    restrict_hybrid_to_template(hybrid, template_ids_worker)
                 if hybrid.ai_error:
                     summary["media_warnings"].append((bundle.article_number, f"Attribut-KI: {hybrid.ai_error}"))
                     if "Key" in hybrid.ai_error:
