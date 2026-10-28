@@ -118,7 +118,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.50"
+APP_VERSION = "0.1.51"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -497,6 +497,12 @@ LEGACY_SEARCH_TERM_CRITERIA_ID = "9595"
 FREE_TEXT_SLOT_IDS = ["9202", "9213", "9220"]
 # Die KI liefert alle Kurzinfos unter dieser ID; die App verteilt auf die Slots.
 FREE_TEXT_CRITERIA_ID = FREE_TEXT_SLOT_IDS[0]
+# Attribute nach Referenzartikel: Kriterien-IDs, deren Zeilen 1:1 aus dem
+# Referenzartikel uebernommen werden (Zusatzinfo, Zusatz LI/SI 2, Information,
+# Entspricht Norm) statt je Artikel aus Text/KI gesucht zu werden - der
+# Referenzartikel wird von Hand gepflegt und ist die Wahrheit. Im Abrufumfang
+# aenderbar ('davon 1:1 uebernehmen (Kriterien-IDs)').
+DEFAULT_REFERENCE_COPY_CRITERIA_IDS = "9202, 9213, 9220, 9798"
 SEARCH_TERM_MAX_LENGTH = 50
 CSV_ARTICLE_HEADER_ALIASES = {
     "artikelnummer",
@@ -908,6 +914,62 @@ class HybridAttributeResult:
     ai_used: bool = False
     ai_error: str = ""
     ai_usage_text: str = ""
+
+
+@dataclass
+class ReferenceTemplate:
+    """Attribut-Vorlage aus dem Referenzartikel (Option 'Attribute nach Referenzartikel').
+
+    Eine Struktur fuer Einzelartikel und Massenimport; liegt auch in der
+    Sicherung eines offenen KI-Batches (nur einfache Typen, pickle-faehig).
+
+    reference_article: Artikelnummer des Referenzartikels.
+    search_ids: Kriterien-IDs, die je Artikel aus Text/KI gesucht werden
+        (Vorlage ohne die Kopier-IDs), in der Reihenfolge des Referenzartikels.
+    copy_ids: Kriterien-IDs aus 'davon 1:1 uebernehmen' (nur dem Katalog
+        bekannte). Sie werden weder per Regel gesucht noch der KI als Kandidaten
+        gegeben; vorhandene Zeilen dieser IDs werden beim Artikel durch die
+        Zeilen des Referenzartikels ersetzt - nur fuer IDs, zu denen der
+        Referenzartikel Zeilen hat (copied_ids); eine Kopier-ID ohne Zeile im
+        Referenzartikel (copy_ids_without_reference_rows) wird weder kopiert
+        noch gesucht, vorhandene Zeilen des Artikels bleiben.
+    copy_rows: die Zeilen des Referenzartikels zu den Kopier-IDs in seiner
+        Reihenfolge - alle, auch mehrere je ID (der Referenzartikel ist die Wahrheit).
+    reference_lines: Formatbeispiele fuer die KI (nur gesuchte IDs).
+    all_ids_in_reference_order: alle Vorlage-IDs (gesucht + kopiert) in der
+        Reihenfolge des Referenzartikels, fuer die Sortierung der Artikelzeilen.
+    unknown_copy_ids: eingegebene Kopier-IDs, die der Katalog nicht kennt (ignoriert).
+    """
+
+    reference_article: str = ""
+    search_ids: list[str] = field(default_factory=list)
+    copy_ids: list[str] = field(default_factory=list)
+    copy_rows: list[AttributeRow] = field(default_factory=list)
+    reference_lines: list[str] = field(default_factory=list)
+    all_ids_in_reference_order: list[str] = field(default_factory=list)
+    unknown_copy_ids: list[str] = field(default_factory=list)
+
+    def copied_ids(self) -> list[str]:
+        """Kriterien-IDs, zu denen der Referenzartikel 1:1-Zeilen hat (ohne Doppelte)."""
+        return list(dict.fromkeys(row.criteria_id.strip() for row in self.copy_rows if row.criteria_id.strip()))
+
+    def copy_ids_without_reference_rows(self) -> list[str]:
+        """Kopier-IDs ohne Zeile im Referenzartikel: nichts kopiert, nichts gesucht,
+        nichts ersetzt - vorhandene Zeilen des Artikels bleiben (Hinweis im Kurztext)."""
+        copied = set(self.copied_ids())
+        return [criteria_id for criteria_id in self.copy_ids if criteria_id not in copied]
+
+    def summary_text(self) -> str:
+        """'REF (3507, 727; 1:1: 9202, 9798; ohne Zeile im Referenzartikel: 9220)'
+        fuer Startmeldung und Abschlussdialog."""
+        parts = [", ".join(self.search_ids)] if self.search_ids else []
+        if self.copy_rows:
+            parts.append(f"1:1: {', '.join(self.copied_ids())}")
+        if self.copy_ids_without_reference_rows():
+            parts.append(f"ohne Zeile im Referenzartikel: {', '.join(self.copy_ids_without_reference_rows())}")
+        if self.unknown_copy_ids:
+            parts.append(f"unbekannte 1:1-IDs ignoriert: {', '.join(self.unknown_copy_ids)}")
+        return f"{self.reference_article} ({'; '.join(parts)})" if parts else self.reference_article
 
 
 @dataclass
@@ -1611,6 +1673,13 @@ _SIGNED_NUMBER_PATTERN = rf"[+-]?{_NUMBER_PATTERN}"
 # Einheiten dürfen Hochzahlen (m², m³), Klammern (dB(A)) und Schrägstriche
 # (m³/Std., l/min) enthalten.
 _UNIT_PATTERN = r"[A-Za-z²³°/%\".()]{0,8}"
+# Normbezeichnungen ('EN ISO 374-1', 'DIN EN 1494', 'ANSI/ISEA 105'): folgt nach
+# dem Doppelpunkt das Ausgabejahr ('EN ISO 374-1:2016/TYPE B'), gehoert der
+# Doppelpunkt zur Norm - keine 'Label: Wert'-Zeile. Bis v0.1.51 wurde daraus ueber
+# die gelernte Zuordnung 'EN ISO 374-1' -> 9798 der Wert '2016/TYPE B'.
+# 'Norm: EN ISO 374-1:2016' (Label 'Norm') bleibt eine normale Spezifikationszeile.
+_NORM_DESIGNATION_PATTERN = re.compile(r"^(?:DIN|EN|ISO|IEC|ANSI|ASTM|VDE|UL)\b[\w\s/.-]*\d[\w.-]*$")
+_NORM_YEAR_VALUE_PATTERN = re.compile(r"^\d{4}(?:\b|/)")
 
 
 def extract_spec_lines_from_text(text: str) -> list[ExtractedSpecLine]:
@@ -1624,6 +1693,8 @@ def extract_spec_lines_from_text(text: str) -> list[ExtractedSpecLine]:
             label, _, value = line.partition("\t")
         elif ":" in line:
             label, _, value = line.partition(":")
+            if _NORM_DESIGNATION_PATTERN.match(" ".join(label.split())) and _NORM_YEAR_VALUE_PATTERN.match(value.strip()):
+                continue  # 'EN ISO 374-1:2016/TYPE B': Doppelpunkt gehoert zur Norm, bleibt Freitext fuer die KI
         else:
             continue
         label = " ".join(label.split())
@@ -2775,6 +2846,82 @@ def merge_attribute_rows_add_only(rows: list[AttributeRow], new_rows: list[Attri
     return merged
 
 
+def parse_criteria_id_list(text: str) -> list[str]:
+    """Kriterien-IDs aus einer Eingabe wie '9202, 9213; 9220 9798' (tolerant, ohne Doppelte)."""
+    return list(dict.fromkeys(part for part in re.split(r"[,;\s]+", str(text or "").strip()) if part))
+
+
+def reference_order_rank(reference_order: list[str]) -> dict[str, int]:
+    """Position jeder Vorlage-ID in der Reihenfolge des Referenzartikels (erste Nennung zaehlt)."""
+    return {
+        criteria_id: index
+        for index, criteria_id in enumerate(dict.fromkeys(str(cid).strip() for cid in reference_order))
+    }
+
+
+def reference_sort_key(criteria_id: str, index: int, rank: dict[str, int]) -> tuple[int, int, int]:
+    """Sortierschluessel 'wie der Referenzartikel': Marke (8988) zuerst, dann die
+    Vorlage-IDs in Referenz-Reihenfolge, uebrige Zeilen dahinter; `index` haelt die
+    Sortierung stabil (mehrere Zeilen derselben ID behalten ihre Reihenfolge)."""
+    criteria_id = criteria_id.strip()
+    if criteria_id == BRAND_CRITERIA_ID:
+        return (0, 0, index)
+    if criteria_id in rank:
+        return (1, rank[criteria_id], index)
+    return (2, 0, index)
+
+
+def order_attribute_rows_by_reference(rows: list[AttributeRow], reference_order: list[str]) -> list[AttributeRow]:
+    """Attributzeilen wie der Referenzartikel sortieren (siehe reference_sort_key)."""
+    rank = reference_order_rank(reference_order)
+    return [
+        row
+        for _index, row in sorted(enumerate(rows), key=lambda item: reference_sort_key(item[1].criteria_id, item[0], rank))
+    ]
+
+
+def merge_reference_attribute_rows(
+    rows: list[AttributeRow], template: "ReferenceTemplate", new_rows: list[AttributeRow]
+) -> list[AttributeRow]:
+    """Attribut-Vorlage (Referenzartikel) auf die Zeilen eines Artikels anwenden (im Speicher).
+
+    Zeilen der Kopier-IDs, zu denen der Referenzartikel Zeilen hat (copied_ids),
+    werden durch dessen 1:1-Zeilen ersetzt (auch mehrere je ID - der
+    Referenzartikel ist die Wahrheit); Zeilen einer Kopier-ID ohne Zeile im
+    Referenzartikel bleiben (nichts wird still geloescht). Gefundene Zeilen
+    (new_rows) kommen add-only dazu (nur Kriterien-IDs, die der Artikel danach noch
+    nicht hat), und alle Zeilen werden wie der Referenzartikel sortiert. Ein
+    erneuter Lauf liefert dieselben Zeilen (keine Doppelten)."""
+    copy_ids = set(template.copied_ids())
+    merged = [row for row in rows if row.criteria_id.strip() not in copy_ids]
+    merged.extend(normalize_attribute_rows(template.copy_rows))
+    existing_ids = {row.criteria_id.strip() for row in merged if row.criteria_id.strip()}
+    for row in normalize_attribute_rows(new_rows):
+        criteria_id = row.criteria_id.strip()
+        if not criteria_id or criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID or criteria_id in existing_ids:
+            continue
+        existing_ids.add(criteria_id)
+        merged.append(row)
+    return order_attribute_rows_by_reference(merged, template.all_ids_in_reference_order)
+
+
+def reference_replaced_attribute_rows(rows: list[AttributeRow], template: "ReferenceTemplate") -> list[AttributeRow]:
+    """Zeilen eines Artikels (Maske), die merge_reference_attribute_rows durch die
+    1:1-Zeilen des Referenzartikels ersetzt: Zeilen der kopierten IDs ohne gleiche
+    Zeile (Kriterien-ID, Wert, Wert bis) im Referenzartikel - fuer die Statuszeile."""
+    copied_ids = set(template.copied_ids())
+    reference_keys = {
+        (row.criteria_id.strip(), row.value.casefold(), row.value_to.casefold())
+        for row in normalize_attribute_rows(template.copy_rows)
+    }
+    return [
+        row
+        for row in normalize_attribute_rows(rows)
+        if row.criteria_id.strip() in copied_ids
+        and (row.criteria_id.strip(), row.value.casefold(), row.value_to.casefold()) not in reference_keys
+    ]
+
+
 def format_oe_number_rows(label: str, rows: list[OeNumberRow]) -> str:
     normalized = normalize_oe_number_rows(rows)
     lines = [label]
@@ -3438,7 +3585,8 @@ def write_ki_batch_resume_file(payload: dict[str, object]) -> None:
 
     payload: entries (die pending_ai-Eintraege des Massenimports), chunks
     (je eingereichtem Batch: batch_id + Schluessel), options, output_root,
-    run_label, created_at, model, template_ids, reference_article.
+    run_label, created_at, model, reference_template (ReferenceTemplate der
+    Vorlage, seit v0.1.51) sowie template_ids, reference_article (Einzelfelder).
     """
     tmp_path = KI_BATCH_RESUME_FILE.with_suffix(".tmp")
     try:
@@ -7987,6 +8135,125 @@ def append_attribute_rows_add_only(
             existing_rows = [row for row in existing_rows if not (is_empty_fill_row(row) and str(row[1]).strip() in added_ids)]
         write_workbook(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS, existing_rows + appended_rows)
     return added_ids
+
+
+def read_article_attribute_rows_for_ids(path: Path, criteria_ids: set[str]) -> dict[str, list[list[str]]]:
+    """Vorlage (Testlauf): vorhandene Dateizeilen der genannten Kriterien-IDs je
+    Artikel aus Attribute.xlsx (Dateireihenfolge) - um zu berichten, welche Zeilen
+    der scharfe Lauf ersetzen wuerde, ohne je Artikel die Datei zu lesen."""
+    rows_by_article: dict[str, list[list[str]]] = {}
+    wanted = {str(criteria_id or "").strip() for criteria_id in criteria_ids if str(criteria_id or "").strip()}
+    if not wanted or not path.exists():
+        return rows_by_article
+    for row in prepare_existing_rows_for_write(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS):
+        if len(row) < 6:
+            continue
+        article = normalize_article_number(str(row[0] or ""))
+        if article and str(row[1] or "").strip() in wanted:
+            rows_by_article.setdefault(article, []).append(list(row))
+    return rows_by_article
+
+
+def reference_replaced_file_rows(
+    article_rows: list[list[str]],
+    template: ReferenceTemplate,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+) -> list[list[str]]:
+    """Dateizeilen eines Artikels (Attribute.xlsx), die apply_reference_attribute_rows
+    durch die 1:1-Zeilen des Referenzartikels ersetzt: Zeilen der kopierten IDs ohne
+    gleiche Zeile (Kriterien-ID, Wert, Wert bis) im Referenzartikel - fuer
+    Testbericht und Abschlussdialog (im Testlauf 'wuerde ersetzt')."""
+    copied_ids = set(template.copied_ids())
+    reference_keys: set[tuple[str, str, str]] = set()
+    for row in normalize_attribute_rows(template.copy_rows):
+        export_value = row.value
+        if is_attribute_key_value_format(row.value_format):
+            export_value = resolve_attribute_export_value(row, attribute_key_values_by_group)
+        reference_keys.add((row.criteria_id.strip(), str(export_value).strip().casefold(), row.value_to.strip().casefold()))
+    replaced: list[list[str]] = []
+    for row in article_rows:
+        if len(row) < 6:
+            continue
+        criteria_id = str(row[1] or "").strip()
+        key = (criteria_id, str(row[4] or "").strip().casefold(), str(row[5] or "").strip().casefold())
+        if criteria_id in copied_ids and key not in reference_keys:
+            replaced.append(list(row))
+    return replaced
+
+
+def apply_reference_attribute_rows(
+    path: Path,
+    article_number: str,
+    template: ReferenceTemplate,
+    new_rows: list[AttributeRow],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    written_at: str,
+) -> tuple[list[str], int, list[list[str]], bool]:
+    """Attribut-Vorlage (Referenzartikel) in der Attribute.xlsx auf einen Artikel anwenden.
+
+    Wie merge_reference_attribute_rows, nur auf der Datei: die Zeilen der
+    Kopier-IDs, zu denen der Referenzartikel Zeilen hat (copied_ids), werden
+    durch dessen 1:1-Zeilen ersetzt (Zeilen einer Kopier-ID ohne Zeile im
+    Referenzartikel bleiben), new_rows kommen add-only dazu, die Zeilen des
+    Artikels werden wie der Referenzartikel sortiert. Andere Artikel und
+    unveraenderte Zeilen (samt Zeitstempel) bleiben, wie sie sind; die Marke
+    (8988) wird nie angefasst. Ohne Aenderung wird nicht geschrieben (erneuter
+    Lauf = keine Doppelten).
+    Rueckgabe: (hinzugefuegte Kriterien-IDs, Anzahl 1:1-Zeilen, ersetzte
+    Dateizeilen des Artikels, geschrieben?).
+    """
+    existing_rows = prepare_existing_rows_for_write(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS)
+    article_key = normalize_article_number(article_number)
+
+    def is_article_row(row: list[str]) -> bool:
+        return len(row) >= 6 and normalize_article_number(str(row[0] or "")) == article_key
+
+    def comparable(row: list[str]) -> tuple[str, ...]:
+        return tuple(str(cell or "").strip() for cell in row[1:6])
+
+    article_rows = [list(row) for row in existing_rows if is_article_row(row)]
+    other_rows = [row for row in existing_rows if not is_article_row(row)]
+    copy_ids = set(template.copied_ids())
+    kept_rows = [row for row in article_rows if str(row[1] or "").strip() not in copy_ids]
+    replaced_rows = reference_replaced_file_rows(article_rows, template, attribute_key_values_by_group)
+
+    def file_row(row: AttributeRow) -> list[str]:
+        export_value = row.value
+        if is_attribute_key_value_format(row.value_format):
+            export_value = resolve_attribute_export_value(row, attribute_key_values_by_group)
+        return append_written_at(
+            [article_key, row.criteria_id, row.label, row.value_format, export_value, row.value_to], written_at
+        )
+
+    copied_rows = [file_row(row) for row in normalize_attribute_rows(template.copy_rows)]
+    existing_ids = {str(row[1] or "").strip() for row in kept_rows + copied_rows}
+    added_ids: list[str] = []
+    appended_rows: list[list[str]] = []
+    for row in normalize_attribute_rows(new_rows):
+        criteria_id = row.criteria_id.strip()
+        if not criteria_id or criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID or criteria_id in existing_ids:
+            continue
+        appended_rows.append(file_row(row))
+        existing_ids.add(criteria_id)
+        added_ids.append(criteria_id)
+    # Unveraenderte 1:1-Zeilen behalten ihren Zeitstempel.
+    previous_written_at = {comparable(row): str(row[6] or "") for row in article_rows if len(row) > 6}
+    for row in copied_rows + appended_rows:
+        stamp = previous_written_at.get(comparable(row))
+        if stamp:
+            row[6] = stamp
+    rank = reference_order_rank(template.all_ids_in_reference_order)
+    ordered_rows = [
+        row
+        for _index, row in sorted(
+            enumerate(kept_rows + copied_rows + appended_rows),
+            key=lambda item: reference_sort_key(str(item[1][1] or ""), item[0], rank),
+        )
+    ]
+    changed = [comparable(row) for row in ordered_rows] != [comparable(row) for row in article_rows]
+    if changed:
+        write_workbook(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS, other_rows + ordered_rows)
+    return added_ids, len(copied_rows), replaced_rows, changed
 
 
 def export_bundle(
@@ -13553,6 +13820,9 @@ class ApolloImportApp:
         # Attribute dieses Referenzartikels (Werte je Artikel aus Text/KI).
         self.batch_attribute_reference_var = tk.BooleanVar(value=False)
         self.batch_attribute_reference_article_var = tk.StringVar(value="")
+        # Kriterien-IDs, deren Zeilen 1:1 aus dem Referenzartikel kommen (statt
+        # Suche je Artikel); vorhandene Zeilen dieser IDs werden ersetzt.
+        self.batch_attribute_reference_copy_ids_var = tk.StringVar(value=DEFAULT_REFERENCE_COPY_CRITERIA_IDS)
         # Suchwoerter: KI-Vorschlaege im Einzelartikel (wirksam nur mit API Key -
         # ohne Key laufen nur die Regeln) und im Massenimport (Standard aus, kostet
         # je Artikel einen KI-Aufruf).
@@ -14491,6 +14761,7 @@ class ApolloImportApp:
                 "skip_discontinued": self.skip_discontinued_var.get(),
                 "batch_attribute_reference": self.batch_attribute_reference_var.get(),
                 "batch_attribute_reference_article": self.batch_attribute_reference_article_var.get(),
+                "batch_attribute_reference_copy_ids": self.batch_attribute_reference_copy_ids_var.get(),
                 "brand_list": self.brand_list_var.get(),
                 "search_term_ai": self.search_term_ai_var.get(),
                 "batch_search_term_ai": self.batch_search_term_ai_var.get(),
@@ -14680,6 +14951,11 @@ class ApolloImportApp:
                 )
                 self.batch_attribute_reference_article_var.set(
                     str(options.get("batch_attribute_reference_article", self.batch_attribute_reference_article_var.get()) or "")
+                )
+                # Aeltere Sitzungsdateien (bis v0.1.50) ohne Kopier-IDs behalten den Standard;
+                # ein bewusst geleertes Feld (nichts 1:1) bleibt leer.
+                self.batch_attribute_reference_copy_ids_var.set(
+                    str(options.get("batch_attribute_reference_copy_ids", self.batch_attribute_reference_copy_ids_var.get()) or "")
                 )
                 # Aeltere Sitzungsdateien ohne Markenliste behalten den Standard.
                 stored_brand_list = str(options.get("brand_list", self.brand_list_var.get()) or "").strip()
@@ -15847,10 +16123,20 @@ if ($copied) {{
                 normalize_article_number(self.article_number_var.get())
             ),
         ).grid(row=0, column=2, padx=(6, 0))
+        # Eigener Unterrahmen ueber alle Spalten: das lange Label wuerde sonst Spalte 0
+        # verbreitern und 'Referenzartikel' von seinem Feld wegruecken. Die ueberschuessige
+        # Breite des Unterrahmens nimmt die leere Platzhalter-Spalte 3 (weight=1) auf,
+        # Spalten 0-2 behalten ihre natuerliche Breite.
+        reference_row.columnconfigure(3, weight=1)
+        copy_row = ttk.Frame(reference_row)
+        copy_row.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(copy_row, text="davon 1:1 übernehmen (Kriterien-IDs)").grid(row=0, column=0, padx=(0, 6))
+        ttk.Entry(copy_row, textvariable=self.batch_attribute_reference_copy_ids_var, width=28).grid(row=0, column=1)
         ttk.Label(
             scope_frame,
             text=(
-                "Attribute werden nur ergänzt, nie überschrieben. Im Testlauf wird ausschließlich der "
+                "Attribute werden nur ergänzt, nie überschrieben - Ausnahme sind die 1:1-Zeilen des Referenzartikels, "
+                "die vorhandene Zeilen derselben IDs ersetzen. Im Testlauf wird ausschließlich der "
                 "Attribut-Testbericht.xlsx erzeugt - ideal zum Prüfen vor einem großen Lauf. "
                 "Unsichere Treffer landen zusätzlich in der Attribute_Pruefliste.xlsx. "
                 "Die Marke (Attribut 8988) wird bei jedem Abruf automatisch ergänzt - auch ohne 'Attribute' "
@@ -15860,7 +16146,11 @@ if ($copied) {{
                 "beim Einzel- und Massenimport nicht übernommen und im Massenimport in der Warnliste genannt. "
                 "Mit 'Attribute nach Referenzartikel' bekommen alle Artikel eines Massenimports genau die Attribute "
                 "des Referenzartikels (z. B. Spannbereich statt Klemmbereich von/bis); andere Treffer landen nur in "
-                "der Prüfliste. Für Listen gleichartiger Produkte."
+                "der Prüfliste. Für Listen gleichartiger Produkte. Die Kriterien-IDs unter 'davon 1:1 übernehmen' "
+                "(Standard: Zusatzinfo 9202, Zusatz LI/SI 2 9213, Information 9220, Entspricht Norm 9798) werden nicht "
+                "gesucht, sondern mit allen Zeilen des Referenzartikels übernommen - vorhandene Zeilen dieser IDs "
+                "werden dabei ersetzt (nur IDs, zu denen der Referenzartikel Zeilen hat; ersetzte Zeilen stehen in "
+                "Statuszeile und Testbericht), die Attribute in der Reihenfolge des Referenzartikels sortiert (Marke zuerst)."
             ),
             wraplength=500,
             foreground="#5E6472",
@@ -16540,7 +16830,16 @@ if ($copied) {{
         if not initial:
             self.status_var.set(f"Attribut-Zuordnung geladen: {len(self.attribute_mapping)} Einträge")
 
-    def _apply_attribute_suggestions(self, rows: list[AttributeRow], learned: list[tuple[str, str]]) -> None:
+    def _apply_attribute_suggestions(
+        self,
+        rows: list[AttributeRow],
+        learned: list[tuple[str, str]],
+        template: ReferenceTemplate | None = None,
+    ) -> None:
+        """'Uebernehmen' im Bestaetigungsdialog: angehakte Zeilen in die Maske (exakte
+        Doppel uebersprungen). Mit `template` (Attribut-Vorlage) wird die Maske danach
+        wie der Referenzartikel sortiert - sonst haengt eine bestaetigte Pruefzeile
+        eines gesuchten Vorlage-Attributs hinten an."""
         added = 0
         if rows:
             existing = self.attribute_frame.get_rows()
@@ -16553,7 +16852,10 @@ if ($copied) {{
                 seen.add(key)
                 new_rows.append(row)
             if new_rows:
-                self.attribute_frame.set_rows(existing + new_rows)
+                rows_out = existing + new_rows
+                if template is not None:
+                    rows_out = order_attribute_rows_by_reference(rows_out, template.all_ids_in_reference_order)
+                self.attribute_frame.set_rows(rows_out)
                 added = len(new_rows)
                 self._write_live_section("attributes", status_message=f"{added} Attribut(e) aus Text übernommen")
 
@@ -16581,29 +16883,56 @@ if ($copied) {{
         elif added == 0:
             self.status_var.set("Keine neuen Attribute übernommen.")
 
-    def _resolve_reference_attribute_template(self) -> tuple[str, list[str] | None, list[str], str]:
+    def _reference_article_attribute_rows(self, reference_article: str) -> list[AttributeRow]:
+        """Aktuelle Attributzeilen des Referenzartikels fuer die Vorlage.
+
+        Wie _existing_attribute_rows_for_fetch, nur dass die Maske zaehlt, wenn
+        sie den Referenzartikel zeigt (_mask_article_number): dort gerade
+        gepflegte Zeilen gelten sofort - nicht erst, wenn das asynchrone
+        Live-Schreiben den Eintrag im Verzeichnis nachgezogen hat. Sonst wuerde
+        ein veralteter Stand kopiert, bei Referenz = geladenem Artikel sogar die
+        eigene Eingabe zurueckgesetzt und so geschrieben. Danach ein noch
+        wartender Schreibauftrag, zuletzt der Eintrag im Artikelverzeichnis
+        (spiegelt die Output-Dateien).
+        """
+        if not reference_article:
+            return []
+        if reference_article == self._mask_article_number:
+            return list(self.attribute_frame.get_rows())
+        queued_bundle = self.live_writer.latest_bundle(reference_article)
+        if queued_bundle is not None:
+            return list(queued_bundle.attribute_rows)
+        record = self.article_browser_records.get(reference_article)
+        return list(record.attribute_rows) if record is not None else []
+
+    def _resolve_reference_template(self) -> tuple[ReferenceTemplate | None, str]:
         """Attribut-Vorlage aus dem Referenzartikel (Option 'Attribute nach Referenzartikel').
 
         Gemeinsam fuer Massenimport und Einzelartikel (Button 'Attribute
-        automatisch ausfuellen', Findung nach 'Artikel anlegen'). Liest Haken und
-        Artikelnummer aus dem Abrufumfang und die Attributzeilen des Referenz-
-        artikels aus dem Verzeichnis (spiegelt die Output-Dateien).
+        automatisch ausfuellen', Findung nach 'Artikel anlegen'). Liest Haken,
+        Artikelnummer und die Kopier-IDs ('davon 1:1 uebernehmen') aus dem
+        Abrufumfang und die Attributzeilen des Referenzartikels aus Maske,
+        wartendem Schreibauftrag oder Verzeichnis (_reference_article_attribute_rows).
 
-        Rueckgabe: (Referenzartikel, Vorlage-IDs, Referenzzeilen fuer die KI,
-        Fehlertext). Ohne Haken ist die Vorlage None. Vorlage = Kriterien-IDs der
-        Attributzeilen ausser Marke (8988) und Altbestand (9595), nur bekannte
-        Katalog-IDs; Referenzzeilen 'ID | Label: Wert [bis Wert] ' mit Schluessel-
-        Bezeichnung aus der Werteliste ('1 | Einohrklemme'). Hat der Referenz-
-        artikel keine Attribute: Vorlage None und Fehlertext (der Aufrufer meldet
-        und bricht ab).
+        Rueckgabe: (Vorlage, Fehlertext); ohne Haken (None, ""). Vorlage = die
+        Attributzeilen des Referenzartikels ausser Marke (8988) und Altbestand
+        (9595), nur bekannte Katalog-IDs. Zeilen der Kopier-IDs werden 1:1
+        uebernommen (copy_rows, alle Zeilen in Referenz-Reihenfolge), die uebrigen
+        IDs je Artikel gesucht (search_ids) - mit Referenzzeilen 'ID | Label: Wert
+        [bis Wert]' als Formatbeispiel fuer die KI (Schluesselwerte mit
+        Bezeichnung aus der Werteliste, '1 | Einohrklemme'). Eine Kopier-ID ohne
+        Zeile im Referenzartikel wird weder kopiert noch gesucht noch ersetzt
+        (Hinweis im Kurztext). Unbekannte Kopier-IDs (sowie 8988/9595) werden
+        ignoriert und in Statuszeile bzw. Abschlussdialog genannt. Hat der
+        Referenzartikel keine Attribute: (None, Fehlertext) - der Aufrufer meldet
+        und bricht ab.
         """
         if not self.batch_attribute_reference_var.get():
-            return "", None, [], ""
+            return None, ""
         reference_article = normalize_article_number(self.batch_attribute_reference_article_var.get())
-        reference_record = self.article_browser_records.get(reference_article) if reference_article else None
         template_rows = [
             row
-            for row in (reference_record.attribute_rows if reference_record is not None else [])
+            for row in self._reference_article_attribute_rows(reference_article)
             if row.criteria_id.strip()
             and row.criteria_id.strip() not in {BRAND_CRITERIA_ID, LEGACY_SEARCH_TERM_CRITERIA_ID}
             and row.criteria_id.strip() in self.attribute_options_by_id
@@ -16615,8 +16944,22 @@ if ($copied) {{
                 "Bitte die Artikelnummer prüfen bzw. den Referenzartikel zuerst pflegen - oder die Option "
                 "'Attribute nach Referenzartikel' im Abrufumfang abschalten."
             )
-            return reference_article, None, [], error_text
-        template_ids = list(dict.fromkeys(row.criteria_id.strip() for row in template_rows))
+            return None, error_text
+        configured_copy_ids = parse_criteria_id_list(self.batch_attribute_reference_copy_ids_var.get())
+        copy_ids = [
+            criteria_id
+            for criteria_id in configured_copy_ids
+            if criteria_id in self.attribute_options_by_id
+            and criteria_id not in {BRAND_CRITERIA_ID, LEGACY_SEARCH_TERM_CRITERIA_ID}
+        ]
+        unknown_copy_ids = [criteria_id for criteria_id in configured_copy_ids if criteria_id not in copy_ids]
+        if unknown_copy_ids:
+            self.status_var.set(
+                f"Vorlage {reference_article}: unbekannte Kriterien-IDs unter '1:1 übernehmen' ignoriert: "
+                f"{', '.join(unknown_copy_ids)}"
+            )
+        copy_rows = [row for row in template_rows if row.criteria_id.strip() in set(copy_ids)]
+        search_rows = [row for row in template_rows if row.criteria_id.strip() not in set(copy_ids)]
 
         def reference_value_text(row: AttributeRow) -> str:
             # Schluesselwerte stehen in der Datei als Schluessel ('1') - fuer die KI
@@ -16633,9 +16976,29 @@ if ($copied) {{
         reference_lines = [
             f"{row.criteria_id} | {row.label}: {reference_value_text(row)}"
             + (f" bis {row.value_to}" if row.value_to.strip() else "")
-            for row in template_rows
+            for row in search_rows
         ]
-        return reference_article, template_ids, reference_lines, ""
+        template = ReferenceTemplate(
+            reference_article=reference_article,
+            search_ids=list(dict.fromkeys(row.criteria_id.strip() for row in search_rows)),
+            copy_ids=copy_ids,
+            copy_rows=copy_rows,
+            reference_lines=reference_lines,
+            all_ids_in_reference_order=list(dict.fromkeys(row.criteria_id.strip() for row in template_rows)),
+            unknown_copy_ids=unknown_copy_ids,
+        )
+        return template, ""
+
+    def _resolve_reference_attribute_template(self) -> tuple[str, list[str] | None, list[str], str]:
+        """Sicht auf _resolve_reference_template() in der Form bis v0.1.50:
+        (Referenzartikel, gesuchte Vorlage-IDs oder None, Referenzzeilen, Fehlertext)."""
+        template, error_text = self._resolve_reference_template()
+        if template is None:
+            reference_article = (
+                normalize_article_number(self.batch_attribute_reference_article_var.get()) if error_text else ""
+            )
+            return reference_article, None, [], error_text
+        return template.reference_article, list(template.search_ids), list(template.reference_lines), ""
 
     def _start_attribute_autofill(self, auto: bool = False, web_research: bool = False) -> None:
         """Startet die hybride Attribut-Findung (Regeln + optionale KI) im Hintergrund.
@@ -16646,7 +17009,10 @@ if ($copied) {{
         Ist 'Attribute nach Referenzartikel' im Abrufumfang angehakt, gilt die
         Vorlage des Referenzartikels auch hier (bis v0.1.49 nur im Massenimport):
         Treffer ausserhalb der Vorlage gehen in die Pruefung, die KI laeuft nur,
-        solange Vorlage-Attribute fehlen. Fehlt der Referenzartikel, meldet der
+        solange gesuchte Vorlage-Attribute fehlen; die Kopier-IDs ('davon 1:1
+        uebernehmen') gelten als belegt - sie werden weder per Regel gesucht noch
+        der KI gegeben, ihre Zeilen kommen 1:1 aus dem Referenzartikel
+        (_finish_attribute_autofill). Fehlt der Referenzartikel, meldet der
         Button einen Hinweis; nach 'Artikel anlegen' (auto) nur die Statuszeile.
         """
         text = "\n".join(
@@ -16672,7 +17038,7 @@ if ($copied) {{
             if not auto:
                 messagebox.showwarning(APP_TITLE, "Es ist keine Attributliste geladen (Datenstämme im Projekt-Tab).")
             return
-        reference_article, template_ids, reference_lines, template_error = self._resolve_reference_attribute_template()
+        template, template_error = self._resolve_reference_template()
         if template_error:
             if auto:
                 # Nur Statuszeile (kein Modal nach dem Abruf) - und zwar so, dass das
@@ -16695,6 +17061,14 @@ if ($copied) {{
         existing_ids = {
             row.criteria_id.strip() for row in self.attribute_frame.get_rows() if row.criteria_id.strip()
         }
+        search_ids: list[str] | None = None
+        reference_lines: list[str] = []
+        if template is not None:
+            # Kopier-IDs zaehlen als belegt: nicht per Regel suchen, nicht an die KI
+            # geben - ihre Zeilen kommen 1:1 aus dem Referenzartikel.
+            existing_ids |= set(template.copy_ids)
+            search_ids = list(template.search_ids)
+            reference_lines = list(template.reference_lines)
         mapping = dict(self.attribute_mapping)
         attribute_options = list(self.attribute_options)
         attribute_options_by_id = dict(self.attribute_options_by_id)
@@ -16731,16 +17105,14 @@ if ($copied) {{
                 article_number=article_number,
                 product_group=product_group,
                 min_ai_text_length=min_ai_text_length,
-                candidate_ids=template_ids,
+                candidate_ids=search_ids,
                 reference_lines=reference_lines,
             )
 
         def on_success(payload: object) -> None:
             result = payload
             if isinstance(result, HybridAttributeResult):
-                self._finish_attribute_autofill(
-                    result, auto=auto, template_ids=template_ids, reference_article=reference_article
-                )
+                self._finish_attribute_autofill(result, auto=auto, template=template)
 
         if web_research:
             mode_hint = "Regeln + KI mit Internet-Recherche"
@@ -16750,8 +17122,10 @@ if ($copied) {{
             mode_hint = "nur Regeln, kein API Key"
         if scrape_needed and cached_scrape is None:
             mode_hint += ", inkl. Kunzer-Abruf"
-        if template_ids is not None:
-            mode_hint += f", Vorlage {reference_article}: {len(template_ids)} Attribute"
+        if template is not None:
+            mode_hint += f", Vorlage {template.reference_article}: {len(template.search_ids)} Attribute"
+            if template.copy_rows:
+                mode_hint += f" gesucht, {len(template.copy_rows)} Zeilen 1:1"
         self._run_background_task(
             f"Attribute werden automatisch ermittelt ({mode_hint}) ...",
             worker,
@@ -16763,47 +17137,87 @@ if ($copied) {{
         self,
         result: HybridAttributeResult,
         auto: bool,
-        template_ids: list[str] | None = None,
-        reference_article: str = "",
+        template: ReferenceTemplate | None = None,
     ) -> None:
         """Ergebnis der Attribut-Findung in die Maske uebernehmen (UI-Thread).
 
         Sichere Treffer werden add-only in die Maske geschrieben und live
         gespeichert, unsichere (inkl. Treffer 'nicht in der Vorlage') gehen in den
-        Bestaetigungsdialog. Mit `template_ids` (Attribut-Vorlage) nennt die
-        Statuszeile die Vorlage-Attribute, die weder vorhanden noch gefunden sind.
+        Bestaetigungsdialog. Mit `template` (Attribut-Vorlage) kommen die Zeilen
+        der Kopier-IDs 1:1 aus dem Referenzartikel und ersetzen vorhandene Zeilen
+        dieser IDs, die Maske wird wie der Referenzartikel sortiert
+        (merge_reference_attribute_rows); der Dialog zeigt die 1:1-Zeilen als
+        angehakte Zeilen mit Hinweis, und die Statuszeile nennt die 1:1-Zeilen
+        sowie die gesuchten Vorlage-Attribute, die weder vorhanden noch gefunden
+        sind. Ein erneuter Lauf auf demselben Artikel aendert nichts mehr.
         """
-        added = 0
-        if result.accepted:
-            existing = self.attribute_frame.get_rows()
-            existing_ids = {row.criteria_id.strip() for row in existing if row.criteria_id.strip()}
-            new_rows = []
-            for suggestion in result.accepted:
-                row = attribute_suggestion_to_row(suggestion)
-                if row.criteria_id in existing_ids:
-                    continue
-                existing_ids.add(row.criteria_id)
-                new_rows.append(row)
-            if new_rows:
-                self.attribute_frame.set_rows(existing + new_rows)
-                added = len(new_rows)
+        existing = self.attribute_frame.get_rows()
+        existing_ids = {row.criteria_id.strip() for row in existing if row.criteria_id.strip()}
+        accepted_rows = [attribute_suggestion_to_row(suggestion) for suggestion in result.accepted]
+        replaced_rows: list[AttributeRow] = []
+        if template is not None:
+            replaced_rows = reference_replaced_attribute_rows(existing, template)
+            rows = merge_reference_attribute_rows(existing, template, accepted_rows)
+        else:
+            rows = merge_attribute_rows_add_only(existing, accepted_rows)
+
+        def row_keys(row_list: list[AttributeRow]) -> list[tuple[str, str, str, str, str]]:
+            return [(row.criteria_id, row.label, row.value_format, row.value, row.value_to) for row in row_list]
+
+        changed = row_keys(rows) != row_keys(existing)
+        mask_ids = {row.criteria_id.strip() for row in rows if row.criteria_id.strip()}
+        added = len(
+            [
+                criteria_id
+                for criteria_id in dict.fromkeys(row.criteria_id for row in accepted_rows)
+                if criteria_id not in existing_ids and criteria_id in mask_ids
+            ]
+        )
+        copied = len(template.copy_rows) if template is not None else 0
+        if changed:
+            self.attribute_frame.set_rows(rows)
 
         status_parts = [f"Attribute: {added} automatisch übernommen"]
         if result.review:
             status_parts.append(f"{len(result.review)} zur Prüfung")
-        if template_ids is not None:
-            # Vorlage (Referenzartikel): offen gebliebene Vorlage-Attribute nennen -
-            # weder vorhanden (Maske nach dem Schreiben) noch sicher gefunden.
-            mask_ids = {row.criteria_id.strip() for row in self.attribute_frame.get_rows() if row.criteria_id.strip()}
-            unfilled = [cid for cid in template_ids if cid in missing_template_ids(template_ids, mask_ids, result)]
-            template_label = f"Vorlage {reference_article}" if reference_article else "Vorlage"
-            if unfilled:
+        if template is not None:
+            # Vorlage (Referenzartikel): 1:1-Zeilen und offen gebliebene gesuchte
+            # Vorlage-Attribute nennen - weder vorhanden (Maske nach dem Schreiben)
+            # noch sicher gefunden. Ohne 1:1-Zeilen die Meldung wie bis v0.1.50.
+            search_ids = list(template.search_ids)
+            unfilled = [cid for cid in search_ids if cid in missing_template_ids(search_ids, mask_ids, result)]
+            template_label = f"Vorlage {template.reference_article}" if template.reference_article else "Vorlage"
+            if copied:
+                if search_ids:
+                    found_text = f"{len(search_ids) - len(unfilled)} von {len(search_ids)} gesuchten Attributen gefunden"
+                    if unfilled:
+                        found_text += f" (nicht gefunden: {', '.join(unfilled)})"
+                else:
+                    found_text = "keine gesuchten Attribute"
+                if replaced_rows:
+                    # Ersetzte Zeilen des Artikels sichtbar machen (nichts wird still entfernt).
+                    replaced_ids = ", ".join(dict.fromkeys(row.criteria_id.strip() for row in replaced_rows))
+                    found_text += (
+                        f", {len(replaced_rows)} vorhandene Zeile{'n' if len(replaced_rows) != 1 else ''} "
+                        f"ersetzt ({replaced_ids})"
+                    )
                 status_parts.append(
-                    f"{template_label}: {len(unfilled)} von {len(template_ids)} Attributen nicht gefunden "
+                    f"{template_label}: {copied} Zeile{'n' if copied != 1 else ''} 1:1 übernommen, {found_text}"
+                )
+            elif unfilled:
+                status_parts.append(
+                    f"{template_label}: {len(unfilled)} von {len(search_ids)} Attributen nicht gefunden "
                     f"({', '.join(unfilled)})"
                 )
             else:
-                status_parts.append(f"{template_label}: alle {len(template_ids)} Attribute belegt")
+                status_parts.append(f"{template_label}: alle {len(search_ids)} Attribute belegt")
+            if template.copy_ids_without_reference_rows():
+                status_parts.append(
+                    "1:1-IDs ohne Zeile im Referenzartikel (nicht kopiert, nicht gesucht): "
+                    f"{', '.join(template.copy_ids_without_reference_rows())}"
+                )
+            if template.unknown_copy_ids:
+                status_parts.append(f"unbekannte 1:1-IDs ignoriert: {', '.join(template.unknown_copy_ids)}")
         if result.ai_error:
             status_parts.append(f"KI-Fehler: {result.ai_error}")
         elif result.ai_used:
@@ -16811,7 +17225,7 @@ if ($copied) {{
         else:
             status_parts.append("nur Regeln")
         status_text = " | ".join(status_parts)
-        if added:
+        if changed:
             # Der Abschluss des Hintergrund-Schreibens zeigt dieselbe Zusammenfassung
             # (bis v0.1.49 nur 'n Attribut(e) automatisch übernommen'), damit Pruefung
             # und Vorlage-Meldung nicht wenige Sekunden spaeter ueberdeckt werden.
@@ -16843,17 +17257,36 @@ if ($copied) {{
         if result.ai_error and not auto:
             messagebox.showwarning(APP_TITLE, f"KI-Attribut-Findung fehlgeschlagen (Regeln liefen trotzdem):\n{result.ai_error}")
 
+        copy_suggestions: list[AttributeSuggestion] = []
+        if template is not None:
+            # 1:1-Zeilen des Referenzartikels im Dialog als angehakte Zeilen zeigen
+            # (sie stehen bereits in der Maske); 'Übernehmen' doppelt sie nicht,
+            # _apply_attribute_suggestions ueberspringt exakte Doppel.
+            for row in template.copy_rows:
+                option = self.attribute_options_by_id.get(row.criteria_id.strip())
+                if option is None:
+                    continue
+                copy_suggestions.append(
+                    AttributeSuggestion(
+                        option=option,
+                        value=row.value,
+                        value_to=row.value_to,
+                        source_line=f"Referenzartikel {template.reference_article}",
+                        confident=True,
+                        note=f"aus Referenzartikel {template.reference_article} übernommen",
+                    )
+                )
         show_dialog = bool(result.review) or (not auto and bool(result.unmatched))
         if show_dialog:
             AttributeSuggestionDialog(
                 self.root,
-                suggestions=result.review,
+                suggestions=copy_suggestions + result.review,
                 unmatched=result.unmatched,
                 attribute_options=self.attribute_options,
-                on_apply=self._apply_attribute_suggestions,
+                on_apply=lambda rows, learned: self._apply_attribute_suggestions(rows, learned, template=template),
                 attribute_key_values_by_group=self.attribute_key_values_by_group,
             )
-        elif not auto and added == 0:
+        elif not auto and added == 0 and not copied:
             messagebox.showinfo(APP_TITLE, "Im Text wurden keine neuen Attribute erkannt.")
 
         # Suchwoerter: KI-Nachlauf nach der automatischen Attribut-Findung (Einzelabruf).
@@ -19581,21 +20014,6 @@ if ($copied) {{
                 f"{run_label} trotzdem starten?\n(Nein = zuerst 'KI-Batch abholen')",
             ):
                 return
-        # Attribut-Vorlage aus dem Referenzartikel (Attribute ausser Marke/Altbestand).
-        template_ids_worker: list[str] | None = None
-        reference_lines_worker: list[str] = []
-        reference_article_worker = ""
-        if resume is not None:
-            # Vorlage des urspruenglichen Laufs (nur noch fuer Lernschleife und Abschlussdialog).
-            template_ids_worker = [str(cid) for cid in (resume.get("template_ids") or [])] or None  # type: ignore[union-attr]
-            reference_article_worker = str(resume.get("reference_article") or "")
-        elif options.get("attributes") and options.get("attributes_reference"):
-            reference_article_worker, template_ids_worker, reference_lines_worker, template_error = (
-                self._resolve_reference_attribute_template()
-            )
-            if template_error:
-                messagebox.showwarning(APP_TITLE, template_error)
-                return
         min_ai_text_length_worker = AI_SHORT_TEXT_MIN_LENGTH if options.get("attributes_short_text") else AI_MIN_TEXT_LENGTH
         # Kopien für den Worker-Thread: keine Tk-/App-Zugriffe aus dem Thread.
         attribute_mapping_worker = dict(self.attribute_mapping)
@@ -19646,6 +20064,34 @@ if ($copied) {{
                 self.status_var.set(f"{run_label} abgebrochen: Live-Speichern noch nicht abgeschlossen.")
                 return
 
+        # Attribut-Vorlage aus dem Referenzartikel (Attribute ausser Marke/Altbestand):
+        # gesuchte IDs je Artikel aus Text/KI, Kopier-IDs 1:1 aus dem Referenzartikel.
+        # Erst NACH dem Abschluss der Live-Auftraege aufloesen: ein gerade in der Maske
+        # gepflegter Referenzartikel ist sonst im Verzeichnis noch veraltet, und der
+        # ganze Lauf wuerde den alten Stand kopieren.
+        template_worker: ReferenceTemplate | None = None
+        if resume is not None:
+            # Vorlage des urspruenglichen Laufs (fuer Finalisierung, Lernschleife, Abschlussdialog).
+            stored_template = resume.get("reference_template")
+            if isinstance(stored_template, ReferenceTemplate):
+                template_worker = stored_template
+            elif resume.get("template_ids"):
+                # Sicherung bis v0.1.50 (nur IDs + Referenzartikel): alles gesucht, nichts 1:1.
+                stored_ids = [str(cid) for cid in (resume.get("template_ids") or [])]  # type: ignore[union-attr]
+                template_worker = ReferenceTemplate(
+                    reference_article=str(resume.get("reference_article") or ""),
+                    search_ids=stored_ids,
+                    all_ids_in_reference_order=list(stored_ids),
+                )
+        elif options.get("attributes") and options.get("attributes_reference"):
+            template_worker, template_error = self._resolve_reference_template()
+            if template_error:
+                messagebox.showwarning(APP_TITLE, template_error)
+                return
+        search_ids_worker: list[str] | None = list(template_worker.search_ids) if template_worker is not None else None
+        reference_lines_worker: list[str] = list(template_worker.reference_lines) if template_worker is not None else []
+        copy_ids_worker: set[str] = set(template_worker.copy_ids) if template_worker is not None else set()
+
         if output_root.exists():
             self.id_registry.load_from_folder(output_root, clear_existing=False)
 
@@ -19680,9 +20126,12 @@ if ($copied) {{
                 # Auslaufartikel ('nicht mehr im Sortiment'), die nicht uebernommen wurden.
                 "discontinued_items": [],
                 # Attribut-Vorlage dieses Laufs (Referenzartikel), fuer den Abschlussdialog.
-                "attribute_template": (
-                    f"{reference_article_worker} ({', '.join(template_ids_worker)})" if template_ids_worker else ""
-                ),
+                "attribute_template": template_worker.summary_text() if template_worker is not None else "",
+                # Vorlage: Zeilen, die 1:1 aus dem Referenzartikel kamen (im Testlauf: kaemen),
+                # und vorhandene Zeilen der Artikel, die dabei ersetzt wurden (wuerden).
+                "attribute_copied_count": 0,
+                "attribute_replaced_count": 0,
+                "attribute_dry_run": bool(options.get("attributes_dry_run")),
                 "last_result": None,
                 "last_bundle": None,
                 "total": total,
@@ -19803,6 +20252,16 @@ if ($copied) {{
                 brand_values_by_article = read_article_attribute_values(output_root / ATTRIBUTE_FILE[0], BRAND_CRITERIA_ID)
             except Exception:  # pragma: no cover - defekte Datei darf den Lauf nicht kippen
                 attribute_ids_by_article = {}
+            # Vorlage im Testlauf: vorhandene Zeilen der kopierten IDs je Artikel (einmal
+            # gelesen), um zu berichten, welche Zeilen der scharfe Lauf ersetzen wuerde.
+            copy_id_rows_by_article: dict[str, list[list[str]]] = {}
+            if attributes_dry_run and template_worker is not None and template_worker.copy_rows:
+                try:
+                    copy_id_rows_by_article = read_article_attribute_rows_for_ids(
+                        output_root / ATTRIBUTE_FILE[0], set(template_worker.copied_ids())
+                    )
+                except Exception:  # pragma: no cover - defekte Datei darf den Lauf nicht kippen
+                    copy_id_rows_by_article = {}
             if options.get("attributes") and resume is None:
                 # Beim Abholen steckt die Produktgruppe bereits in den gesicherten Eintraegen.
                 article_product_groups = load_article_product_groups(find_latest_article_list_source())
@@ -19913,7 +20372,9 @@ if ($copied) {{
                     for text in (extract_pdf_text(source, article_number=bundle.article_number) for source in pdf_sources)
                     if text
                 ]
-                existing_ids = set(attribute_ids_by_article.get(bundle.article_number, set()))
+                # Vorlage: Kopier-IDs zaehlen als belegt (weder Regel-Suche noch KI-Kandidat) -
+                # ihre Zeilen kommen in finalize_attribute_step 1:1 aus dem Referenzartikel.
+                existing_ids = set(attribute_ids_by_article.get(bundle.article_number, set())) | copy_ids_worker
                 product_group = article_product_groups.get(normalize_article_number(bundle.article_number), "")
                 if attribute_web_worker and claude_client is not None and not ai_disabled:
                     # Wie Button 'Automatisch ermitteln (Internet)': Regeln + KI mit Websuche.
@@ -19930,7 +20391,7 @@ if ($copied) {{
                         article_number=bundle.article_number,
                         product_group=product_group,
                         min_ai_text_length=min_ai_text_length_worker,
-                        candidate_ids=template_ids_worker,
+                        candidate_ids=search_ids_worker,
                         reference_lines=reference_lines_worker,
                     )
                     finalize_attribute_step(bundle, hybrid, product_group)
@@ -19943,9 +20404,9 @@ if ($copied) {{
                     attribute_key_values_worker,
                     existing_ids,
                 )
-                if template_ids_worker is not None:
-                    restrict_hybrid_to_template(hybrid, template_ids_worker)
-                    wants_ai = bool(combined) and bool(missing_template_ids(template_ids_worker, existing_ids, hybrid))
+                if search_ids_worker is not None:
+                    restrict_hybrid_to_template(hybrid, search_ids_worker)
+                    wants_ai = bool(combined) and bool(missing_template_ids(search_ids_worker, existing_ids, hybrid))
                 else:
                     wants_ai = bool(combined) and bool(hybrid.unmatched or len(combined) >= min_ai_text_length_worker)
                 client_available = claude_client is not None and not ai_disabled
@@ -19960,7 +20421,7 @@ if ($copied) {{
                         existing_ids,
                         article_number=bundle.article_number,
                         product_group=product_group,
-                        candidate_ids=template_ids_worker,
+                        candidate_ids=search_ids_worker,
                         reference_lines=reference_lines_worker,
                     )
                     if prepared is not None:
@@ -19991,15 +20452,22 @@ if ($copied) {{
                 finalize_attribute_step(bundle, hybrid, product_group)
 
             def finalize_attribute_step(bundle: ExportBundle, hybrid: HybridAttributeResult, product_group: str) -> None:
-                """Validierte Ergebnisse schreiben bzw. berichten (auch rules-only)."""
+                """Validierte Ergebnisse schreiben bzw. berichten (auch rules-only).
+
+                Mit Vorlage (Referenzartikel) wie im Einzelpfad: die Zeilen der
+                Kopier-IDs kommen 1:1 aus dem Referenzartikel und ersetzen vorhandene
+                Zeilen dieser IDs, gefundene Zeilen add-only, Sortierung wie der
+                Referenzartikel (apply_reference_attribute_rows); im Testlauf werden
+                die 1:1-Zeilen nur als 'Referenz 1:1' berichtet. Die Marke (8988)
+                bleibt unangetastet (eigener Schritt)."""
                 nonlocal ai_disabled
-                if template_ids_worker is not None:
+                if search_ids_worker is not None:
                     # Vorlage: wie im Einzelpfad (run_hybrid_attribute_extraction) auch nach
                     # der KI auf die Vorlage beschraenken - die Verteilung von Zusatzinfos
                     # auf freie Slots (9202 -> 9213 -> 9220) kann sonst eine ID ausserhalb
                     # der Vorlage als sicher liefern. Verwirft auch gelernte Zuordnungen
                     # (nichts dauerhaft in die Zuordnungsdatei lernen).
-                    restrict_hybrid_to_template(hybrid, template_ids_worker)
+                    restrict_hybrid_to_template(hybrid, search_ids_worker)
                 if hybrid.ai_error:
                     summary["media_warnings"].append((bundle.article_number, f"Attribut-KI: {hybrid.ai_error}"))
                     if "Key" in hybrid.ai_error:
@@ -20022,14 +20490,86 @@ if ($copied) {{
                         ]
                     )
 
+                copy_rows = list(template_worker.copy_rows) if template_worker is not None else []
+
+                def report_copy_row(row: AttributeRow) -> None:
+                    summary["attribute_report_rows"].append(
+                        [
+                            bundle.article_number,
+                            product_group,
+                            row.criteria_id,
+                            row.label,
+                            row.value_format,
+                            row.value,
+                            row.value_to,
+                            "Referenz 1:1",
+                            "Referenz",
+                            f"aus Referenzartikel {template_worker.reference_article if template_worker else ''} uebernommen",
+                        ]
+                    )
+
+                def report_replaced_rows(replaced: list[list[str]], status: str) -> None:
+                    """Ersetzte (bzw. im Testlauf: zu ersetzende) Zeilen des Artikels mit
+                    ihrem alten Wert berichten - nichts wird still entfernt."""
+                    summary["attribute_replaced_count"] = int(summary["attribute_replaced_count"]) + len(replaced)
+                    for row in replaced:
+                        summary["attribute_report_rows"].append(
+                            [
+                                bundle.article_number,
+                                product_group,
+                                str(row[1] or ""),
+                                str(row[2] or ""),
+                                str(row[3] or ""),
+                                str(row[4] or ""),
+                                str(row[5] or ""),
+                                status,
+                                "Referenz",
+                                f"durch die Zeilen des Referenzartikels {template_worker.reference_article if template_worker else ''} ersetzt",
+                            ]
+                        )
+
                 accepted_rows = [attribute_suggestion_to_row(suggestion) for suggestion in hybrid.accepted]
                 if attributes_dry_run:
                     # Testlauf: nichts schreiben, nichts lernen - nur berichten.
                     summary["attribute_would_count"] = int(summary["attribute_would_count"]) + len(accepted_rows)
                     for suggestion in hybrid.accepted:
                         report(suggestion, "wuerde uebernommen")
+                    summary["attribute_copied_count"] = int(summary["attribute_copied_count"]) + len(copy_rows)
+                    for row in copy_rows:
+                        report_copy_row(row)
+                    if template_worker is not None and copy_rows:
+                        report_replaced_rows(
+                            reference_replaced_file_rows(
+                                copy_id_rows_by_article.get(normalize_article_number(bundle.article_number), []),
+                                template_worker,
+                                attribute_key_values_worker,
+                            ),
+                            "wuerde ersetzt",
+                        )
                 else:
-                    if accepted_rows:
+                    added_ids: list[str] = []
+                    if template_worker is not None and (accepted_rows or copy_rows):
+                        added_ids, copied_count, replaced_rows, _changed = apply_reference_attribute_rows(
+                            output_root / ATTRIBUTE_FILE[0],
+                            bundle.article_number,
+                            template_worker,
+                            accepted_rows,
+                            attribute_key_values_worker,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        )
+                        if copied_count:
+                            known_ids = attribute_ids_by_article.setdefault(bundle.article_number, set())
+                            known_ids.update(template_worker.copied_ids())
+                            summary["attribute_copied_count"] = int(summary["attribute_copied_count"]) + copied_count
+                            for row in copy_rows:
+                                report_copy_row(row)
+                            report_replaced_rows(replaced_rows, "ersetzt")
+                        bundle.attribute_rows = merge_reference_attribute_rows(
+                            bundle.attribute_rows,
+                            template_worker,
+                            [row for row in accepted_rows if row.criteria_id in set(added_ids)],
+                        )
+                    elif accepted_rows:
                         added_ids = append_attribute_rows_add_only(
                             output_root / ATTRIBUTE_FILE[0],
                             bundle.article_number,
@@ -20038,11 +20578,12 @@ if ($copied) {{
                             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         )
                         if added_ids:
-                            attribute_ids_by_article.setdefault(bundle.article_number, set()).update(added_ids)
-                            summary["attribute_added_count"] = int(summary["attribute_added_count"]) + len(added_ids)
                             bundle.attribute_rows = list(bundle.attribute_rows) + [
                                 row for row in accepted_rows if row.criteria_id in set(added_ids)
                             ]
+                    if added_ids:
+                        attribute_ids_by_article.setdefault(bundle.article_number, set()).update(added_ids)
+                        summary["attribute_added_count"] = int(summary["attribute_added_count"]) + len(added_ids)
                     for suggestion in hybrid.accepted:
                         report(suggestion, "automatisch")
 
@@ -20219,8 +20760,11 @@ if ($copied) {{
                                 "output_root": str(output_root),
                                 "options": dict(options),
                                 "model": claude_client.model,
-                                "template_ids": list(template_ids_worker or []),
-                                "reference_article": reference_article_worker,
+                                # Vorlage als Ganzes (gesuchte IDs, 1:1-Zeilen, Reihenfolge); die
+                                # Einzelfelder bleiben zur Lesbarkeit der Sicherung erhalten.
+                                "reference_template": template_worker,
+                                "template_ids": list(search_ids_worker or []),
+                                "reference_article": template_worker.reference_article if template_worker else "",
                                 # Je eingereichtem Batch: {'batch_id', 'keys'} in Chunk-Reihenfolge.
                                 "chunks": [dict(chunk) for chunk in resume_chunks],
                                 "entries": pending_ai,
@@ -20766,8 +21310,22 @@ if ($copied) {{
         brand_existing_count = int(summary.get("brand_existing_count") or 0)
         brand_failed_count = int(summary.get("brand_failed_count") or 0)
         attribute_template = str(summary.get("attribute_template") or "")
+        attribute_copied_count = int(summary.get("attribute_copied_count") or 0)
+        attribute_replaced_count = int(summary.get("attribute_replaced_count") or 0)
         if attribute_template:
             error_list_hint += f"\n\nAttribut-Vorlage (Referenzartikel): {attribute_template}"
+            if attribute_copied_count:
+                replaced_text = (
+                    f", {attribute_replaced_count} vorhandene Zeile{'n' if attribute_replaced_count != 1 else ''} ersetzt"
+                    if attribute_replaced_count
+                    else ""
+                )
+                error_list_hint += (
+                    f"\nVorlage: {attribute_copied_count} Zeilen würden 1:1 übernommen{replaced_text} "
+                    "(Testlauf, nicht geschrieben)"
+                    if summary.get("attribute_dry_run")
+                    else f"\nVorlage: {attribute_copied_count} Zeilen 1:1 übernommen{replaced_text}"
+                )
         if mask_unsaved:
             error_list_hint += (
                 f"\n\nACHTUNG: Die Maske zeigt {mask_article} noch im Stand vor dem Lauf und enthält "
