@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import csv
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
@@ -80,6 +81,15 @@ def _get_pymupdf() -> Any:
     return _pymupdf_module
 
 
+# PyMuPDF ist nicht threadsicher: die Vorschau rendert PDFs in eigenen Threads
+# (PreviewLoader, ein Thread je Vorschau), die Attribut-Findung liest PDF-Text im
+# Hintergrund. Gleichzeitiges Oeffnen/Rendern brachte den Prozess bei schnellem
+# Artikelwechsel zum Absturz (access violation in fz_run_display_list). Jede
+# Verwendung von PyMuPDF (Oeffnen, Seiten lesen/rendern, Schliessen) laeuft deshalb
+# unter dieser Sperre - nie Download oder Tkinter-Aufrufe.
+PYMUPDF_LOCK = threading.RLock()
+
+
 def _get_anthropic() -> Any:
     """Anthropic-SDK beim ersten Aufruf importieren; None, wenn es nicht installiert ist."""
     global _anthropic_module
@@ -118,7 +128,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.51"
+APP_VERSION = "0.1.52"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -381,6 +391,32 @@ BATCH_ERROR_LIST_FILENAME = "Massenimport-Fehler.xlsx"
 # Artikelnummer - Aufbau wie die in Apollo verwendeten Loeschlisten (VLoesch.xlsx).
 APOLLO_DELETE_LIST_COLUMN_A_VALUE = 757
 APOLLO_DELETE_LIST_HEADERS = ["", "Artikelnummer"]
+# Apollo-Importstand: wann die Output-Dateien zuletzt in Apollo (IMS) importiert
+# wurden. Liegt im Ausgabeordner, damit alle Instanzen denselben Stand sehen.
+# Artikel, deren Zeilen ('Zuletzt geschrieben am') juenger sind, muessen vor dem
+# naechsten Import ueber eine Loeschliste aus Apollo entfernt werden; ebenso alle
+# Artikel im Aenderungsjournal changed_since (Artikel -> Zeitpunkt der LETZTEN
+# Aenderung, auch Loeschungen im Verzeichnis) - es faengt die Faelle ab, in denen in
+# den Dateien kein juengerer Zeilen-Zeitstempel steht (Bereich geleert, Artikel
+# geloescht). Das Journal wird auch ohne gesetzten Stand gefuehrt (Datei 'pending',
+# last_import_at leer) und bei 'erledigt' nicht gekuerzt (Eintraege bis zum Stand zaehlen
+# nur nicht mehr - ein spaeter frueher gesetzter Stand sieht sie wieder); delete_list_at =
+# Zeitpunkt der ERSTEN Loeschliste seit Apollo-Import gegen den aktuellen Stand (Grundlage
+# fuer 'Apollo-Import erledigt'), dazu delete_list_base/_size/_count/_checked_at
+# (DELETE_LIST_KEYS).
+IMPORT_STAND_FILENAME = "Apollo-Importstand.json"
+IMPORT_STAND_VERSION = 1
+IMPORT_STAND_CHANGES_HEADERS = ["Artikelnummer", "letzte Aenderung", "geaenderte Bereiche", "Status"]
+# Statuszeilen-Zusatz, wenn ein Journal-Vermerk im Importstand gescheitert ist (bleibt stehen).
+IMPORT_STAND_NOTE_FAILED = "Importstand nicht vermerkt"
+# Massenimport: im Lauf geaenderte Artikel spaetestens nach so vielen Sekunden bzw.
+# Artikeln im Aenderungsjournal vermerken (ein Lese-/Schreibvorgang je Vermerk) - nicht
+# erst am Laufende, das beim Schliessen waehrend des Laufs nie kommt.
+BATCH_JOURNAL_FLUSH_SECONDS = 30.0
+BATCH_JOURNAL_FLUSH_ARTICLES = 25
+# Zeilenfarbe im Artikelverzeichnis und in der Uebersicht: seit dem Importstand geaendert.
+ARTICLE_CHANGED_ROW_COLOR = "#FFE8C2"
+ARTICLE_CHANGED_ROW_TAG = "changed_since_import"
 # Übersprungene tote Medien-Links (Server liefert die Datei dauerhaft nicht).
 # Eigene Datei, damit die Fehlerliste nur echte, wiederholbare Fehler enthält.
 BATCH_WARNING_LIST_FILENAME = "Massenimport-Warnungen.xlsx"
@@ -1107,6 +1143,13 @@ class StoredArticleSnapshot:
     vehicle_link_rows: list[VehicleLinkRow] = field(default_factory=list)
     attribute_rows: list[AttributeRow] = field(default_factory=list)
     search_terms: list[str] = field(default_factory=list)
+    # Zeitstempel 'Zuletzt geschrieben am' je Bereich (Schluessel wie LIVE_SECTIONS):
+    # der juengste Wert aller Zeilen des Artikels in der jeweiligen Datei, Format
+    # 'YYYY-MM-DD HH:MM:SS'. last_written_at = juengster Wert ueber alle Bereiche,
+    # first_written_at = aeltester (fuer 'neu seit Importstand').
+    last_written: dict[str, str] = field(default_factory=dict)
+    last_written_at: str = ""
+    first_written_at: str = ""
 
     def __post_init__(self) -> None:
         self.sync_genart_fields()
@@ -1116,6 +1159,7 @@ class StoredArticleSnapshot:
         self.vehicle_link_rows = normalize_vehicle_link_rows(self.vehicle_link_rows)
         self.attribute_rows = normalize_attribute_rows(self.attribute_rows)
         self.search_terms = normalize_search_terms(self.search_terms)
+        self.sync_written_at_fields()
 
     def sync_genart_fields(self) -> None:
         self.genart_selections = normalize_genart_selections(
@@ -1129,6 +1173,107 @@ class StoredArticleSnapshot:
         else:
             self.genart_id = ""
             self.genart_bezeichnung = ""
+
+    def note_written_at(self, section: str, value: object) -> None:
+        """Merkt den Zeitstempel einer Zeile des Bereichs (nur gueltige Werte)."""
+        written_at = normalize_written_at(value)
+        if not written_at:
+            return
+        current = self.last_written.get(section, "")
+        if written_at > current:
+            self.last_written[section] = written_at
+        if written_at > self.last_written_at:
+            self.last_written_at = written_at
+        if not self.first_written_at or written_at < self.first_written_at:
+            self.first_written_at = written_at
+
+    def stamp_sections(self, sections: set[str] | tuple[str, ...] | list[str], written_at: str) -> None:
+        """Nach einem eigenen Schreibvorgang: die geschriebenen Bereiche tragen den Auftragszeitpunkt."""
+        for section in sections:
+            self.note_written_at(section, written_at)
+
+    def sync_written_at_fields(self) -> None:
+        self.last_written = {section: ts for section, ts in self.last_written.items() if normalize_written_at(ts)}
+        values = list(self.last_written.values())
+        if values:
+            self.last_written_at = max([self.last_written_at, *values]) if self.last_written_at else max(values)
+            first_candidates = [self.first_written_at, *values] if self.first_written_at else values
+            self.first_written_at = min(first_candidates)
+
+
+_WRITTEN_AT_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
+_WRITTEN_AT_DE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$")
+
+
+def normalize_written_at(value: object) -> str:
+    """'Zuletzt geschrieben am' in das Vergleichsformat 'YYYY-MM-DD HH:MM:SS' bringen.
+
+    Nimmt das eigene Format, ISO mit 'T' (datetime-Zellen aus Excel) und die
+    deutsche Schreibweise 'TT.MM.JJJJ HH:MM'. Alles andere (leer, Fremdtext in
+    der Spalte) liefert '' - der Wert zaehlt dann nicht."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    text = str(value).strip()
+    if not text:
+        return ""
+    match = _WRITTEN_AT_RE.match(text)
+    if match:
+        year, month, day, hour, minute, second = match.groups()
+        return f"{year}-{month}-{day} {hour}:{minute}:{second or '00'}"
+    match = _WRITTEN_AT_DE_RE.match(text)
+    if match:
+        day, month, year, hour, minute, second = match.groups()
+        return f"{year}-{int(month):02d}-{int(day):02d} {int(hour or 0):02d}:{minute or '00'}:{second or '00'}"
+    return ""
+
+
+def format_written_at_display(value: str, with_time: bool = True, with_seconds: bool = False) -> str:
+    """'YYYY-MM-DD HH:MM:SS' -> 'TT.MM.JJJJ HH:MM' (bzw. 'TT.MM.JJJJ' oder mit Sekunden); leer bleibt leer."""
+    normalized = normalize_written_at(value)
+    if not normalized:
+        return ""
+    date_part, time_part = normalized.split(" ", 1)
+    year, month, day = date_part.split("-")
+    if not with_time:
+        return f"{day}.{month}.{year}"
+    return f"{day}.{month}.{year} {time_part[:8] if with_seconds else time_part[:5]}"
+
+
+def format_written_at_short(value: str) -> str:
+    """'YYYY-MM-DD HH:MM:SS' -> 'TT.MM.' fuer die Bereichsspalten der Uebersicht."""
+    normalized = normalize_written_at(value)
+    if not normalized:
+        return ""
+    _year, month, day = normalized.split(" ", 1)[0].split("-")
+    return f"{day}.{month}."
+
+
+def parse_import_stand_input(text: str) -> str:
+    """Nutzereingabe fuer 'Importstand setzen' pruefen: liefert 'YYYY-MM-DD HH:MM:SS'
+    oder wirft ValueError mit deutscher Meldung. Erlaubt 'TT.MM.JJJJ HH:MM[:SS]',
+    'JJJJ-MM-TT HH:MM[:SS]' und ein reines Datum (dann 00:00:00)."""
+    raw = text.strip()
+    if not raw:
+        raise ValueError("Bitte Datum und Uhrzeit angeben (z. B. 28.10.2026 14:30).")
+    candidates = (
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    )
+    for pattern in candidates:
+        try:
+            parsed = datetime.strptime(raw, pattern)
+        except ValueError:
+            continue
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    raise ValueError(f"'{raw}' ist kein gültiges Datum. Erwartet: TT.MM.JJJJ HH:MM (z. B. 28.10.2026 14:30).")
 
 
 def parse_genart_selection_label(raw: str) -> GenArtSelection | None:
@@ -4225,27 +4370,29 @@ def extract_pdf_text(
             pdf_bytes = fetch_preview_bytes_from_url(raw, timeout_seconds=20)
         else:
             pdf_bytes = Path(raw).read_bytes()
-        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            parts: list[str] = []
-            total = 0
-            restrict_to_article = bool(str(article_number or "").strip()) and len(document) > 1
-            for page_index in range(min(len(document), max_pages)):
-                page_text = document[page_index].get_text().strip()
-                if not page_text:
-                    continue
-                if restrict_to_article and not pdf_page_mentions_article(page_text, article_number):
-                    continue
-                parts.append(page_text)
-                total += len(page_text)
-                if total >= max_chars:
-                    break
-            # Steuerzeichen sofort entfernen: sie wandern sonst bis in die
-            # Berichts-Exceldateien und lassen openpyxl das Speichern verweigern
-            # (hat den Pilotbericht v0.1.29 gekostet).
-            return _EXCEL_ILLEGAL_CHARACTERS_RE.sub("", "\n".join(parts)[:max_chars]).strip()
-        finally:
-            document.close()
+        # Nur Oeffnen, Lesen und Schliessen unter der Sperre (PYMUPDF_LOCK), nicht der Download.
+        with PYMUPDF_LOCK:
+            document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                parts: list[str] = []
+                total = 0
+                restrict_to_article = bool(str(article_number or "").strip()) and len(document) > 1
+                for page_index in range(min(len(document), max_pages)):
+                    page_text = document[page_index].get_text().strip()
+                    if not page_text:
+                        continue
+                    if restrict_to_article and not pdf_page_mentions_article(page_text, article_number):
+                        continue
+                    parts.append(page_text)
+                    total += len(page_text)
+                    if total >= max_chars:
+                        break
+            finally:
+                document.close()
+        # Steuerzeichen sofort entfernen: sie wandern sonst bis in die
+        # Berichts-Exceldateien und lassen openpyxl das Speichern verweigern
+        # (hat den Pilotbericht v0.1.29 gekostet).
+        return _EXCEL_ILLEGAL_CHARACTERS_RE.sub("", "\n".join(parts)[:max_chars]).strip()
     except Exception:
         return ""
 
@@ -4821,6 +4968,56 @@ def _allocate_media_stem(target_dir: Path, article_number: str, kind_tag: str) -
     raise ValueError("Keine freie Bildnummer mehr verfügbar (mehr als 999 Dateien).")
 
 
+def _image_frames_equal(old_image: object, new_image: object) -> bool:
+    """Gleiche Bilddaten in jedem Frame: Groesse, Modus, Palette, Transparenz und Pixel."""
+    old_frames = getattr(old_image, "n_frames", 1)
+    if old_frames != getattr(new_image, "n_frames", 1):
+        return False
+    for index in range(old_frames):
+        if index:
+            old_image.seek(index)  # type: ignore[attr-defined]
+            new_image.seek(index)  # type: ignore[attr-defined]
+        if (
+            old_image.size != new_image.size  # type: ignore[attr-defined]
+            or old_image.mode != new_image.mode  # type: ignore[attr-defined]
+            or old_image.getpalette() != new_image.getpalette()  # type: ignore[attr-defined]
+            or old_image.info.get("transparency") != new_image.info.get("transparency")  # type: ignore[attr-defined]
+            or old_image.tobytes() != new_image.tobytes()  # type: ignore[attr-defined]
+        ):
+            return False
+    return True
+
+
+def _media_file_holds(path: Path, data: bytes, converted: bool = False) -> bool:
+    """True, wenn die Datei genau diese Bytes enthaelt (fehlt sie oder ist sie nicht lesbar: False).
+
+    converted=True: data ist ein von convert_image_bytes_to_png erzeugtes PNG (Quelle webp/
+    tif/bmp, CONVERTIBLE_IMAGE_EXTENSIONS). Nur dann zaehlen bei anderen Bytes gleiche
+    Bilddaten als gleich (jeder Frame mit Groesse, Modus, Palette, Transparenz und Pixeln,
+    dazu das ICC-Profil): die Umwandlung kann mit einer anderen Pillow-/zlib-Version andere
+    Bytes ergeben - der erste 'Medien neu herunterladen'-Lauf markierte sonst alles. Nativ
+    gespeicherte Dateien (JPG/PNG/GIF/PDF) werden Byte fuer Byte verglichen: dort aendern
+    auch EXIF-Ausrichtung, ICC-Profil, Transparenz oder spaetere GIF-Frames das Bild."""
+    try:
+        existing = path.read_bytes()
+    except OSError:
+        return False
+    if existing == data:
+        return True
+    if not converted or Image is None:
+        return False
+    try:
+        with Image.open(io.BytesIO(existing)) as old_image, Image.open(io.BytesIO(data)) as new_image:
+            if old_image.format != "PNG" or new_image.format != "PNG":
+                return False
+            if old_image.info.get("icc_profile") != new_image.info.get("icc_profile"):
+                return False
+            return _image_frames_equal(old_image, new_image)
+    except Exception:
+        # Nicht (mehr) lesbar: es zaehlen die Bytes.
+        return False
+
+
 def download_media_to_folder(
     url: str,
     target_dir: Path,
@@ -4828,6 +5025,7 @@ def download_media_to_folder(
     kind_tag: str,
     index: dict[str, str],
     force: bool = False,
+    changed: list[Path] | None = None,
 ) -> Path:
     """Lädt einen Deeplink herunter und liefert den lokalen Dateipfad zurück.
 
@@ -4835,7 +5033,12 @@ def download_media_to_folder(
     werden wiederverwendet (Live-Speichern), neue URLs bekommen die nächste
     freie Nummer, damit es keine Dopplungen gibt. Mit force=True wird immer
     neu heruntergeladen (Monats-Aktualisierung: erkennt auch unter gleicher
-    URL ausgetauschte Inhalte).
+    URL ausgetauschte Inhalte). Ist der Inhalt dabei gleich geblieben (gleiche
+    Bytes; bei nach PNG umgewandelten Bildern gleiche Bilddaten, siehe
+    _media_file_holds), bleibt die vorhandene Datei unberuehrt; hat er sich unter
+    derselben URL geaendert (auch nur die Endung), kommt die Datei in `changed` - die Zeile in
+    Bilder.xlsx/Dokumente.xlsx bleibt sonst gleich, der Artikel muss trotzdem
+    als 'geaendert seit Apollo-Import' gelten.
     """
     url_key = url.strip()
     target_dir = target_dir.resolve()
@@ -4857,7 +5060,10 @@ def download_media_to_folder(
 
     url_suffix = Path(unquote(urlparse(url_key).path)).suffix.lower()
     suffix = sniff_media_extension(data) or url_suffix
-    if suffix in CONVERTIBLE_IMAGE_EXTENSIONS:
+    # Nach PNG umgewandelt (webp/tif/bmp): beim Vergleich mit der vorhandenen Datei zaehlen
+    # gleiche Bilddaten als gleich; nativ gespeicherte Dateien nur bei gleichen Bytes.
+    converted = suffix in CONVERTIBLE_IMAGE_EXTENSIONS
+    if converted:
         data = convert_image_bytes_to_png(data)
         suffix = ".png"
     if suffix == ".jpeg":
@@ -4868,7 +5074,13 @@ def download_media_to_folder(
     target_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(existing_name).stem if existing_name is not None else _allocate_media_stem(target_dir, article_number, kind_tag)
     target_path = target_dir / f"{stem}{suffix}"
-    target_path.write_bytes(data)
+    if existing_name is not None and force:
+        if existing_name != target_path.name or not _media_file_holds(target_path, data, converted=converted):
+            target_path.write_bytes(data)
+            if changed is not None:
+                changed.append(target_path)
+    else:
+        target_path.write_bytes(data)
 
     # Gleicher Stamm mit anderer Endung (z. B. vorher .png, jetzt .jpg) wird ersetzt.
     for other_suffix in ATTACHMENT_FORMAT_TYPE_BY_EXTENSION:
@@ -4892,6 +5104,7 @@ def materialize_media_rows(
     kind_label: str,
     kind_tag: str = "",
     force_download: bool = False,
+    changed_files: list[Path] | None = None,
 ) -> tuple[list[MediaRow], list[str]]:
     """Ersetzt Deeplinks durch lokal heruntergeladene Dateien.
 
@@ -4902,6 +5115,8 @@ def materialize_media_rows(
     Dauerhaft tote Links (Server liefert 400/404/...) blockieren den Artikel
     nicht mehr: das Medium wird übersprungen und als Warnung zurückgegeben.
     Vorübergehende Fehler (Timeout, 5xx) werfen weiterhin einen ValueError.
+    `changed_files` (optional, mit force_download): Dateien, deren Inhalt sich
+    unter derselben URL geaendert hat (siehe download_media_to_folder).
     """
     target_dir = (export_dir / MEDIA_SUBFOLDER / safe_folder_name(article_number)).resolve()
     index = load_media_index(target_dir)
@@ -4915,7 +5130,9 @@ def materialize_media_rows(
                 materialized.append(row)
                 continue
             try:
-                local_path = download_media_to_folder(link, target_dir, article_number, kind_tag, index, force=force_download)
+                local_path = download_media_to_folder(
+                    link, target_dir, article_number, kind_tag, index, force=force_download, changed=changed_files
+                )
             except MediaUnavailableError as exc:
                 skipped.append(f"{kind_label} übersprungen: {link} ({exc})")
                 continue
@@ -7547,12 +7764,27 @@ def prepare_existing_rows_for_write(path: Path, sheet_name: str, headers: list[s
             existing_rows.append([padded[0], padded[1], padded[2], padded[3], "", "", padded[4]])
     else:
         existing_rows = read_workbook_rows(path, sheet_name, len(headers))
-    if headers and headers[-1] == LAST_WRITTEN_HEADER and path.exists():
-        fallback_written_at = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        for row in existing_rows:
-            if row and not row[-1].strip() and any(cell.strip() for cell in row[:-1]):
-                row[-1] = fallback_written_at
+    if headers and headers[-1] == LAST_WRITTEN_HEADER:
+        fill_missing_written_at(path, existing_rows)
     return existing_rows
+
+
+def fill_missing_written_at(path: Path, rows: list[list[str]]) -> list[list[str]]:
+    """Zeilen ohne 'Zuletzt geschrieben am' (letzte Spalte leer, z. B. von Hand
+    eingefuegt) bekommen die Aenderungszeit der Datei. Gleicher Rueckfall beim
+    Schreiben (prepare_existing_rows_for_write) und beim Laden des Verzeichnisses
+    (load_article_snapshots_from_folder). Veraendert die Zeilen an Ort und Stelle
+    (read_workbook_rows liefert frische Listen)."""
+    if not rows:
+        return rows
+    try:
+        fallback_written_at = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except OSError:
+        return rows
+    for row in rows:
+        if row and not row[-1].strip() and any(cell.strip() for cell in row[:-1]):
+            row[-1] = fallback_written_at
+    return rows
 
 
 def merge_rows_by_article(
@@ -7586,13 +7818,15 @@ def write_workbook_with_upsert(
     rows: list[list[str]],
     key_index: int = 0,
     replace_article_keys: set[str] | None = None,
-) -> None:
+) -> bool:
+    """Rueckgabe: True, wenn die Datei geschrieben wurde."""
     with _workbook_file_lock(_workbook_cache_key(path)):
         existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
         merged_rows = merge_rows_by_article(existing_rows, rows, key_index=key_index, replace_article_keys=replace_article_keys)
         if _workbook_already_holds(path, sheet_name, headers, merged_rows):
-            return
+            return False
         write_workbook(path, sheet_name, headers, merged_rows)
+        return True
 
 
 def remove_article_rows_from_workbook(
@@ -7628,32 +7862,63 @@ def replace_article_rows_preserving_timestamps(
     article_number: str,
     rows: list[list[str]],
     key_index: int = 0,
-) -> None:
+    force_changed: bool = False,
+) -> bool:
+    """Ersetzt die Zeilen eines Artikels; unveraenderte Zeilen behalten ihren
+    Zeitstempel, neue bekommen 'jetzt'. Rueckgabe: True, wenn sich die Zeilen des
+    Artikels geaendert haben (Inhalt, Anzahl, Reihenfolge oder Zeitstempel) -
+    Grundlage fuer 'geaendert seit Apollo-Import'. Ein reines Neuschreiben der
+    Datei (z. B. Blattname normalisiert) zaehlt nicht. force_changed: der Bereich
+    gilt als geaendert, auch wenn die Zeilen gleich bleiben (z. B. Mediendatei
+    unter gleichem Pfad ausgetauscht) - alle Zeilen des Artikels bekommen 'jetzt'."""
     with _workbook_file_lock(_workbook_cache_key(path)):
         existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
         article_key = normalize_article_number(article_number)
         has_last_written = bool(headers) and headers[-1] == LAST_WRITTEN_HEADER
         written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        old_article_rows = [
+            row
+            for row in existing_rows
+            if len(row) > key_index and normalize_article_number(str(row[key_index])) == article_key
+        ]
 
         rebuilt_rows = rows
         if has_last_written:
             existing_timestamps_by_signature: dict[tuple[str, ...], list[str]] = {}
             signature_width = len(headers) - 1
-            for row in existing_rows:
-                if len(row) <= key_index or normalize_article_number(str(row[key_index])) != article_key:
-                    continue
+            for row in old_article_rows:
                 signature = tuple(str(cell) for cell in row[:signature_width])
                 existing_timestamps_by_signature.setdefault(signature, []).append(row[-1].strip() or written_at)
 
             rebuilt_rows = []
             for row in rows:
-                signature_values = [str(cell) for cell in row[:signature_width]]
+                # Bereinigt wie beim Schreiben (verbotene Steuerzeichen, Zellenlaenge):
+                # sonst passte eine Zeile mit Steuerzeichen nie zur gespeicherten Zeile
+                # und bekaeme bei jedem Speichern einen neuen Zeitstempel.
+                signature_values = [str(_sanitize_cell_value(str(cell))) for cell in row[:signature_width]]
                 if len(signature_values) < signature_width:
                     signature_values.extend([""] * (signature_width - len(signature_values)))
                 signature = tuple(signature_values)
                 known_timestamps = existing_timestamps_by_signature.get(signature, [])
                 timestamp = known_timestamps.pop(0) if known_timestamps else written_at
                 rebuilt_rows.append(signature_values + [timestamp])
+
+        # Wie _workbook_already_holds: die gelesenen Zeilen sind bereinigt geschrieben.
+        article_changed = len(old_article_rows) != len(rebuilt_rows) or any(
+            existing != new and existing != [_sanitize_cell_value(cell) for cell in new]
+            for existing, new in zip(old_article_rows, ([str(cell) for cell in row] for row in rebuilt_rows))
+        )
+        # Haben sich die Zeilen geaendert, ohne dass eine Zeile den aktuellen Stempel
+        # traegt (Zeilen weggefallen, nur die Reihenfolge geaendert), bliebe in der
+        # Datei kein juengeres 'Zuletzt geschrieben am' zurueck - der Artikel fiele
+        # beim naechsten Laden von der Platte von der Loeschliste seit Apollo-Import.
+        # Dann gilt der ganze Bereich als jetzt geschrieben (ebenso bei force_changed).
+        if has_last_written and rebuilt_rows and (
+            force_changed or (article_changed and not any(row[-1] == written_at for row in rebuilt_rows))
+        ):
+            rebuilt_rows = [row[:-1] + [written_at] for row in rebuilt_rows]
+        if force_changed:
+            article_changed = True
 
         merged_rows: list[list[str]] = []
         inserted = False
@@ -7671,8 +7936,9 @@ def replace_article_rows_preserving_timestamps(
         # Unveraenderte Zeilen behalten ihren Zeitstempel - ist der Artikel also
         # unveraendert, ist die Datei es auch und das Schreiben entfaellt.
         if _workbook_already_holds(path, sheet_name, headers, merged_rows):
-            return
+            return article_changed
         write_workbook(path, sheet_name, headers, merged_rows)
+        return article_changed
 
 
 def merge_usage_number_import_rows(
@@ -7689,19 +7955,31 @@ def merge_usage_number_import_rows(
     Zeilen eines betroffenen Artikels stehen an der Stelle seiner bisherigen
     ersten Zeile, neue Artikel kommen ans Ende. Zeitstempel bestehender
     (Artikel, Suchwort)-Paare bleiben erhalten, neue Paare bekommen written_at.
+    Fallen Suchwoerter eines Artikels weg, ohne dass ein neues dazukommt, bekommen
+    seine verbleibenden Zeilen written_at (siehe replace_article_rows_preserving_timestamps).
     """
     timestamps_by_pair: dict[tuple[str, str], list[str]] = {}
+    existing_count_by_article: dict[str, int] = {}
     for row in existing_rows:
         article_key = normalize_article_number(str(row[0])) if row else ""
         if article_key in terms_by_article and len(row) >= len(USAGE_NUMBER_HEADERS):
             timestamps_by_pair.setdefault((article_key, str(row[2])), []).append(str(row[3]).strip() or written_at)
+            existing_count_by_article[article_key] = existing_count_by_article.get(article_key, 0) + 1
 
     def rebuilt_rows(article_key: str) -> list[list[str]]:
         rows: list[list[str]] = []
+        reused_timestamps = 0
         for term in terms_by_article[article_key]:
             known_timestamps = timestamps_by_pair.get((article_key, term), [])
-            timestamp = known_timestamps.pop(0) if known_timestamps else written_at
+            if known_timestamps:
+                timestamp = known_timestamps.pop(0)
+                reused_timestamps += 1
+            else:
+                timestamp = written_at
             rows.append([article_key, USAGE_NUMBER_TECDOC_ID, term, timestamp])
+        if reused_timestamps < existing_count_by_article.get(article_key, 0) and reused_timestamps == len(rows):
+            for row in rows:
+                row[3] = written_at
         return rows
 
     merged_rows: list[list[str]] = []
@@ -7724,6 +8002,7 @@ def apply_search_term_import(
     output_root: Path,
     imported_terms: dict[str, list[str]],
     mode: str,
+    changed_articles: set[str] | None = None,
 ) -> tuple[dict[str, list[str]], str]:
     """Schreibt einen Suchwort-Import in EINEM Schreibvorgang in die Gebrauchsnummern.xlsx.
 
@@ -7740,6 +8019,11 @@ def apply_search_term_import(
     Ergaenzen wandern die Alt-Suchwoerter mit in die Referenzdatei, beim Ersetzen
     entfallen sie; in beiden Faellen werden ihre Altzeilen danach aus der
     Attribute.xlsx geraeumt.
+
+    `changed_articles` (optional) bekommt die Artikel, deren Zeilen sich dabei
+    tatsaechlich aendern (Suchwort dazu oder weg, Alt-Suchwortzeilen umgezogen) -
+    Grundlage fuer 'geaendert seit Apollo-Import'; unveraenderte Artikel der
+    Importdatei behalten ihre Zeitstempel und zaehlen nicht.
 
     Rueckgabe: (geschriebene Suchwortliste je betroffenem Artikel, Warnungstext
     oder ''). Der Aufrufer haelt WORKBOOK_WRITE_LOCK; das Schreiben der
@@ -7771,6 +8055,17 @@ def apply_search_term_import(
                 )
             else:
                 final_terms[article] = normalize_search_terms(list(new_terms))
+        if changed_articles is not None:
+            # Gleiche Paarbildung wie merge_usage_number_import_rows: (Artikel, Suchwort)
+            # der vorhandenen Zeilen gegen die neue Liste.
+            existing_pairs: dict[str, Counter[str]] = {}
+            for row in existing_rows:
+                article_key = normalize_article_number(str(row[0])) if row else ""
+                if article_key in final_terms and len(row) >= len(USAGE_NUMBER_HEADERS):
+                    existing_pairs.setdefault(article_key, Counter())[str(row[2])] += 1
+            for article, terms in final_terms.items():
+                if article in legacy_articles or existing_pairs.get(article, Counter()) != Counter(terms):
+                    changed_articles.add(article)
         merged_rows = merge_usage_number_import_rows(existing_rows, final_terms, written_at)
         if not _workbook_already_holds(path, USAGE_NUMBER_FILE[1], USAGE_NUMBER_HEADERS, merged_rows):
             output_root.mkdir(parents=True, exist_ok=True)
@@ -7812,11 +8107,12 @@ def read_legacy_search_terms(output_root: Path, article_numbers: set[str]) -> tu
     return terms, articles
 
 
-def remove_legacy_search_term_attribute_rows(output_root: Path, article_numbers: set[str]) -> None:
-    """Raeumt Alt-Suchwortzeilen (Kriterien-ID 9595) der Artikel aus der Attribute.xlsx."""
+def remove_legacy_search_term_attribute_rows(output_root: Path, article_numbers: set[str]) -> bool:
+    """Raeumt Alt-Suchwortzeilen (Kriterien-ID 9595) der Artikel aus der Attribute.xlsx.
+    Rueckgabe: True, wenn Zeilen entfernt wurden."""
     path = output_root / ATTRIBUTE_FILE[0]
     if not path.exists():
-        return
+        return False
     with _workbook_file_lock(_workbook_cache_key(path)):
         existing_rows = prepare_existing_rows_for_write(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS)
         remaining_rows = [
@@ -7825,8 +8121,9 @@ def remove_legacy_search_term_attribute_rows(output_root: Path, article_numbers:
             if not (normalize_article_number(str(row[0])) in article_numbers and str(row[1]).strip() == LEGACY_SEARCH_TERM_CRITERIA_ID)
         ]
         if len(remaining_rows) == len(existing_rows):
-            return
+            return False
         write_workbook(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS, remaining_rows)
+        return True
 
 
 def build_short_text_export_row(bundle: ExportBundle) -> list[str]:
@@ -8251,6 +8548,13 @@ def apply_reference_attribute_rows(
         )
     ]
     changed = [comparable(row) for row in ordered_rows] != [comparable(row) for row in article_rows]
+    # Ersetzt die Vorlage Zeilen nur durch weniger (gleiche) Zeilen oder sortiert sie nur
+    # um, traegt keine Zeile den neuen Stempel - der Artikel fiele nach dem Neuladen von
+    # der Loeschliste seit Apollo-Import. Dann gelten alle Attributzeilen des Artikels als
+    # jetzt geschrieben (wie replace_article_rows_preserving_timestamps).
+    if changed and not any(len(row) > 6 and row[6] == written_at for row in ordered_rows):
+        for row in ordered_rows:
+            row[6] = written_at
     if changed:
         write_workbook(path, ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS, other_rows + ordered_rows)
     return added_ids, len(copied_rows), replaced_rows, changed
@@ -8262,7 +8566,24 @@ def export_bundle(
     use_timestamp_subdir: bool,
     refresh_media: bool = False,
     media_warnings: list[str] | None = None,
+    changed_sections: set[str] | None = None,
+    force_changed_sections: set[str] | None = None,
 ) -> Path:
+    """Schreibt das Bundle in einen Zeitstempel-Unterordner oder (fester Pfad) per
+    Upsert in die Output-Dateien des Ausgabeordners.
+
+    Fester Pfad: je Bereich ersetzt replace_article_rows_preserving_timestamps die
+    Zeilen des Artikels - unveraenderte Zeilen behalten ihr 'Zuletzt geschrieben
+    am' (wie beim Live-Speichern), ein Lauf ohne Aenderung schreibt nichts und
+    markiert nichts als 'geaendert seit Apollo-Import'. `changed_sections`
+    (optional) bekommt die Bereiche (Schluessel wie LIVE_SECTIONS), deren Zeilen
+    sich dabei tatsaechlich geaendert haben - Bilder/Dokumente auch dann, wenn
+    refresh_media unter gleichem Pfad einen geaenderten Dateiinhalt geladen hat;
+    das sofort nach dem Herunterladen, vor jedem Excel-Schreiben: die Datei ist dann
+    schon ueberschrieben, auch wenn danach etwas scheitert (ein zweiter Versuch saehe
+    nur noch gleiche Bytes). `force_changed_sections`: Bereiche, deren Zeilen auf jeden
+    Fall neu gestempelt werden (z. B. im ersten, gescheiterten Versuch ausgetauschte
+    Mediendateien)."""
     written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if use_timestamp_subdir:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -8271,12 +8592,32 @@ def export_bundle(
         export_dir = output_root
     export_dir.mkdir(parents=True, exist_ok=True)
 
+    # Mediendateien, deren Inhalt sich beim Neu-Herunterladen unter gleichem Pfad
+    # geaendert hat: die Zeile bleibt gleich, der Bereich gilt trotzdem als geaendert.
+    changed_media_files: dict[str, list[Path]] = {"images": [], "documents": []}
+
+    def note_changed_media(section: str) -> None:
+        if changed_media_files[section] and changed_sections is not None and not use_timestamp_subdir:
+            changed_sections.add(section)
+
     if bundle.include_images:
-        bundle.image_rows, skipped_images = materialize_media_rows(bundle.article_number, bundle.image_rows, export_dir, "Bild", kind_tag="", force_download=refresh_media)
+        try:
+            bundle.image_rows, skipped_images = materialize_media_rows(
+                bundle.article_number, bundle.image_rows, export_dir, "Bild", kind_tag="",
+                force_download=refresh_media, changed_files=changed_media_files["images"],
+            )
+        finally:
+            note_changed_media("images")
         if media_warnings is not None:
             media_warnings.extend(skipped_images)
     if bundle.include_documents:
-        bundle.document_rows, skipped_documents = materialize_media_rows(bundle.article_number, bundle.document_rows, export_dir, "Dokument", kind_tag="D", force_download=refresh_media)
+        try:
+            bundle.document_rows, skipped_documents = materialize_media_rows(
+                bundle.article_number, bundle.document_rows, export_dir, "Dokument", kind_tag="D",
+                force_download=refresh_media, changed_files=changed_media_files["documents"],
+            )
+        finally:
+            note_changed_media("documents")
         if media_warnings is not None:
             media_warnings.extend(skipped_documents)
 
@@ -8324,112 +8665,38 @@ def export_bundle(
         if bundle.include_web_links:
             write_workbook(export_dir / WEB_LINK_FILE[0], WEB_LINK_FILE[1], WEB_HEADERS, web_rows)
     else:
-        article_keys = {bundle.article_number}
-        if bundle.include_short_text:
-            write_workbook_with_upsert(
-                export_dir / SHORT_TEXT_FILE[0],
-                SHORT_TEXT_FILE[1],
-                SHORT_TEXT_HEADERS,
-                [short_row],
-                replace_article_keys=article_keys,
+        curated = bundle.include_curated_data
+        # (Bereich, enthalten?, Datei, Kopfzeile, Zeilen) in der bisherigen Schreibreihenfolge;
+        # die Zeilen ohne Zeitstempel - den vergibt replace_article_rows_preserving_timestamps.
+        upserts: list[tuple[str, bool, tuple[str, str], list[str], list[list[str]]]] = [
+            ("short_text", bundle.include_short_text, SHORT_TEXT_FILE, SHORT_TEXT_HEADERS, [short_row]),
+            ("short_text", bundle.include_short_text, SHORT_MAPPING_FILE, SHORT_MAPPING_HEADERS, [short_mapping_row]),
+            ("long_text", bundle.include_long_text, LONG_TEXT_FILE, SHORT_TEXT_HEADERS, [long_row]),
+            ("genart", curated, GENART_FILE, GENART_HEADERS, genart_rows),
+            ("oe_numbers", curated, OE_FILE, OE_HEADERS, oe_rows),
+            ("comparison_numbers", curated, COMPARISON_FILE, COMPARISON_HEADERS, comparison_rows),
+            ("article_lists", curated, ARTICLE_LIST_FILE, ARTICLE_LIST_HEADERS, article_list_rows),
+            ("search_terms", curated, USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS, usage_number_rows),
+            ("vehicle_links", curated, VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS, vehicle_link_rows),
+            ("attributes", curated, ATTRIBUTE_FILE, ATTRIBUTE_HEADERS, attribute_rows),
+            ("images", bundle.include_images, IMAGE_FILE, IMAGE_HEADERS, image_rows),
+            ("documents", bundle.include_documents, DOCUMENT_FILE, DOCUMENT_HEADERS, document_rows),
+            ("videos", bundle.include_videos, VIDEO_FILE, VIDEO_HEADERS, video_rows),
+            ("web_links", bundle.include_web_links, WEB_LINK_FILE, WEB_HEADERS, web_rows),
+        ]
+        for section, included, file_spec, headers, stamped_rows in upserts:
+            if not included:
+                continue
+            section_changed = replace_article_rows_preserving_timestamps(
+                export_dir / file_spec[0],
+                file_spec[1],
+                headers,
+                bundle.article_number,
+                [row[:-1] for row in stamped_rows],
+                force_changed=bool(changed_media_files.get(section)) or section in (force_changed_sections or ()),
             )
-            write_workbook_with_upsert(
-                export_dir / SHORT_MAPPING_FILE[0],
-                SHORT_MAPPING_FILE[1],
-                SHORT_MAPPING_HEADERS,
-                [short_mapping_row],
-                replace_article_keys=article_keys,
-            )
-        if bundle.include_long_text:
-            write_workbook_with_upsert(
-                export_dir / LONG_TEXT_FILE[0],
-                LONG_TEXT_FILE[1],
-                SHORT_TEXT_HEADERS,
-                [long_row],
-                replace_article_keys=article_keys,
-            )
-        if bundle.include_curated_data:
-            write_workbook_with_upsert(
-                export_dir / GENART_FILE[0],
-                GENART_FILE[1],
-                GENART_HEADERS,
-                genart_rows,
-                replace_article_keys=article_keys,
-            )
-            write_workbook_with_upsert(
-                export_dir / OE_FILE[0],
-                OE_FILE[1],
-                OE_HEADERS,
-                oe_rows,
-                replace_article_keys=article_keys,
-            )
-            write_workbook_with_upsert(
-                export_dir / COMPARISON_FILE[0],
-                COMPARISON_FILE[1],
-                COMPARISON_HEADERS,
-                comparison_rows,
-                replace_article_keys=article_keys,
-            )
-            write_workbook_with_upsert(
-                export_dir / ARTICLE_LIST_FILE[0],
-                ARTICLE_LIST_FILE[1],
-                ARTICLE_LIST_HEADERS,
-                article_list_rows,
-                replace_article_keys=article_keys,
-            )
-            write_workbook_with_upsert(
-                export_dir / USAGE_NUMBER_FILE[0],
-                USAGE_NUMBER_FILE[1],
-                USAGE_NUMBER_HEADERS,
-                usage_number_rows,
-                replace_article_keys=article_keys,
-            )
-            write_workbook_with_upsert(
-                export_dir / VEHICLE_LINK_FILE[0],
-                VEHICLE_LINK_FILE[1],
-                VEHICLE_LINK_HEADERS,
-                vehicle_link_rows,
-                replace_article_keys=article_keys,
-            )
-            write_workbook_with_upsert(
-                export_dir / ATTRIBUTE_FILE[0],
-                ATTRIBUTE_FILE[1],
-                ATTRIBUTE_HEADERS,
-                attribute_rows,
-                replace_article_keys=article_keys,
-            )
-        if bundle.include_images:
-            write_workbook_with_upsert(
-                export_dir / IMAGE_FILE[0],
-                IMAGE_FILE[1],
-                IMAGE_HEADERS,
-                image_rows,
-                replace_article_keys=article_keys,
-            )
-        if bundle.include_documents:
-            write_workbook_with_upsert(
-                export_dir / DOCUMENT_FILE[0],
-                DOCUMENT_FILE[1],
-                DOCUMENT_HEADERS,
-                document_rows,
-                replace_article_keys=article_keys,
-            )
-        if bundle.include_videos:
-            write_workbook_with_upsert(
-                export_dir / VIDEO_FILE[0],
-                VIDEO_FILE[1],
-                VIDEO_HEADERS,
-                video_rows,
-                replace_article_keys=article_keys,
-            )
-        if bundle.include_web_links:
-            write_workbook_with_upsert(
-                export_dir / WEB_LINK_FILE[0],
-                WEB_LINK_FILE[1],
-                WEB_HEADERS,
-                web_rows,
-                replace_article_keys=article_keys,
-            )
+            if section_changed and changed_sections is not None:
+                changed_sections.add(section)
 
     if refresh_media:
         cleanup_article_media_folder(export_dir, bundle.article_number)
@@ -8615,7 +8882,14 @@ def load_article_snapshots_from_folder(
             snapshots[article_key] = snapshot
         return snapshot
 
-    short_rows = read_workbook_rows(folder / SHORT_TEXT_FILE[0], SHORT_TEXT_FILE[1], len(SHORT_TEXT_HEADERS))
+    def read_rows(file_spec: tuple[str, str], headers: list[str]) -> list[list[str]]:
+        # Zeilen ohne 'Zuletzt geschrieben am' zaehlen mit der Aenderungszeit der
+        # Datei - derselbe Rueckfall wie beim Schreiben (prepare_existing_rows_for_write),
+        # damit 'geaendert seit Apollo-Import' nicht davon abhaengt, wie die Datei gelesen wird.
+        path = folder / file_spec[0]
+        return fill_missing_written_at(path, read_workbook_rows(path, file_spec[1], len(headers)))
+
+    short_rows = read_rows(SHORT_TEXT_FILE, SHORT_TEXT_HEADERS)
     for row in short_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
@@ -8624,8 +8898,12 @@ def load_article_snapshots_from_folder(
         snapshot.short_module_id = row[1].strip()
         snapshot.short_texts = translation_set_from_export_row(row)
         snapshot.short_auto_uni = not snapshot.short_texts.uni or snapshot.short_texts.uni == snapshot.short_texts.de
+        # Alle Output-Dateien tragen 'Zuletzt geschrieben am' als letzte Spalte
+        # (die Zeilen sind auf die Kopfzeilenbreite aufgefuellt): je Bereich den
+        # juengsten Wert merken - Grundlage fuer 'geaendert seit Apollo-Import'.
+        snapshot.note_written_at("short_text", row[-1])
 
-    long_rows = read_workbook_rows(folder / LONG_TEXT_FILE[0], LONG_TEXT_FILE[1], len(SHORT_TEXT_HEADERS))
+    long_rows = read_rows(LONG_TEXT_FILE, SHORT_TEXT_HEADERS)
     for row in long_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
@@ -8634,14 +8912,16 @@ def load_article_snapshots_from_folder(
         snapshot.long_module_id = row[1].strip()
         snapshot.long_texts = translation_set_from_export_row(row)
         snapshot.long_auto_uni = not snapshot.long_texts.uni or snapshot.long_texts.uni == snapshot.long_texts.de
+        snapshot.note_written_at("long_text", row[-1])
 
-    genart_rows = read_workbook_rows(folder / GENART_FILE[0], GENART_FILE[1], len(GENART_HEADERS))
+    genart_rows = read_rows(GENART_FILE, GENART_HEADERS)
     for row in genart_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
         snapshot = ensure_snapshot(article_number)
         snapshot.genart_selections.append(GenArtSelection(id=row[1].strip(), bezeichnung=row[2].strip()))
+        snapshot.note_written_at("genart", row[-1])
 
     oe_rows = prepare_existing_rows_for_write(folder / OE_FILE[0], OE_FILE[1], OE_HEADERS)
     for row in oe_rows:
@@ -8650,6 +8930,7 @@ def load_article_snapshots_from_folder(
             continue
         manufacturer_id = row[2].strip()
         manufacturer = manufacturer_lookup.get(manufacturer_id) if manufacturer_lookup is not None else None
+        ensure_snapshot(article_number).note_written_at("oe_numbers", row[-1])
         ensure_snapshot(article_number).oe_number_rows.append(
             OeNumberRow(
                 value=row[3].strip(),
@@ -8659,13 +8940,14 @@ def load_article_snapshots_from_folder(
             )
         )
 
-    comparison_rows = read_workbook_rows(folder / COMPARISON_FILE[0], COMPARISON_FILE[1], len(COMPARISON_HEADERS))
+    comparison_rows = read_rows(COMPARISON_FILE, COMPARISON_HEADERS)
     for row in comparison_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
         competitor_id = row[2].strip()
         competitor = competitor_lookup.get(competitor_id) if competitor_lookup is not None else None
+        ensure_snapshot(article_number).note_written_at("comparison_numbers", row[-1])
         ensure_snapshot(article_number).comparison_number_rows.append(
             ComparisonNumberRow(
                 competitor_id=competitor_id,
@@ -8675,7 +8957,7 @@ def load_article_snapshots_from_folder(
             )
         )
 
-    article_list_rows = read_workbook_rows(folder / ARTICLE_LIST_FILE[0], ARTICLE_LIST_FILE[1], len(ARTICLE_LIST_HEADERS))
+    article_list_rows = read_rows(ARTICLE_LIST_FILE, ARTICLE_LIST_HEADERS)
 
     def article_list_sort_key(row: list[str]) -> int:
         try:
@@ -8688,11 +8970,12 @@ def load_article_snapshots_from_folder(
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
+        ensure_snapshot(article_number).note_written_at("article_lists", row[-1])
         ensure_snapshot(article_number).article_list_rows.append(
             ArticleListRow(list_type=row[1], item_number=row[2], quantity=row[3], genart_id=row[4], product_group=row[5])
         )
 
-    vehicle_link_rows = read_workbook_rows(folder / VEHICLE_LINK_FILE[0], VEHICLE_LINK_FILE[1], len(VEHICLE_LINK_HEADERS))
+    vehicle_link_rows = read_rows(VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS)
     for row in vehicle_link_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
@@ -8701,6 +8984,7 @@ def load_article_snapshots_from_folder(
         ktyp = row[2].strip()
         if not ktyp:
             continue
+        ensure_snapshot(article_number).note_written_at("vehicle_links", row[-1])
         system = row[3].strip().casefold()
         match = None
         if vehicle_catalog is not None:
@@ -8739,14 +9023,16 @@ def load_article_snapshots_from_folder(
                 )
         ensure_snapshot(article_number).vehicle_link_rows.append(link_row)
 
-    usage_number_rows = read_workbook_rows(folder / USAGE_NUMBER_FILE[0], USAGE_NUMBER_FILE[1], len(USAGE_NUMBER_HEADERS))
+    usage_number_rows = read_rows(USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS)
     for row in usage_number_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
         search_term = row[2].strip()
         if search_term:
-            ensure_snapshot(article_number).search_terms.append(search_term)
+            snapshot = ensure_snapshot(article_number)
+            snapshot.search_terms.append(search_term)
+            snapshot.note_written_at("search_terms", row[-1])
 
     attribute_rows = prepare_existing_rows_for_write(folder / ATTRIBUTE_FILE[0], ATTRIBUTE_FILE[1], ATTRIBUTE_HEADERS)
     for row in attribute_rows:
@@ -8761,7 +9047,9 @@ def load_article_snapshots_from_folder(
             search_term = row[4].strip()
             if search_term:
                 ensure_snapshot(article_number).search_terms.append(search_term)
+                ensure_snapshot(article_number).note_written_at("search_terms", row[-1])
             continue
+        ensure_snapshot(article_number).note_written_at("attributes", row[-1])
         attribute_option = attribute_lookup.get(criteria_id) if attribute_lookup is not None else None
         label = row[2].strip() or (attribute_option.label if attribute_option is not None else "")
         value_format = row[3].strip() or (attribute_option.value_format if attribute_option is not None else "")
@@ -8790,33 +9078,50 @@ def load_article_snapshots_from_folder(
             attribute_row
         )
 
-    image_rows = read_workbook_rows(folder / IMAGE_FILE[0], IMAGE_FILE[1], len(IMAGE_HEADERS))
+    image_rows = read_rows(IMAGE_FILE, IMAGE_HEADERS)
     for row in image_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
-        ensure_snapshot(article_number).image_rows.append(MediaRow(path_or_link=row[1].strip(), art=row[2].strip(), sprache=row[3].strip()))
+        snapshot = ensure_snapshot(article_number)
+        snapshot.image_rows.append(MediaRow(path_or_link=row[1].strip(), art=row[2].strip(), sprache=row[3].strip()))
+        snapshot.note_written_at("images", row[-1])
 
-    document_rows = read_workbook_rows(folder / DOCUMENT_FILE[0], DOCUMENT_FILE[1], len(DOCUMENT_HEADERS))
+    document_rows = read_rows(DOCUMENT_FILE, DOCUMENT_HEADERS)
     for row in document_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
-        ensure_snapshot(article_number).document_rows.append(MediaRow(path_or_link=row[1].strip(), art=row[3].strip(), sprache=row[2].strip()))
+        snapshot = ensure_snapshot(article_number)
+        snapshot.document_rows.append(MediaRow(path_or_link=row[1].strip(), art=row[3].strip(), sprache=row[2].strip()))
+        snapshot.note_written_at("documents", row[-1])
 
-    video_rows = read_workbook_rows(folder / VIDEO_FILE[0], VIDEO_FILE[1], len(VIDEO_HEADERS))
+    video_rows = read_rows(VIDEO_FILE, VIDEO_HEADERS)
     for row in video_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
-        ensure_snapshot(article_number).video_rows.append(MediaRow(path_or_link=row[1].strip()))
+        snapshot = ensure_snapshot(article_number)
+        snapshot.video_rows.append(MediaRow(path_or_link=row[1].strip()))
+        snapshot.note_written_at("videos", row[-1])
 
-    web_rows = read_workbook_rows(folder / WEB_LINK_FILE[0], WEB_LINK_FILE[1], len(WEB_HEADERS))
+    web_rows = read_rows(WEB_LINK_FILE, WEB_HEADERS)
     for row in web_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
             continue
-        ensure_snapshot(article_number).web_rows.append(MediaRow(path_or_link=row[1].strip()))
+        snapshot = ensure_snapshot(article_number)
+        snapshot.web_rows.append(MediaRow(path_or_link=row[1].strip()))
+        snapshot.note_written_at("web_links", row[-1])
+
+    # Kurzbezeichnung_zu_ID.xlsx gehoert zum Bereich Kurzbezeichnung (wird mit ihm
+    # geschrieben): ihr Zeitstempel zaehlt mit - aendert sich nur die Zuordnungszeile,
+    # waere der Artikel nach dem Neuladen sonst nicht mehr 'geaendert seit Apollo-Import'.
+    # Nur fuer Artikel, die auch in einer anderen Datei stehen (wie bisher).
+    for row in read_rows(SHORT_MAPPING_FILE, SHORT_MAPPING_HEADERS):
+        snapshot = snapshots.get(normalize_article_number(row[0]))
+        if snapshot is not None:
+            snapshot.note_written_at("short_text", row[-1])
 
     for snapshot in snapshots.values():
         snapshot.sync_genart_fields()
@@ -8828,6 +9133,545 @@ def load_article_snapshots_from_folder(
         snapshot.search_terms = normalize_search_terms(snapshot.search_terms)
 
     return snapshots
+
+
+# ---------------------------------------------------------------------------
+# Apollo-Importstand (IMPORT_STAND_FILENAME im Ausgabeordner) und Aenderungen seitdem
+#
+# Apollo kann Artikel nicht aktualisieren: Artikel, die seit dem letzten Import in
+# der GUI geaendert wurden, muessen vor dem naechsten Import ueber eine Loeschliste
+# (A = 757, B = Artikelnummer) aus Apollo entfernt werden. Der Stand liegt als
+# kleine JSON-Datei neben den Output-Dateien; 'changed_since' ist das Journal der
+# Aenderungen (auch geloeschter Artikel, die in keiner Output-Datei mehr stehen und
+# trotzdem auf die Loeschliste muessen). Das Journal wird nie gekuerzt: Eintraege bis
+# zum Stand zaehlen nur nicht. 'deleted_since' (Vorabformat ohne Zeitpunkt, nie
+# ausgeliefert) wird nur noch gelesen; 'erledigt' uebernimmt es mit dem neuen Stand als
+# Zeitpunkt ins Journal.
+
+
+def _import_stand_path(folder: Path) -> Path:
+    return Path(folder) / IMPORT_STAND_FILENAME
+
+
+def _normalize_changed_since(raw: object) -> dict[str, str]:
+    """'changed_since' des Importstands: Artikel -> 'YYYY-MM-DD HH:MM:SS' (sortiert, nur gueltige Eintraege)."""
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, str] = {}
+    for article, value in raw.items():
+        key = normalize_article_number(str(article))
+        written_at = normalize_written_at(value)
+        if key and written_at and written_at > result.get(key, ""):
+            result[key] = written_at
+    return dict(sorted(result.items()))
+
+
+def new_import_stand(
+    last_import_at: str,
+    note: str = "",
+    deleted_since: list[str] | None = None,
+    changed_since: dict[str, str] | None = None,
+) -> dict[str, object]:
+    return {
+        "version": IMPORT_STAND_VERSION,
+        "last_import_at": normalize_written_at(last_import_at) or last_import_at,
+        "set_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "set_by": os.environ.get("USERNAME") or os.environ.get("USER") or "",
+        "note": note or "",
+        "deleted_since": sorted({normalize_article_number(a) for a in (deleted_since or []) if normalize_article_number(a)}),
+        "changed_since": _normalize_changed_since(changed_since),
+    }
+
+
+# Vermerk der Loeschliste im Importstand: delete_list_at (Zeitpunkt der ersten Liste seit dem
+# Stand), delete_list_base (Stand, gegen den sie erstellt wurde), delete_list_size (Artikel auf
+# der Liste; 0 = Pruefung 'keine Loeschliste noetig', ohne Datei; fehlt = Liste einer frueheren
+# Entwicklungsversion, zaehlt als echte Liste), delete_list_count (echte Listen seitdem, eine
+# Pruefung ohne Liste zaehlt nicht) und delete_list_checked_at (Zeitpunkt einer Pruefung ohne
+# Liste, die die erste echte Liste ersetzt hat - fuer die Rueckfrage in 'erledigt').
+DELETE_LIST_KEYS = ("delete_list_at", "delete_list_base", "delete_list_size", "delete_list_count", "delete_list_checked_at")
+
+
+def _non_negative_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _normalize_delete_list_fields(stand: dict[str, object]) -> None:
+    """Loeschlisten-Vermerk (DELETE_LIST_KEYS) bereinigen; ohne gueltiges delete_list_at
+    entfallen alle Felder, ungueltige einzelne Felder ebenso."""
+    delete_list_at = normalize_written_at(stand.get("delete_list_at"))
+    if not delete_list_at:
+        for key in DELETE_LIST_KEYS:
+            stand.pop(key, None)
+        return
+    stand["delete_list_at"] = delete_list_at
+    for key in ("delete_list_base", "delete_list_checked_at"):
+        value = normalize_written_at(stand.get(key))
+        if value:
+            stand[key] = value
+        else:
+            stand.pop(key, None)
+    for key in ("delete_list_size", "delete_list_count"):
+        number = _non_negative_int(stand.get(key))
+        if number is not None:
+            stand[key] = number
+        else:
+            stand.pop(key, None)
+
+
+@dataclass
+class DeleteListRecord:
+    """Loeschlisten-Vermerk eines Importstands (siehe DELETE_LIST_KEYS)."""
+
+    at: str
+    # Stand, gegen den die Liste erstellt wurde (fehlt im Vermerk: der aktuelle Stand).
+    base: str
+    # Artikel auf der Liste; 0 = Pruefung ohne Liste, None = unbekannt (zaehlt als Liste).
+    size: int | None
+    # Echte Listen seit dem Stand.
+    count: int
+    # Zeitpunkt einer Pruefung ohne Liste, die durch diese Liste ersetzt wurde ('' = keine).
+    checked_at: str
+
+    @property
+    def empty(self) -> bool:
+        """Nur eine Pruefung 'keine Loeschliste noetig' (keine Datei geschrieben)."""
+        return self.size == 0
+
+    def fits(self, last_import_at: str) -> bool:
+        """Gilt fuer den Stand: juenger als er und gegen ihn oder einen frueheren Stand
+        erstellt (delete_list_base <= Stand) - dieselbe Regel fuer 'erledigt' und fuer das
+        Vermerken weiterer Listen. Wurde der Stand danach frueher gesetzt, fehlen der Liste
+        die Artikel dazwischen; spaeter (aber vor der Liste) deckt sie ihn weiter ab."""
+        return bool(self.at and last_import_at and last_import_at < self.at and self.base <= last_import_at)
+
+
+def delete_list_record(stand: dict[str, object] | None) -> DeleteListRecord | None:
+    """Loeschlisten-Vermerk des Importstands (None ohne gueltiges delete_list_at)."""
+    if not stand:
+        return None
+    at = normalize_written_at(stand.get("delete_list_at"))
+    if not at:
+        return None
+    last_import_at = normalize_written_at(stand.get("last_import_at"))
+    size = _non_negative_int(stand.get("delete_list_size"))
+    count = _non_negative_int(stand.get("delete_list_count"))
+    if count is None:
+        count = 0 if size == 0 else 1
+    return DeleteListRecord(
+        at=at,
+        base=normalize_written_at(stand.get("delete_list_base")) or last_import_at,
+        size=size,
+        count=count,
+        checked_at=normalize_written_at(stand.get("delete_list_checked_at")),
+    )
+
+
+def _normalize_import_stand_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Gelesene Importstand-Datei bereinigen. Unbekannte Schluessel bleiben erhalten
+    (z. B. aus einer neueren Version), last_import_at ist '' bei einer Datei ohne
+    gesetzten Stand (nur Journal), die Felder des Loeschlisten-Vermerks (DELETE_LIST_KEYS)
+    fehlen, wenn ungueltig."""
+    stand: dict[str, object] = dict(payload)
+    last_import_at = normalize_written_at(payload.get("last_import_at"))
+    deleted_raw = payload.get("deleted_since")
+    stand.update(
+        {
+            "version": payload.get("version") if isinstance(payload.get("version"), int) else IMPORT_STAND_VERSION,
+            "last_import_at": last_import_at,
+            "set_at": normalize_written_at(payload.get("set_at")) or last_import_at,
+            "set_by": str(payload.get("set_by") or ""),
+            "note": str(payload.get("note") or ""),
+            "deleted_since": (
+                sorted({normalize_article_number(str(a)) for a in deleted_raw if normalize_article_number(str(a))})
+                if isinstance(deleted_raw, list)
+                else []
+            ),
+            "changed_since": _normalize_changed_since(payload.get("changed_since")),
+        }
+    )
+    _normalize_delete_list_fields(stand)
+    return stand
+
+
+def _read_import_stand_file(folder: Path) -> dict[str, object] | None:
+    """Wie read_import_stand, wirft aber OSError/ValueError, wenn die Datei fehlt,
+    gesperrt oder kaputt ist (Aufrufer kann dann spaeter erneut lesen). Ein UTF-8-BOM
+    (Datei von Hand z. B. mit PowerShell 5.1 gespeichert) ist erlaubt."""
+    payload = json.loads(_import_stand_path(folder).read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError("kein JSON-Objekt")
+    stand = _normalize_import_stand_payload(payload)
+    return stand if stand["last_import_at"] else None
+
+
+def read_import_stand(folder: Path) -> dict[str, object] | None:
+    """Importstand des Ausgabeordners; None, wenn keiner gesetzt ist (auch: Datei nur
+    mit Journal, last_import_at leer) oder die Datei fehlt bzw. kaputt ist."""
+    try:
+        return _read_import_stand_file(folder)
+    except Exception:
+        return None
+
+
+IMPORT_STAND_REPLACE_ATTEMPTS = 5
+IMPORT_STAND_REPLACE_RETRY_SECONDS = 0.15
+
+
+def read_import_stand_for_update(folder: Path) -> dict[str, object]:
+    """Importstand zum Fortschreiben (Journal-Vermerk, Stand setzen, Loeschliste).
+
+    Fehlt die Datei, kommt ein neuer Stand ohne gesetzten Importzeitpunkt (Journal
+    wird auch vor dem ersten 'Importstand setzen' gefuehrt). Ist sie gesperrt oder
+    nicht lesbar, wird wie beim Schreiben einige Male kurz versetzt wiederholt;
+    klappt es dann noch nicht, OSError - der Aufrufer meldet das (ein stilles
+    Verwerfen liesse geaenderte Artikel von der Loeschliste fallen)."""
+    path = _import_stand_path(folder)
+    last_error: Exception | None = None
+    for attempt in range(1, IMPORT_STAND_REPLACE_ATTEMPTS + 1):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError as exc:
+            # Nur bei erreichbarem Ausgabeordner gilt 'keine Datei' - sonst (Laufwerk
+            # weg) wuerde der Aufrufer einen leeren Stand ueber den echten schreiben.
+            if path_exists_safe(path.parent):
+                return new_import_stand("")
+            last_error = exc
+        except (OSError, ValueError) as exc:
+            last_error = exc
+        else:
+            if isinstance(payload, dict):
+                return _normalize_import_stand_payload(payload)
+            last_error = ValueError("kein JSON-Objekt")
+        if attempt < IMPORT_STAND_REPLACE_ATTEMPTS:
+            time.sleep(IMPORT_STAND_REPLACE_RETRY_SECONDS)
+    raise OSError(f"{IMPORT_STAND_FILENAME} nicht lesbar: {last_error}") from last_error
+
+
+def write_import_stand(folder: Path, stand: dict[str, object]) -> Path:
+    """Schreibt den Importstand atomar (Temp-Datei + Austausch) in den Ausgabeordner.
+    Ein leeres last_import_at ist erlaubt (Datei nur mit Journal, noch kein Stand
+    gesetzt), ein ungueltiges nicht.
+
+    Unter Windows scheitert der Austausch (os.replace) mit PermissionError, solange
+    ein anderer Prozess die Datei offen hat - etwa eine zweite Instanz, die sie
+    gerade liest, oder ein Virenscanner. Das dauert nur Augenblicke: deshalb wird
+    der Austausch einige Male kurz versetzt wiederholt, bevor der Fehler durchgeht."""
+    path = _import_stand_path(folder)
+    payload = dict(stand)
+    payload.setdefault("version", IMPORT_STAND_VERSION)
+    raw_last_import_at = payload.get("last_import_at")
+    payload["last_import_at"] = normalize_written_at(raw_last_import_at)
+    if not payload["last_import_at"] and str(raw_last_import_at or "").strip():
+        raise ValueError("Importstand ohne gültiges Datum (last_import_at).")
+    _normalize_delete_list_fields(payload)
+    payload.setdefault("set_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    payload.setdefault("set_by", os.environ.get("USERNAME") or os.environ.get("USER") or "")
+    payload.setdefault("note", "")
+    payload["deleted_since"] = sorted(
+        {normalize_article_number(str(a)) for a in (payload.get("deleted_since") or []) if normalize_article_number(str(a))}
+    )
+    payload["changed_since"] = _normalize_changed_since(payload.get("changed_since"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        for attempt in range(1, IMPORT_STAND_REPLACE_ATTEMPTS + 1):
+            try:
+                os.replace(temp_path, path)
+                break
+            except PermissionError:
+                if attempt == IMPORT_STAND_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(IMPORT_STAND_REPLACE_RETRY_SECONDS)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+    return path
+
+
+def import_stand_signature(folder: Path) -> tuple[int, int] | None:
+    """(mtime_ns, Groesse) der Importstand-Datei - None ohne Datei."""
+    try:
+        stat = _import_stand_path(folder).stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+@dataclass
+class ArticleChangeSinceImport:
+    article_number: str
+    # 'YYYY-MM-DD HH:MM:SS' der letzten Aenderung ('' bei geloeschten Artikeln ohne Eintrag).
+    last_change: str
+    # Bereichs-Labels (LIVE_SECTION_LABELS) in Schreibreihenfolge.
+    changed_sections: list[str]
+    # 'geaendert' | 'neu' | 'geloescht'
+    status: str
+
+    def as_row(self) -> list[str]:
+        return [
+            self.article_number,
+            format_written_at_display(self.last_change) if self.last_change else "",
+            ", ".join(self.changed_sections),
+            self.status,
+        ]
+
+
+def changed_articles_since(
+    records: dict[str, StoredArticleSnapshot], stand: dict[str, object] | None
+) -> list[ArticleChangeSinceImport]:
+    """Alle Artikel, die seit dem Importstand geaendert, neu angelegt oder geloescht wurden.
+
+    Ohne Stand: leere Liste. 'neu' = alle Zeilen des Artikels sind juenger als der
+    Stand (der Artikel war beim Import also noch nicht in den Dateien). Artikel aus
+    dem Journal changed_since mit Zeitpunkt nach dem Stand zaehlen als 'geaendert'
+    (z. B. ein komplett geleerter Bereich ohne juengeren Zeilen-Zeitstempel) bzw.
+    als 'geloescht', wenn sie in keiner Output-Datei mehr stehen (im Verzeichnis
+    geloescht). deleted_since (Vorabformat) zaehlt weiter als 'geloescht'.
+    Sortiert nach Artikel.
+    """
+    if not stand:
+        return []
+    last_import_at = normalize_written_at(stand.get("last_import_at"))
+    if not last_import_at:
+        return []
+    changes: list[ArticleChangeSinceImport] = []
+    for article_number in sorted(records):
+        snapshot = records[article_number]
+        if not snapshot.last_written_at or snapshot.last_written_at <= last_import_at:
+            continue
+        sections = [
+            LIVE_SECTION_LABELS.get(section, section)
+            for section in LIVE_SECTIONS
+            if snapshot.last_written.get(section, "") > last_import_at
+        ]
+        status = "neu" if snapshot.first_written_at and snapshot.first_written_at > last_import_at else "geaendert"
+        changes.append(ArticleChangeSinceImport(article_number, snapshot.last_written_at, sections, status))
+    by_article = {change.article_number: change for change in changes}
+    for article_number, written_at in _normalize_changed_since(stand.get("changed_since")).items():
+        if written_at <= last_import_at:
+            continue
+        listed_change = by_article.get(article_number)
+        if listed_change is not None:
+            if written_at > listed_change.last_change:
+                listed_change.last_change = written_at
+            continue
+        snapshot = records.get(article_number)
+        if snapshot is not None:
+            change = ArticleChangeSinceImport(article_number, max(snapshot.last_written_at, written_at), [], "geaendert")
+        else:
+            # Seit dem Stand geschrieben, aber in keiner Output-Datei mehr (z. B. von
+            # Hand entfernt): Apollo kennt ihn womoeglich noch - auf die Loeschliste.
+            change = ArticleChangeSinceImport(article_number, written_at, [], "geloescht")
+        changes.append(change)
+        by_article[article_number] = change
+    listed = set(by_article)
+    for article_number in stand.get("deleted_since") or []:
+        key = normalize_article_number(str(article_number))
+        if not key or key in listed:
+            continue
+        listed.add(key)
+        if key in records:
+            # Nach dem Loeschen wieder angelegt, aber alle Zeilen aelter als der Stand
+            # (z. B. aus einer IMS-Uebernahme): bleibt auf der Loeschliste.
+            changes.append(ArticleChangeSinceImport(key, records[key].last_written_at, [], "geloescht"))
+        else:
+            changes.append(ArticleChangeSinceImport(key, "", [], "geloescht"))
+    changes.sort(key=lambda change: change.article_number)
+    return changes
+
+
+def changed_since_import_map(records: dict[str, StoredArticleSnapshot], stand: dict[str, object] | None) -> dict[str, str]:
+    """Artikel -> Zeitpunkt der letzten Aenderung, nur fuer seit dem Stand geaenderte Artikel
+    (Zeilen-Zeitstempel der Dateien plus changed_since des Importstands, dazu wieder
+    vorhandene Artikel aus deleted_since - wie in changed_articles_since)."""
+    if not stand:
+        return {}
+    last_import_at = normalize_written_at(stand.get("last_import_at"))
+    if not last_import_at:
+        return {}
+    changed = {
+        article_number: snapshot.last_written_at
+        for article_number, snapshot in records.items()
+        if snapshot.last_written_at and snapshot.last_written_at > last_import_at
+    }
+    for article_number, written_at in _normalize_changed_since(stand.get("changed_since")).items():
+        if written_at > last_import_at and article_number in records and written_at > changed.get(article_number, ""):
+            changed[article_number] = written_at
+    for article_number in stand.get("deleted_since") or []:
+        key = normalize_article_number(str(article_number))
+        if key in records and key not in changed:
+            # Geloescht und wieder angelegt (Zeilen aelter als der Stand): steht auf der
+            # Loeschliste, also auch markieren.
+            changed[key] = records[key].last_written_at or last_import_at
+    return changed
+
+
+def write_import_delete_list(path: Path, changes: list[ArticleChangeSinceImport]) -> None:
+    """Loeschliste seit Apollo-Import: Blatt 'Loeschliste' (A = 757, B = Artikelnummer,
+    Aufbau wie VLoesch.xlsx) plus Blatt 'Aenderungen' (was sich je Artikel geaendert hat).
+    CSV-Ziel: nur die Loeschliste."""
+    articles = [change.article_number for change in changes]
+    if path.suffix.lower() == ".csv":
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle, delimiter=";")
+            writer.writerow(APOLLO_DELETE_LIST_HEADERS)
+            for article_number in articles:
+                writer.writerow([APOLLO_DELETE_LIST_COLUMN_A_VALUE, article_number])
+        return
+    workbook = Workbook()
+    delete_sheet = workbook.active
+    delete_sheet.title = "Loeschliste"
+    delete_sheet.append(list(APOLLO_DELETE_LIST_HEADERS))
+    for article_number in articles:
+        delete_sheet.append([APOLLO_DELETE_LIST_COLUMN_A_VALUE, _sanitize_cell_value(article_number)])
+    changes_sheet = workbook.create_sheet("Aenderungen")
+    changes_sheet.append(list(IMPORT_STAND_CHANGES_HEADERS))
+    for change in changes:
+        changes_sheet.append([_sanitize_cell_value(cell) for cell in change.as_row()])
+    temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    try:
+        workbook.save(temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def format_import_stand_label(
+    stand: dict[str, object] | None, changed_count: int, deleted_count: int = 0, read_error: str = ""
+) -> str:
+    """Text fuer die Zeile 'Letzter Apollo-Import' im Projekt-Reiter. read_error: die
+    Importstand-Datei ist gerade nicht lesbar (stand = zuletzt gelesener Stand oder None)."""
+    if not stand:
+        if read_error:
+            return f"Apollo-Importstand nicht lesbar: {read_error}"
+        return "Letzter Apollo-Import: noch kein Importstand gesetzt"
+    text = f"Letzter Apollo-Import: {format_written_at_display(str(stand.get('last_import_at', '')))}"
+    text += f" – seitdem {changed_count} Artikel geändert"
+    if deleted_count:
+        text += f", {deleted_count} gelöscht"
+    set_by = str(stand.get("set_by") or "").strip()
+    if set_by:
+        text += f" (gesetzt von {set_by})"
+    if read_error:
+        text += f" – Datei gerade nicht lesbar ({read_error}), Stand vom letzten Lesen"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Reiter 'Uebersicht': alle Artikel wie in Excel auf einen Blick, je Reiter/Bereich
+# Zeilenanzahl und Datum der letzten Aenderung.
+#
+# Spalten: (Schluessel, Ueberschrift, Breite, Ausrichtung, Sortierart). Sortierart
+# 'text' = Zeichenkette, 'count' = (Anzahl, Datum), 'date' = Zeitstempel, 'flag' = ja/leer.
+OVERVIEW_COLUMNS: tuple[tuple[str, str, int, str, str], ...] = (
+    ("article", "Artikelnummer", 150, "w", "text"),
+    ("short_de", "Kurzbezeichnung (DE)", 240, "w", "text"),
+    ("brand", "Marke", 100, "w", "text"),
+    ("genarts", "GenArten", 110, "w", "text"),
+    ("last_change", "Letzte Änderung", 125, "center", "date"),
+    ("since_import", "Seit Import", 80, "center", "flag"),
+    ("short_text", "Kurzbezeichnung", 150, "center", "count"),
+    ("long_text", "Text", 150, "center", "count"),
+    ("genart", "GenArt", 95, "center", "count"),
+    ("attributes", "Attribute", 95, "center", "count"),
+    ("search_terms", "Suchwörter", 95, "center", "count"),
+    ("oe_numbers", "OE", 95, "center", "count"),
+    ("comparison_numbers", "Vergleich", 95, "center", "count"),
+    ("vehicle_links", "Fahrzeuge", 95, "center", "count"),
+    ("article_lists", "Listen", 95, "center", "count"),
+    ("images", "Bilder", 95, "center", "count"),
+    ("documents", "Dokumente", 95, "center", "count"),
+    ("videos", "Videos", 95, "center", "count"),
+    ("web_links", "Web Links", 95, "center", "count"),
+)
+OVERVIEW_COLUMN_KEYS = tuple(column[0] for column in OVERVIEW_COLUMNS)
+OVERVIEW_HEADERS = [column[1] for column in OVERVIEW_COLUMNS]
+OVERVIEW_EMPTY_CELL = "–"
+OVERVIEW_SHORT_TEXT_MAX = 60
+
+
+def _overview_count_cell(count: int, written_at: str) -> tuple[str, tuple[int, str]]:
+    """'n (TT.MM.)' bzw. '–' plus Sortierschluessel (Anzahl, Zeitstempel)."""
+    if not count:
+        return OVERVIEW_EMPTY_CELL, (0, "")
+    date_label = format_written_at_short(written_at)
+    label = f"{count} ({date_label})" if date_label else str(count)
+    return label, (count, normalize_written_at(written_at))
+
+
+def _overview_text_cell(module_id: str, texts: TranslationSet, auto_uni: bool, written_at: str) -> tuple[str, tuple[int, str]]:
+    """Kurzbezeichnung/Text: 'ID · n Spr. (TT.MM.)' - ID der Textmodul-Zeile und Anzahl gefuellter Sprachen."""
+    languages = texts.populated_count(auto_uni)
+    module_id = module_id.strip()
+    if not languages and not module_id:
+        return OVERVIEW_EMPTY_CELL, (0, "")
+    label = f"{module_id or OVERVIEW_EMPTY_CELL} · {languages} Spr."
+    date_label = format_written_at_short(written_at)
+    if date_label:
+        label += f" ({date_label})"
+    return label, (languages, normalize_written_at(written_at))
+
+
+def overview_row_for_snapshot(snapshot: StoredArticleSnapshot, changed_at: str) -> tuple[list[str], list[object]]:
+    """Eine Zeile der Uebersicht: (Anzeigewerte, Sortierschluessel) in OVERVIEW_COLUMNS-Reihenfolge.
+
+    changed_at = Zeitpunkt der letzten Aenderung, wenn der Artikel seit dem
+    Apollo-Importstand geaendert wurde (sonst '').
+    """
+    brand = next(
+        (row.value.strip() for row in snapshot.attribute_rows if row.criteria_id.strip() == BRAND_CRITERIA_ID and row.value.strip()),
+        "",
+    )
+    short_de = snapshot.short_texts.de.strip() or snapshot.short_texts.uni.strip()
+    if len(short_de) > OVERVIEW_SHORT_TEXT_MAX:
+        short_de = short_de[: OVERVIEW_SHORT_TEXT_MAX - 1] + "…"
+    genarts = ", ".join(selection.id for selection in snapshot.genart_selections if selection.id)
+    values: list[str] = [
+        snapshot.article_number,
+        short_de,
+        brand,
+        genarts or OVERVIEW_EMPTY_CELL,
+        format_written_at_display(snapshot.last_written_at),
+        "ja" if changed_at else "",
+    ]
+    keys: list[object] = [
+        snapshot.article_number,
+        short_de.casefold(),
+        brand.casefold(),
+        genarts.casefold(),
+        snapshot.last_written_at,
+        1 if changed_at else 0,
+    ]
+    last_written = snapshot.last_written
+    for cell, key in (
+        _overview_text_cell(snapshot.short_module_id, snapshot.short_texts, snapshot.short_auto_uni, last_written.get("short_text", "")),
+        _overview_text_cell(snapshot.long_module_id, snapshot.long_texts, snapshot.long_auto_uni, last_written.get("long_text", "")),
+        _overview_count_cell(len(snapshot.genart_selections), last_written.get("genart", "")),
+        _overview_count_cell(len(snapshot.attribute_rows), last_written.get("attributes", "")),
+        _overview_count_cell(len(snapshot.search_terms), last_written.get("search_terms", "")),
+        _overview_count_cell(len(snapshot.oe_number_rows), last_written.get("oe_numbers", "")),
+        _overview_count_cell(len(snapshot.comparison_number_rows), last_written.get("comparison_numbers", "")),
+        _overview_count_cell(len(snapshot.vehicle_link_rows), last_written.get("vehicle_links", "")),
+        _overview_count_cell(len(snapshot.article_list_rows), last_written.get("article_lists", "")),
+        _overview_count_cell(len(snapshot.image_rows), last_written.get("images", "")),
+        _overview_count_cell(len(snapshot.document_rows), last_written.get("documents", "")),
+        _overview_count_cell(len(snapshot.video_rows), last_written.get("videos", "")),
+        _overview_count_cell(len(snapshot.web_rows), last_written.get("web_links", "")),
+    ):
+        values.append(cell)
+        keys.append(key)
+    return values, keys
 
 
 class SingleLineTranslationFrame(ttk.LabelFrame):
@@ -9616,14 +10460,23 @@ class MediaTableFrame(ttk.LabelFrame):
         if pymupdf is None:
             raise ValueError("PyMuPDF für PDF-Vorschau installieren")
         pdf_bytes = self._load_preview_bytes(path_or_link)
-        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            page = document[0]
-            matrix = pymupdf.Matrix(1.5, 1.5)
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            image = pixmap.pil_image()
-        finally:
-            document.close()
+        # Laeuft im Vorschau-Thread: Oeffnen, Rendern und Schliessen nur unter der
+        # PyMuPDF-Sperre (nicht threadsicher, siehe PYMUPDF_LOCK) - der Download davor nicht.
+        with PYMUPDF_LOCK:
+            document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            page: Any = None
+            pixmap: Any = None
+            try:
+                page = document[0]
+                matrix = pymupdf.Matrix(1.5, 1.5)
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                image = pixmap.pil_image()
+            finally:
+                # Seite und Pixmap noch unter der Sperre freigeben (nicht erst beim
+                # Aufraeumen ausserhalb).
+                pixmap = None
+                page = None
+                document.close()
 
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
@@ -13437,6 +14290,22 @@ LIVE_SECTION_LABELS = {
     "videos": "Videos",
     "web_links": "Web-Links",
 }
+# Output-Dateien je Live-Bereich (fuer Meldungen zu gesperrten Dateien).
+LIVE_SECTION_FILES: dict[str, tuple[str, ...]] = {
+    "short_text": (SHORT_TEXT_FILE[0], SHORT_MAPPING_FILE[0]),
+    "long_text": (LONG_TEXT_FILE[0],),
+    "genart": (GENART_FILE[0],),
+    "oe_numbers": (OE_FILE[0],),
+    "comparison_numbers": (COMPARISON_FILE[0],),
+    "search_terms": (USAGE_NUMBER_FILE[0],),
+    "vehicle_links": (VEHICLE_LINK_FILE[0],),
+    "article_lists": (ARTICLE_LIST_FILE[0],),
+    "attributes": (ATTRIBUTE_FILE[0],),
+    "images": (IMAGE_FILE[0],),
+    "documents": (DOCUMENT_FILE[0],),
+    "videos": (VIDEO_FILE[0],),
+    "web_links": (WEB_LINK_FILE[0],),
+}
 
 
 def format_live_section_labels(sections: set[str] | dict[str, object] | tuple[str, ...]) -> str:
@@ -13543,6 +14412,34 @@ def live_section_fingerprints(bundle: ExportBundle, sections: tuple[str, ...] | 
     return {section: live_section_fingerprint(bundle, section)[0] for section in sections}
 
 
+def text_sections_with_only_new_module_id(
+    bundle: ExportBundle, sections: set[str], saved: dict[str, str | None]
+) -> set[str]:
+    """Text-Bereiche ohne jeden Text, die sich vom gespeicherten Stand nur durch die Modul-ID unterscheiden.
+
+    collect_bundle erzeugt beide Text-IDs, sobald es irgendeinen deutschen Text
+    gibt - fuer einen Artikel ohne Text-Zeile (nur Kurzbezeichnung) also auch eine
+    Text-ID, ohne dass es einen Text gibt (und umgekehrt). Geschrieben wuerde dann
+    nur eine leere Zeile mit frischer ID und frischem 'Zuletzt geschrieben am' - der
+    Artikel stuende ohne jede Aenderung auf der Loeschliste seit Apollo-Import.
+    `saved` = Fingerabdruecke des gespeicherten Standes je Bereich (None = unbekannt).
+    """
+    result: set[str] = set()
+    for section, id_field, texts, auto_uni in (
+        ("short_text", "short_module_id", bundle.short_texts, bundle.short_auto_uni),
+        ("long_text", "long_module_id", bundle.long_texts, bundle.long_auto_uni),
+    ):
+        if section not in sections or not getattr(bundle, id_field) or texts.populated_count(auto_uni):
+            continue
+        saved_fingerprint = saved.get(section)
+        if saved_fingerprint is None:
+            continue
+        without_id = dataclass_replace(bundle, **{id_field: ""})
+        if live_section_fingerprint(without_id, section)[0] == saved_fingerprint:
+            result.add(section)
+    return result
+
+
 def bundle_from_snapshot(
     snapshot: StoredArticleSnapshot,
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
@@ -13598,6 +14495,34 @@ class LiveWriteJob:
     # Ausfuehren ausgesetzt war (Massenimport laeuft): der Nachlauf tut dann nichts.
     skipped: bool = False
     duration_seconds: float = 0.0
+    # Zeitpunkt des Schreibens ('YYYY-MM-DD HH:MM:SS'), vom Schreiber gesetzt: damit
+    # tragen die geschriebenen Bereiche im Verzeichnis-Eintrag denselben Stempel wie
+    # die Zeilen auf der Platte ('geaendert seit Apollo-Import').
+    written_at: str = ""
+    # Vom Schreiber gesetzt: Bereiche, deren Zeilen sich auf der Platte tatsaechlich
+    # geaendert haben. Ein Auftrag ohne echte Aenderung (z. B. Bild-Link, der wieder
+    # denselben lokalen Pfad ergibt) stempelt nichts und vermerkt nichts im Importstand.
+    changed_sections: set[str] = field(default_factory=set)
+    # Folgeauftrag (Fahrzeugzeilen nach einem GenArt-Schreiben) mit dem Bundle eines
+    # schon geschriebenen Auftrags: beim Zusammenfassen mit einem wartenden Auftrag
+    # desselben Artikels ist dessen Bundle juenger und bleibt (siehe LiveWriter.submit).
+    followup: bool = False
+    # Nachholer einer gemerkten Eingabe (_retry_failed_live_write, Schliessen): das Bundle
+    # ist der Stand beim Scheitern, nur seine gescheiterten Bereiche gelten. Der Nachlauf
+    # uebernimmt es deshalb nie in den Verzeichnis-Eintrag (dort koennen andere Bereiche
+    # inzwischen neuer sein - zweite Instanz, eigener Massenimport), sondern liest den
+    # Artikel aus den Dateien neu (_on_live_write_done).
+    stored_input: bool = False
+    # Alter des Bundles (Reihenfolge der Einreichung, LiveWriter.submit vergibt sie): ein
+    # normaler Auftrag bekommt die naechste Nummer, ein Folgeauftrag die seines GenArt-
+    # Auftrags, ein Nachholer 0. Beim Zusammenfassen gewinnt das juengere Bundle; ein
+    # Folgeauftrag entfaellt, wenn seine Bereiche nach seinem Bundle schon mit einem
+    # juengeren eingereicht wurden.
+    bundle_seq: int = 0
+    # Nummer der Einreichung selbst (LiveWriter.submit), auch fuer Folgeauftrag und Nachholer.
+    submit_seq: int = 0
+    # Vom Schreiber gesetzt: Folgeauftrag beim Start schon ueberholt (nicht geschrieben).
+    superseded: bool = False
 
     def section_labels(self) -> str:
         return ", ".join(LIVE_SECTION_LABELS.get(section, section) for section in LIVE_SECTIONS if section in self.sections)
@@ -13623,7 +14548,17 @@ class LiveWriter:
         self._running: LiveWriteJob | None = None
         self._results: queue.Queue[LiveWriteJob] = queue.Queue()
         self._stopping = False
-        self.stats: dict[str, int] = {"jobs_submitted": 0, "jobs_merged": 0, "jobs_run": 0, "jobs_failed": 0}
+        self.stats: dict[str, int] = {
+            "jobs_submitted": 0,
+            "jobs_merged": 0,
+            "jobs_run": 0,
+            "jobs_failed": 0,
+            "jobs_superseded": 0,
+        }
+        # Laufende Nummer der Einreichungen (Alter der Bundles, LiveWriteJob.bundle_seq) und
+        # je (Artikel, Ausgabeordner, Bereich) das juengste eingereichte Bundle.
+        self._seq = 0
+        self._section_seq: dict[tuple[str, str, str], int] = {}
         # Bewusst KEIN Daemon-Thread: ein beim Prozessende mitten in
         # workbook.save() eingefrorener Daemon hinterliesse eine halb
         # geschriebene (kaputte) Excel-Datei. So wird der laufende Auftrag
@@ -13639,21 +14574,66 @@ class LiveWriter:
             self._pending.clear()
             self._condition.notify_all()
 
-    def submit(self, job: LiveWriteJob) -> None:
+    def current_seq(self) -> int:
+        """Nummer der zuletzt vergebenen Einreichung (Alter fuer LiveWriteJob.bundle_seq)."""
+        with self._condition:
+            return self._seq
+
+    def _superseded_locked(self, job: LiveWriteJob) -> bool:
+        """Folgeauftrag: alle seine Bereiche wurden nach seinem Bundle schon mit einem
+        juengeren Bundle eingereicht (nur unter self._condition aufrufen)."""
+        root = str(job.output_root)
+        return bool(job.sections) and all(
+            self._section_seq.get((job.article_number, root, section), 0) > job.bundle_seq for section in job.sections
+        )
+
+    def submit(self, job: LiveWriteJob) -> bool:
+        """Auftrag einreihen; Rueckgabe False, wenn er entfaellt (Schreiber beendet oder
+        Folgeauftrag schon ueberholt).
+
+        GenArt-Folgeauftrag (Fahrzeugzeilen mit dem Bundle des GenArt-Auftrags): wurde nach
+        dem GenArt-Auftrag schon ein Auftrag mit Fahrzeugzeilen fuer den Artikel eingereicht,
+        traegt der die neue GenArt und die aktuellen Fahrzeuge - der Folgeauftrag entfaellt.
+        Bis v0.1.52 lief er nach diesem Auftrag (der hatte schon begonnen, als der UI-Thread
+        den GenArt-Abschluss abholte) und schrieb die alte Fahrzeugliste zurueck, z. B. ein
+        gerade entferntes Fahrzeug."""
         with self._condition:
             if self._stopping:
-                return
+                return False
             self.stats["jobs_submitted"] += 1
+            self._seq += 1
+            job.submit_seq = self._seq
+            if not job.followup and not job.stored_input:
+                job.bundle_seq = self._seq
+            if job.followup and self._superseded_locked(job):
+                self.stats["jobs_superseded"] += 1
+                return False
+            root = str(job.output_root)
+            for section in job.sections:
+                key = (job.article_number, root, section)
+                if job.bundle_seq > self._section_seq.get(key, 0):
+                    self._section_seq[key] = job.bundle_seq
             for pending in self._pending:
                 if pending.article_number == job.article_number and pending.output_root == job.output_root:
                     pending.sections |= job.sections
-                    pending.bundle = job.bundle
-                    pending.fingerprints = job.fingerprints
+                    if job.bundle_seq > pending.bundle_seq:
+                        pending.bundle = job.bundle
+                        pending.fingerprints = job.fingerprints
+                        pending.bundle_seq = job.bundle_seq
+                        pending.followup = job.followup
+                        pending.stored_input = job.stored_input
+                    # Sonst bleibt das Bundle des wartenden Auftrags: es ist juenger (z. B.
+                    # ein nach dem Beginn des GenArt-Auftrags eingereihter Auftrag mit GenArt
+                    # und Fahrzeugen der Maske, oder der Maskenstand gegenueber einer gemerkten
+                    # Eingabe) - mit dem aelteren Bundle schriebe er seine eigenen Bereiche
+                    # (z. B. ein neues Suchwort) im alten Stand. Zwei Folgeauftraege: der
+                    # juengere (spaeterer GenArt-Auftrag) gewinnt.
                     pending.status_message = job.status_message or pending.status_message
                     self.stats["jobs_merged"] += 1
-                    return
+                    return True
             self._pending.append(job)
             self._condition.notify()
+            return True
 
     def drain_results(self) -> list[LiveWriteJob]:
         finished: list[LiveWriteJob] = []
@@ -13705,13 +14685,18 @@ class LiveWriter:
         return expected
 
     def latest_bundle(self, article_number: str) -> ExportBundle | None:
-        """Das juengste noch nicht geschriebene Bundle des Artikels (oder None)."""
+        """Das juengste noch nicht geschriebene Bundle des Artikels (oder None).
+
+        Nachholer einer gemerkten Eingabe (stored_input) zaehlen nicht: ihr Bundle ist der
+        Stand beim Scheitern, nur die gescheiterten Bereiche daraus gelten - die liefert
+        _failed_live_write_entry, alles andere der Verzeichnis-Eintrag (die Dateien)."""
         with self._condition:
             for job in reversed(self._pending):
-                if job.article_number == article_number:
+                if job.article_number == article_number and not job.stored_input:
                     return job.bundle
-            if self._running is not None and self._running.article_number == article_number:
-                return self._running.bundle
+            running = self._running
+            if running is not None and running.article_number == article_number and not running.stored_input:
+                return running.bundle
         return None
 
     def _loop(self) -> None:
@@ -13731,9 +14716,14 @@ class LiveWriter:
                     return
                 job = self._pending.pop(0)
                 self._running = job
+                # Folgeauftrag inzwischen ueberholt (siehe submit): nicht schreiben.
+                if job.followup and self._superseded_locked(job):
+                    job.superseded = True
+                    self.stats["jobs_superseded"] += 1
             started = time.perf_counter()
             try:
-                self._run_job(job)
+                if not job.superseded:
+                    self._run_job(job)
             except Exception as exc:  # pragma: no cover - Fehler werden im UI-Thread gemeldet
                 job.error = exc
             job.duration_seconds = time.perf_counter() - started
@@ -13884,7 +14874,53 @@ class ApolloImportApp:
         self.article_browser_cache_dir = ""
         self.article_browser_cache_signature: tuple[tuple[str, int, int], ...] | None = None
         # Datenstand, den die Artikelliste zuletzt gezeichnet hat (siehe _article_browser_render_key).
-        self.article_browser_rendered_key: tuple[tuple[str, int], ...] | None = None
+        self.article_browser_rendered_key: tuple[object, ...] | None = None
+        # Apollo-Importstand des Ausgabeordners (read_import_stand), dazu Ordner und
+        # Datei-Signatur, damit die kleine JSON-Datei nur bei Aenderung neu gelesen wird.
+        self.import_stand: dict[str, object] | None = None
+        self._import_stand_dir = ""
+        self._import_stand_signature: tuple[int, int] | None = None
+        # Lesefehler der Importstand-Datei beim letzten Lesen ('' = gelesen oder keine
+        # Datei): Label 'nicht lesbar' statt 'kein Importstand', Loeschliste/erledigt warnen.
+        self._import_stand_error = ""
+        # Massenimport: Artikel, deren Zeilen sich im Lauf wirklich geaendert haben
+        # (auch komplett geleerte Bereiche ohne Zeilen-Zeitstempel). Der UI-Thread
+        # vermerkt sie gesammelt im Aenderungsjournal (changed_since): waehrend des Laufs
+        # alle BATCH_JOURNAL_FLUSH_SECONDS bzw. BATCH_JOURNAL_FLUSH_ARTICLES Artikel, am
+        # Ende und beim Schliessen (_flush_batch_changed_since) - mit dem Zeitpunkt des
+        # Vermerks, nicht der Verarbeitung. _batch_changed_since gehoert zu _batch_output_root;
+        # scheitert der Vermerk, bleiben die Artikel vorgemerkt - auch ueber den Lauf hinaus,
+        # bei einem Lauf in einen anderen Ausgabeordner in _batch_changed_other_roots (je
+        # Ordner, nur dort zu vermerken; verworfen erst nach gelungenem Vermerk).
+        self._batch_changed_since: dict[str, str] = {}
+        self._batch_output_root: Path | None = None
+        self._batch_changed_other_roots: dict[Path, dict[str, str]] = {}
+        self._batch_journal_flushed_at = 0.0
+        # Letzter Vermerk fuer _batch_output_root gescheitert: waehrend des Laufs erst nach
+        # BATCH_JOURNAL_FLUSH_SECONDS erneut versuchen (nicht bei jeder Fortschritts-Abfrage).
+        self._batch_journal_failed = False
+        # Beim Schliessen waehrend des Laufs: schon gemeldete, noch nicht abgeholte
+        # Artikel aus der Fortschritts-Queue uebernehmen (gesetzt von _start_batch_import).
+        self._batch_drain_for_close: Callable[[], None] | None = None
+        # Artikel, fuer die ein gescheiterter changed_since-Vermerk bereits gemeldet
+        # wurde - bei dauerhaft gesperrter Importstand-Datei nicht bei jedem Speichern
+        # desselben Artikels erneut ein Dialog. Ein gelungener Vermerk des Artikels,
+        # 'Apollo-Import erledigt' und 'Importstand setzen' setzen das zurueck.
+        self._changed_since_failures_reported: set[str] = set()
+        self.import_stand_label_var = tk.StringVar(value=format_import_stand_label(None, 0))
+        # Reiter 'Uebersicht': Zeilen-Cache je Artikel (Objektidentitaet des Snapshots +
+        # Aenderungszeitpunkt), Suchtext, Sortierung; gezeichnet wird nur, wenn der
+        # Reiter sichtbar ist (3.800 Zeilen x 19 Spalten).
+        self.overview_search_var = tk.StringVar()
+        self.overview_count_var = tk.StringVar(value="0 Artikel")
+        self._overview_search_after_id: str | None = None
+        self._overview_rows_cache: dict[str, tuple[int, str, list[str], list[object], str]] = {}
+        self._overview_rendered_key: tuple[object, ...] | None = None
+        self._overview_rendered_search = ""
+        self._overview_visible: list[str] = []
+        self._overview_render_after_id: str | None = None
+        self._overview_sort_column = "article"
+        self._overview_sort_desc = False
         # Ein Neuladen des Artikelverzeichnisses ist angefordert (Katalog neu geladen,
         # KTyp-Parse fertig, Guard hat einen Reload uebersprungen), konnte aber wegen
         # eines laufenden Live-Schreibens noch nicht ausgefuehrt werden. Der Wunsch
@@ -13893,7 +14929,17 @@ class ApolloImportApp:
         self._article_browser_reload_pending = False
         # Verhindert, dass das verzoegerte Neuladen mehrfach eingeplant wird.
         self._article_browser_reload_scheduled = False
+        # UI-Sperre fuer NEUE Live-Auftraege: gesetzt, solange die Maske gefuellt wird
+        # (_suspend_live_write: Laden, Artikelwechsel, Leeren) und waehrend eines
+        # Massenimports. Nur der UI-Thread liest sie (_submit_live_write und Co.).
         self.live_write_suspended = False
+        # Ein Massenimport besitzt die Output-Dateien (gesetzt in _start_batch_import,
+        # geloescht in _finish_batch_import). Nur dieses Flag laesst den Hintergrund-
+        # Schreiber eingereihte Auftraege verwerfen (_run_live_write_job) - nie das
+        # Fuellen der Maske: bis v0.1.52 pruefte der Schreiber live_write_suspended,
+        # und ein Auftrag, den er waehrend eines Artikelwechsels begann, ging still
+        # verloren (Suchwort in 77M505, sofort Wechsel auf 77M810: 15 von 20 weg).
+        self._batch_owns_output = False
         # Hintergrund-Schreiber fuer das Live-Speichern (siehe LiveWriter). Die
         # Oberflaeche sammelt nur das Bundle ein und reiht den Auftrag ein.
         self.live_writer = LiveWriter(self._run_live_write_job)
@@ -13908,6 +14954,22 @@ class ApolloImportApp:
         # Bereiche, deren letzter Schreibversuch scheiterte: beim naechsten Live-
         # Schreiben des Artikels erneut pruefen, auch wenn ein anderer Bereich ausloest.
         self._live_failed_sections: dict[str, set[str]] = {}
+        # Je Artikel mit gescheiterten Bereichen: Bundle, Ausgabeordner und Fingerabdruecke
+        # des juengsten gescheiterten Auftrags - die Eingabe, die nicht in den Dateien
+        # steht. Scheitert ein Auftrag erst, nachdem der Artikel verlassen wurde, holt das
+        # erneute Laden sie zuerst nach bzw. stellt sie in der Maske wieder her
+        # (_retry_failed_live_write, _restore_failed_sections_into_mask), und das
+        # Schliessen versucht sie noch einmal. Faellt mit dem Marker weg
+        # (_drop_live_failed_sections).
+        self._live_failed_bundles: dict[str, tuple[ExportBundle, Path, dict[str, str]]] = {}
+        self._live_retry_running = False
+        # Solange ein Artikelwechsel bzw. das Laufende des Massenimports auf das Schreiben
+        # wartet (die Ereignisschleife laeuft dabei), darf kein zweiter Wechsel dazwischen
+        # (siehe _block_mask_switch).
+        self._mask_switch_blocked = 0
+        # Hinweis des letzten Ladens, wenn gescheiterte Bereiche aus der gemerkten Eingabe
+        # wiederhergestellt wurden (Statuszeile, _append_mask_restore_notice).
+        self._mask_restore_notice = ""
         # Fehlerarten, fuer die bereits eine Meldung gezeigt wurde (einmal je Art).
         self._live_write_reported_errors: set[str] = set()
         self._closing = False
@@ -13928,6 +14990,15 @@ class ApolloImportApp:
         # Meldung eines gerade abgebrochenen Artikelwechsels; der naechste Klick auf
         # 'Artikel anlegen' zeigt sie statt den alten Artikel abzurufen.
         self._mask_switch_aborted = ""
+        # Der Abbruch wurde schon in einem Dialog bestaetigt ('Nein' waehrend des
+        # Massenimports): der folgende Klick wird still abgefangen, ohne zweite Meldung.
+        self._mask_switch_abort_silent = False
+        # Bereiche, die _save_mask_article_before_leaving beim letzten Verlassen wirklich zu
+        # schreiben versucht hat (Auftrag eingereiht): nur fuer sie nennt der Abbruch eine
+        # gesperrte Datei - waehrend eines Massenimports wird gar nicht geschrieben.
+        self._leave_attempted_sections: set[str] = set()
+        # Bereiche des zuletzt von _submit_live_write eingereihten Auftrags.
+        self._last_live_submit_sections: set[str] = set()
         self.pending_article_browser_selection = ""
         self.project_tab_compact_mode: bool | None = None
         self.article_browser_compact_mode: bool | None = None
@@ -14175,6 +15246,7 @@ class ApolloImportApp:
         self.main_notebook.grid(row=2, column=0, sticky="nsew")
 
         self.project_tab = ttk.Frame(self.main_notebook, padding=18)
+        self.overview_tab = ttk.Frame(self.main_notebook, padding=18)
         self.short_tab = ttk.Frame(self.main_notebook, padding=18)
         self.long_tab = ttk.Frame(self.main_notebook, padding=18)
         self.genart_tab = ttk.Frame(self.main_notebook, padding=18)
@@ -14190,6 +15262,9 @@ class ApolloImportApp:
 
         # Gruppierung: ⚙ = wird beim Kunzer-Abruf automatisch befuellt, ✎ = manuell pflegen.
         self.main_notebook.add(self.project_tab, text="Projekt")
+        # Uebersicht direkt hinter 'Projekt' (ab v0.1.52): der Sitzungszustand merkt
+        # sich den Reiter als Index - aeltere Staende werden beim Laden verschoben.
+        self.main_notebook.add(self.overview_tab, text="Übersicht")
         self.main_notebook.add(self.short_tab, text="⚙ Kurzbezeichnung")
         self.main_notebook.add(self.long_tab, text="⚙ Text")
         self.main_notebook.add(self.image_tab, text="⚙ Bilder")
@@ -14205,6 +15280,7 @@ class ApolloImportApp:
         self.main_notebook.add(self.article_list_tab, text="✎ Stückliste/Zubehör")
 
         self._build_project_tab()
+        self._build_overview_tab()
         self._build_short_tab()
         self._build_long_tab()
         self._build_genart_tab()
@@ -14726,7 +15802,7 @@ class ApolloImportApp:
             selected_browser_article = str(self.article_browser_tree.selection()[0]).strip()
 
         return {
-            "version": 5,
+            "version": 6,
             "window_geometry": self.root.winfo_geometry(),
             "selected_tab": selected_tab,
             "paths": {
@@ -15113,6 +16189,10 @@ class ApolloImportApp:
                 self.web_frame.set_preview_visible(bool(ui.get("web_preview_visible", getattr(self.web_frame, "preview_visible", True))))
 
             selected_tab = payload.get("selected_tab")
+            state_version = payload.get("version")
+            if isinstance(selected_tab, int) and isinstance(state_version, int) and state_version < 6 and selected_tab >= 1:
+                # Bis Version 5 gab es den Reiter 'Uebersicht' hinter 'Projekt' noch nicht.
+                selected_tab += 1
             if isinstance(selected_tab, int) and 0 <= selected_tab < len(self.main_notebook.tabs()):
                 self.main_notebook.select(selected_tab)
 
@@ -15174,10 +16254,15 @@ class ApolloImportApp:
         try:
             completed = self._flush_live_writes(reason="Schließen: ")
             # Zuvor gescheiterte Bereiche (z. B. Datei war in Excel geoeffnet und ist
-            # jetzt frei) ein letztes Mal schreiben - fuer den aktuell geladenen Artikel.
+            # jetzt frei) ein letztes Mal schreiben - fuer den geladenen Artikel aus der
+            # Maske, fuer verlassene Artikel mit der gemerkten Eingabe (nie den Dateistand).
             if self._live_failed_sections:
                 try:
                     self._write_live_database()
+                except Exception:
+                    pass
+                try:
+                    self._retry_failed_live_writes_on_close()
                 except Exception:
                     pass
                 completed = self._flush_live_writes(reason="Schließen: ") and completed
@@ -15197,6 +16282,19 @@ class ApolloImportApp:
                     self._closing = False
                     return
         except tk.TclError:
+            pass
+        # Massenimport (auch beim Warten auf den KI-Batch): die im Lauf geaenderten Artikel
+        # noch im Aenderungsjournal vermerken - das Laufende kommt nach dem Schliessen nicht.
+        # Getrennt abgesichert: ein Fehler beim Abholen darf den Vermerk (auch der noch
+        # vorgemerkten Artikel frueherer Laeufe, aller Ausgabeordner) nicht ueberspringen.
+        try:
+            if self.batch_import_running and self._batch_drain_for_close is not None:
+                self._batch_drain_for_close()
+        except Exception:
+            pass
+        try:
+            self._flush_batch_changed_since()
+        except Exception:
             pass
         # Laufender Auftrag wird noch zu Ende geschrieben, danach endet der Thread.
         self.live_writer.shutdown()
@@ -16160,7 +17258,7 @@ if ($copied) {{
         browser_frame = self.browser_frame
         browser_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(14, 0))
         browser_frame.columnconfigure(0, weight=1)
-        browser_frame.rowconfigure(1, weight=1)
+        browser_frame.rowconfigure(2, weight=1)
 
         browser_header = ttk.Frame(browser_frame)
         browser_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -16182,9 +17280,27 @@ if ($copied) {{
             row=0, column=4, padx=(8, 0)
         )
 
-        columns = ("article", "source", "short_id", "long_id", "genart", "attr", "oe", "comparison", "lists", "images", "documents", "videos", "links")
+        # Apollo-Importstand: wann die Dateien zuletzt in Apollo importiert wurden,
+        # wie viele Artikel seitdem geaendert sind, dazu die Loeschliste dafuer.
+        import_row = ttk.Frame(browser_frame)
+        import_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        import_row.columnconfigure(0, weight=1)
+        self.import_stand_label = ttk.Label(import_row, textvariable=self.import_stand_label_var)
+        self.import_stand_label.grid(row=0, column=0, sticky="w")
+        self.import_done_button = ttk.Button(
+            import_row, text="Apollo-Import erledigt", command=self.mark_apollo_import_done
+        )
+        self.import_done_button.grid(row=0, column=1, padx=(12, 0))
+        self.import_stand_button = ttk.Button(import_row, text="Importstand setzen…", command=self.open_import_stand_dialog)
+        self.import_stand_button.grid(row=0, column=2, padx=(8, 0))
+        self.import_delete_list_button = ttk.Button(
+            import_row, text="Löschliste seit Apollo-Import", command=self.save_apollo_delete_list_since_import
+        )
+        self.import_delete_list_button.grid(row=0, column=3, padx=(8, 0))
+
+        columns = ("article", "changed", "source", "short_id", "long_id", "genart", "attr", "oe", "comparison", "lists", "images", "documents", "videos", "links")
         self.browser_content_frame = ttk.Frame(browser_frame)
-        self.browser_content_frame.grid(row=1, column=0, sticky="nsew")
+        self.browser_content_frame.grid(row=2, column=0, sticky="nsew")
         self.browser_content_frame.columnconfigure(0, weight=1)
         self.browser_content_frame.columnconfigure(1, weight=1)
         self.browser_content_frame.rowconfigure(0, weight=1)
@@ -16222,6 +17338,7 @@ if ($copied) {{
         )
         self.article_browser_tree.grid(row=1, column=0, sticky="nsew")
         self.article_browser_tree.heading("article", text="Artikelnummer")
+        self.article_browser_tree.heading("changed", text="Geändert seit Import")
         self.article_browser_tree.heading("source", text="Quelle")
         self.article_browser_tree.heading("short_id", text="Kurz-ID")
         self.article_browser_tree.heading("long_id", text="Text-ID")
@@ -16234,8 +17351,11 @@ if ($copied) {{
         self.article_browser_tree.heading("documents", text="Dokumente")
         self.article_browser_tree.heading("videos", text="Videos")
         self.article_browser_tree.heading("links", text="Web Links")
-        self.article_browser_tree.column("article", width=220, anchor="w")
+        self.article_browser_tree.column("article", width=200, anchor="w")
+        self.article_browser_tree.column("changed", width=130, anchor="center")
         self.article_browser_tree.column("source", width=90, anchor="center")
+        # Seit dem Apollo-Importstand geaenderte Artikel: hellorange hinterlegt.
+        self.article_browser_tree.tag_configure(ARTICLE_CHANGED_ROW_TAG, background=ARTICLE_CHANGED_ROW_COLOR)
         self.article_browser_tree.column("short_id", width=100, anchor="center")
         self.article_browser_tree.column("long_id", width=100, anchor="center")
         self.article_browser_tree.column("genart", width=180, anchor="w")
@@ -18157,11 +19277,38 @@ if ($copied) {{
         finally:
             self.live_write_suspended = previous
 
-    def _snapshot_from_bundle(self, bundle: ExportBundle, source_folder: Path) -> StoredArticleSnapshot:
+    @contextmanager
+    def _block_mask_switch(self):
+        """Waehrend eines Wartens auf das Schreiben, das die Ereignisschleife laufen laesst
+        (_flush_live_writes) und danach die Artikelnummer des bisherigen Artikels wieder
+        setzt: keinen weiteren Artikelwechsel zulassen (getippte Nummer, Doppelklick im
+        Verzeichnis oder in der Uebersicht, 'Artikel anlegen'). Sonst zeigte das Feld danach
+        den alten Artikel, die Maske den neuen, und der naechste Fokusverlust schriebe den
+        Maskeninhalt unter die falsche Nummer."""
+        self._mask_switch_blocked += 1
+        try:
+            yield
+        finally:
+            self._mask_switch_blocked -= 1
+
+    def _mask_switch_busy(self) -> bool:
+        if not (self._mask_switch_blocked or self._live_retry_running):
+            return False
+        self.status_var.set("Bitte warten – das Speichern des bisherigen Artikels läuft noch.")
+        return True
+
+    def _snapshot_from_bundle(
+        self, bundle: ExportBundle, source_folder: Path, existing: StoredArticleSnapshot | None = None
+    ) -> StoredArticleSnapshot:
+        """Bundle -> Verzeichnis-Eintrag. `existing` liefert die bekannten Zeitstempel
+        ('Zuletzt geschrieben am' je Bereich) weiter - das Bundle selbst kennt keine."""
         return StoredArticleSnapshot(
             article_number=bundle.article_number,
             source_label="Output",
             source_folder=source_folder,
+            last_written=dict(existing.last_written) if existing is not None else {},
+            last_written_at=existing.last_written_at if existing is not None else "",
+            first_written_at=existing.first_written_at if existing is not None else "",
             short_module_id=bundle.short_module_id,
             long_module_id=bundle.long_module_id,
             genart_selections=[GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in bundle.genart_selections],
@@ -18188,6 +19335,9 @@ if ($copied) {{
             article_number=snapshot.article_number,
             source_label=snapshot.source_label,
             source_folder=snapshot.source_folder,
+            last_written=dict(snapshot.last_written),
+            last_written_at=snapshot.last_written_at,
+            first_written_at=snapshot.first_written_at,
             short_module_id=snapshot.short_module_id,
             long_module_id=snapshot.long_module_id,
             genart_selections=[GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in snapshot.genart_selections],
@@ -18262,14 +19412,19 @@ if ($copied) {{
 
         visible_article_numbers = self._visible_article_numbers()
         self._update_article_browser_search_count(len(visible_article_numbers))
+        # Seit dem Apollo-Importstand geaenderte Artikel: Spalte mit Zeitpunkt + Farbe.
+        changed_map = changed_since_import_map(self.article_browser_records, self.import_stand)
         for article_number in visible_article_numbers:
             snapshot = self.article_browser_records[article_number]
+            changed_at = changed_map.get(article_number, "")
             self.article_browser_tree.insert(
                 "",
                 "end",
                 iid=article_number,
+                tags=(ARTICLE_CHANGED_ROW_TAG,) if changed_at else (),
                 values=(
                     snapshot.article_number,
+                    format_written_at_display(changed_at),
                     snapshot.source_label,
                     snapshot.short_module_id,
                     snapshot.long_module_id,
@@ -18293,6 +19448,9 @@ if ($copied) {{
             self._update_article_browser_detail(self.article_browser_records[selected_article])
         else:
             self._update_article_browser_detail(None)
+        self._update_import_stand_label()
+        # Die Uebersicht zeigt dieselben Datensaetze: nur neu zeichnen, wenn sie sichtbar ist.
+        self._refresh_overview_if_visible()
 
     def _visible_article_numbers(self) -> list[str]:
         """Sortierte Artikelnummern, die der aktuelle Suchtext uebrig laesst.
@@ -18439,19 +19597,34 @@ if ($copied) {{
                 signature.append((file_name, -1, -1))
         return tuple(signature)
 
-    def _upsert_article_browser_from_bundle(self, bundle: ExportBundle, output_root: Path) -> None:
-        self.article_browser_records[bundle.article_number] = self._snapshot_from_bundle(bundle, output_root)
+    def _upsert_article_browser_from_bundle(
+        self, bundle: ExportBundle, output_root: Path, stamp: dict[str, str] | None = None
+    ) -> None:
+        """Ganzen Eintrag durch das Bundle ersetzen. `stamp` = {Bereich: Schreibzeitpunkt}
+        der gerade geschriebenen Bereiche (siehe _on_live_write_done)."""
+        existing_snapshot = self.article_browser_records.get(bundle.article_number)
+        snapshot = self._snapshot_from_bundle(bundle, output_root, existing=existing_snapshot)
+        for section, written_at in (stamp or {}).items():
+            snapshot.note_written_at(section, written_at)
+        self.article_browser_records[bundle.article_number] = snapshot
         self._article_search_blob_cache.pop(bundle.article_number, None)
         self.article_browser_cache_dir = str(output_root)
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
 
-    def _upsert_article_browser_from_batch_bundle(self, bundle: ExportBundle, output_root: Path) -> None:
+    def _upsert_article_browser_from_batch_bundle(
+        self, bundle: ExportBundle, output_root: Path, changed_sections: set[str] | None = None
+    ) -> None:
         """Aktualisiert den Artikel in der Artikelliste nach einem Batch-Export.
 
         Es werden nur die im Abrufumfang angehakten Datenarten ersetzt; alles
         andere (nicht abgerufene Texte/Medien sowie die gepflegten GenArts,
         OE-Nummern, Attribute usw.) bleibt aus dem vorhandenen Eintrag erhalten.
+        `changed_sections` = Bereiche, deren Zeilen export_bundle wirklich geaendert
+        hat (None = unbekannt, alle geschriebenen Bereiche gelten als geaendert).
+        Jeder Artikel mit geaendertem Bereich kommt ins Aenderungsjournal des
+        Importstands (am Ende des Laufs, _finish_batch_import) - auch ein komplett
+        geleerter Bereich, in dem kein Zeilen-Zeitstempel zurueckbleibt.
         """
         existing_snapshot = self.article_browser_records.get(bundle.article_number)
         snapshot = self._copy_snapshot(existing_snapshot) if existing_snapshot is not None else StoredArticleSnapshot(
@@ -18459,9 +19632,12 @@ if ($copied) {{
             source_label="Output",
             source_folder=output_root,
         )
+        written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         snapshot.article_number = bundle.article_number
         snapshot.source_label = "Output"
         snapshot.source_folder = output_root
+        written_sections: set[str] = set()
+        attributes_added = False
         if bundle.short_module_id:
             snapshot.short_module_id = bundle.short_module_id
         if bundle.long_module_id:
@@ -18469,18 +19645,27 @@ if ($copied) {{
         if bundle.include_short_text:
             snapshot.short_texts = TranslationSet(**vars(bundle.short_texts))
             snapshot.short_auto_uni = bundle.short_auto_uni
+            written_sections.add("short_text")
         if bundle.include_long_text:
             snapshot.long_texts = TranslationSet(**vars(bundle.long_texts))
             snapshot.long_auto_uni = bundle.long_auto_uni
+            written_sections.add("long_text")
         if bundle.include_images:
             snapshot.image_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.image_rows]
+            written_sections.add("images")
         if bundle.include_documents:
             snapshot.document_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.document_rows]
+            written_sections.add("documents")
         if bundle.include_videos:
             snapshot.video_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.video_rows]
+            written_sections.add("videos")
         if bundle.include_web_links:
             snapshot.web_rows = [MediaRow(row.path_or_link, art=row.art, sprache=row.sprache) for row in bundle.web_rows]
+            written_sections.add("web_links")
         if bundle.include_curated_data:
+            written_sections.update(
+                {"genart", "oe_numbers", "comparison_numbers", "article_lists", "vehicle_links", "attributes", "search_terms"}
+            )
             snapshot.genart_selections = [GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in bundle.genart_selections]
             snapshot.genart_id = bundle.genart_id
             snapshot.genart_bezeichnung = bundle.genart_bezeichnung
@@ -18495,20 +19680,44 @@ if ($copied) {{
             # Marke: im Batch add-only ergaenzte Attributzeilen (8988 bzw.
             # Attribut-Findung) in den Eintrag uebernehmen, damit die Liste den
             # Platten-Stand zeigt, ohne auf das Neuladen zu warten.
-            snapshot.attribute_rows = merge_attribute_rows_add_only(snapshot.attribute_rows, bundle.attribute_rows)
+            merged_rows = merge_attribute_rows_add_only(snapshot.attribute_rows, bundle.attribute_rows)
+            if len(merged_rows) != len(snapshot.attribute_rows):
+                written_sections.add("attributes")
+                attributes_added = True
+            snapshot.attribute_rows = merged_rows
+        # Vom Lauf neu geschriebene Bereiche: ein gescheiterter Live-Nachholer (samt
+        # gemerkter Eingabe) ist damit ueberholt - der Massenimport liefert den
+        # maszgeblichen Stand. Nur ergaenzte Marken-Attribute ersetzen nichts.
+        self._drop_live_failed_sections(
+            normalize_article_number(bundle.article_number),
+            written_sections - ({"attributes"} if attributes_added else set()),
+        )
+        # Zeitstempel der im Batch geaenderten Bereiche nachziehen (export_bundle stempelt
+        # nur geaenderte Zeilen mit 'jetzt'; der Abschluss des Laufs liest ohnehin neu).
+        if changed_sections is not None:
+            # Attribute: auch nur umsortiert (Vorlage) zaehlt als geaendert.
+            attributes_written = attributes_added or "attributes" in changed_sections
+            written_sections = (written_sections & changed_sections) | ({"attributes"} if attributes_written else set())
+        snapshot.stamp_sections(written_sections, written_at)
+        if written_sections or changed_sections:
+            self._note_batch_changed(bundle.article_number)
         self.article_browser_records[bundle.article_number] = snapshot
         self._article_search_blob_cache.pop(bundle.article_number, None)
         self.article_browser_cache_dir = str(output_root)
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
 
-    def _upsert_article_browser_section(self, section: str, bundle: ExportBundle, output_root: Path) -> None:
+    def _upsert_article_browser_section(
+        self, section: str, bundle: ExportBundle, output_root: Path, stamp: dict[str, str] | None = None
+    ) -> None:
         existing_snapshot = self.article_browser_records.get(bundle.article_number)
         snapshot = self._copy_snapshot(existing_snapshot) if existing_snapshot is not None else StoredArticleSnapshot(
             article_number=bundle.article_number,
             source_label="Output",
             source_folder=output_root,
         )
+        for stamped_section, written_at in (stamp or {}).items():
+            snapshot.note_written_at(stamped_section, written_at)
         snapshot.article_number = bundle.article_number
         snapshot.source_label = "Output"
         snapshot.source_folder = output_root
@@ -18603,46 +19812,47 @@ if ($copied) {{
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
 
-    def _write_short_text_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        article_keys = {bundle.article_number}
-        write_workbook_with_upsert(
+    # Die _write_*_live-Methoden liefern True, wenn sich die Zeilen des Artikels
+    # geaendert haben (replace_article_rows_preserving_timestamps): nur dann zaehlt
+    # der Bereich als 'geaendert seit Apollo-Import' (_on_live_write_done). Wie bei
+    # den uebrigen Bereichen behalten unveraenderte Zeilen ihren Zeitstempel.
+    def _write_short_text_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        text_changed = replace_article_rows_preserving_timestamps(
             output_root / SHORT_TEXT_FILE[0],
             SHORT_TEXT_FILE[1],
             SHORT_TEXT_HEADERS,
-            [append_written_at(build_short_text_export_row(bundle), written_at)],
-            replace_article_keys=article_keys,
+            bundle.article_number,
+            [build_short_text_export_row(bundle)],
         )
-        write_workbook_with_upsert(
+        mapping_changed = replace_article_rows_preserving_timestamps(
             output_root / SHORT_MAPPING_FILE[0],
             SHORT_MAPPING_FILE[1],
             SHORT_MAPPING_HEADERS,
-            [append_written_at(build_short_mapping_export_row(bundle), written_at)],
-            replace_article_keys=article_keys,
+            bundle.article_number,
+            [build_short_mapping_export_row(bundle)],
         )
+        return text_changed or mapping_changed
 
-    def _write_long_text_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        write_workbook_with_upsert(
+    def _write_long_text_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / LONG_TEXT_FILE[0],
             LONG_TEXT_FILE[1],
             SHORT_TEXT_HEADERS,
-            [append_written_at(build_long_text_export_row(bundle), written_at)],
-            replace_article_keys={bundle.article_number},
+            bundle.article_number,
+            [build_long_text_export_row(bundle)],
         )
 
-    def _write_genart_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        write_workbook_with_upsert(
+    def _write_genart_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / GENART_FILE[0],
             GENART_FILE[1],
             GENART_HEADERS,
-            [append_written_at(row, written_at) for row in build_genart_export_rows(bundle)],
-            replace_article_keys={bundle.article_number},
+            bundle.article_number,
+            build_genart_export_rows(bundle),
         )
 
-    def _write_oe_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        replace_article_rows_preserving_timestamps(
+    def _write_oe_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / OE_FILE[0],
             OE_FILE[1],
             OE_HEADERS,
@@ -18650,8 +19860,8 @@ if ($copied) {{
             build_oe_export_rows(bundle),
         )
 
-    def _write_comparison_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        replace_article_rows_preserving_timestamps(
+    def _write_comparison_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / COMPARISON_FILE[0],
             COMPARISON_FILE[1],
             COMPARISON_HEADERS,
@@ -18659,8 +19869,8 @@ if ($copied) {{
             build_comparison_export_rows(bundle),
         )
 
-    def _write_article_list_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        replace_article_rows_preserving_timestamps(
+    def _write_article_list_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / ARTICLE_LIST_FILE[0],
             ARTICLE_LIST_FILE[1],
             ARTICLE_LIST_HEADERS,
@@ -18668,8 +19878,8 @@ if ($copied) {{
             build_article_list_export_rows(bundle),
         )
 
-    def _write_usage_number_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        replace_article_rows_preserving_timestamps(
+    def _write_usage_number_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / USAGE_NUMBER_FILE[0],
             USAGE_NUMBER_FILE[1],
             USAGE_NUMBER_HEADERS,
@@ -18677,8 +19887,8 @@ if ($copied) {{
             build_usage_number_export_rows(bundle),
         )
 
-    def _write_vehicle_link_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        replace_article_rows_preserving_timestamps(
+    def _write_vehicle_link_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / VEHICLE_LINK_FILE[0],
             VEHICLE_LINK_FILE[1],
             VEHICLE_LINK_HEADERS,
@@ -18686,8 +19896,8 @@ if ($copied) {{
             build_vehicle_link_export_rows(bundle),
         )
 
-    def _write_attribute_live(self, bundle: ExportBundle, output_root: Path) -> None:
-        replace_article_rows_preserving_timestamps(
+    def _write_attribute_live(self, bundle: ExportBundle, output_root: Path) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / ATTRIBUTE_FILE[0],
             ATTRIBUTE_FILE[1],
             ATTRIBUTE_HEADERS,
@@ -18702,8 +19912,8 @@ if ($copied) {{
         file_spec: tuple[str, str],
         headers: list[str],
         rows: list[list[str]],
-    ) -> None:
-        replace_article_rows_preserving_timestamps(
+    ) -> bool:
+        return replace_article_rows_preserving_timestamps(
             output_root / file_spec[0],
             file_spec[1],
             headers,
@@ -18721,25 +19931,31 @@ if ($copied) {{
         bundle = job.bundle
         output_root = job.output_root
         sections = job.sections
-        if self.live_write_suspended:
+        if self._batch_owns_output:
             # Waehrend eines Massenimports darf kein Live-Schreiben in dieselben
-            # Output-Dateien greifen (siehe live_write_suspended). Ein beim Aussetzen
-            # bereits laufender oder wartender Auftrag wird deshalb verworfen - der
-            # Massenimport liefert den maszgeblichen Stand. Im Normalbetrieb werden
-            # offene Auftraege vor dem Aussetzen per _flush_live_writes abgeschlossen,
-            # dieser Fall tritt dort also nicht ein.
+            # Output-Dateien greifen (siehe _batch_owns_output). Ein beim Start noch
+            # wartender Auftrag wird deshalb verworfen - der Massenimport liefert den
+            # maszgeblichen Stand. Im Normalbetrieb werden offene Auftraege vor dem
+            # Start per _flush_live_writes abgeschlossen (verworfen wird nur nach
+            # 'trotzdem starten'). Bewusst NICHT live_write_suspended: das setzt auch
+            # jedes Fuellen der Maske, und ein waehrenddessen begonnener Auftrag
+            # (Eingabe, sofort Artikelwechsel) ginge sonst verloren.
             job.skipped = True
             return
         errors: dict[str, Exception] = {}
+        # Bereiche, deren Zeilen sich auf der Platte wirklich geaendert haben (die
+        # Schreiber liefern True) - nur sie zaehlen als 'geaendert seit Apollo-Import'.
+        changed: set[str] = set()
 
-        def attempt(section: str, write: Callable[[], None]) -> None:
+        def attempt(section: str, write: Callable[[], bool]) -> None:
             # Jeder Bereich schreibt fuer sich: eine gesperrte Datei (z. B. in Excel
             # geoeffnet) laesst nur ihren Bereich scheitern, die uebrigen Bereiche
             # desselben Auftrags werden weiter geschrieben.
             if section not in sections:
                 return
             try:
-                write()
+                if write():
+                    changed.add(section)
             except Exception as exc:  # pragma: no cover - im UI-Thread gemeldet
                 errors[section] = exc
 
@@ -18762,7 +19978,8 @@ if ($copied) {{
                 # Der Attribut-Export ersetzt alle Zeilen des Artikels und raeumt dabei
                 # auch Alt-Suchwortzeilen (9595) mit ab.
                 try:
-                    self._write_attribute_live(bundle, output_root)
+                    if self._write_attribute_live(bundle, output_root):
+                        changed.add("attributes")
                 except Exception as exc:  # pragma: no cover - im UI-Thread gemeldet
                     errors["attributes"] = exc
             elif "search_terms" in sections:
@@ -18770,24 +19987,30 @@ if ($copied) {{
                 # Attribut-Export zu bauen - eine ungueltige Attributzeile des Artikels
                 # darf die Suchwoerter nicht als fehlgeschlagen markieren.
                 try:
-                    remove_legacy_search_term_attribute_rows(
+                    if remove_legacy_search_term_attribute_rows(
                         output_root, {normalize_article_number(bundle.article_number)}
-                    )
+                    ):
+                        changed.add("search_terms")
                 except Exception as exc:  # pragma: no cover - im UI-Thread gemeldet
                     errors["search_terms"] = exc
 
-            def write_images() -> None:
+            def write_images() -> bool:
                 bundle.image_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.image_rows, output_root, "Bild", kind_tag="")
-                self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
+                return self._write_media_section_live(bundle, output_root, IMAGE_FILE, IMAGE_HEADERS, build_image_export_rows(bundle))
 
-            def write_documents() -> None:
+            def write_documents() -> bool:
                 bundle.document_rows, _skipped = materialize_media_rows(bundle.article_number, bundle.document_rows, output_root, "Dokument", kind_tag="D")
-                self._write_media_section_live(bundle, output_root, DOCUMENT_FILE, DOCUMENT_HEADERS, build_document_export_rows(bundle))
+                return self._write_media_section_live(bundle, output_root, DOCUMENT_FILE, DOCUMENT_HEADERS, build_document_export_rows(bundle))
 
             attempt("images", write_images)
             attempt("documents", write_documents)
             attempt("videos", lambda: self._write_media_section_live(bundle, output_root, VIDEO_FILE, VIDEO_HEADERS, build_video_export_rows(bundle)))
             attempt("web_links", lambda: self._write_media_section_live(bundle, output_root, WEB_LINK_FILE, WEB_HEADERS, build_web_export_rows(bundle)))
+        # Nach den Schreibvorgaengen: die Zeilen tragen hoechstens diesen Zeitpunkt.
+        job.written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Auch ein danach gescheiterter Bereich kann schon Zeilen geaendert haben
+        # (Suchwoerter: Gebrauchsnummern geschrieben, Raeumung der 9595-Zeilen gescheitert).
+        job.changed_sections = changed
 
         if errors:
             job.section_errors = errors
@@ -18801,11 +20024,37 @@ if ($copied) {{
         nach Sitzungs-Wiederherstellung oder einer getippten Artikelnummer),
         wird er aus dem Eintrag im Artikelverzeichnis abgeleitet, der den
         Datentraeger spiegelt. None = unbekannt, der Bereich gilt als geaendert.
+
+        Wird der Verzeichnis-Eintrag ersetzt, ohne dass die Maske neu geladen wird
+        (Neuladen nach einem Katalog, z. B. KTyp-Stammdaten erst nach dem Laden des
+        Artikels fertig, oder nach einer Aenderung durch eine zweite Instanz), bleibt
+        der gemerkte Stand: verglichen wird mit dem, was die Maske beim Laden bzw.
+        letzten Schreiben gezeigt hat. Neu abgeleitet, mit anderem Katalog oder gegen
+        die Fremdaenderung, galte die unveraenderte Maske sonst als geaendert und
+        wuerde ohne Eingabe geschrieben (Fahrzeuge um die TopMotive-Nummern ergaenzt,
+        Fremdaenderung zurueckgedreht). Eigene Schreibwege ausserhalb des Live-
+        Speicherns ziehen den Stand selbst nach (Export, Suchwort-Import, Laufende).
+        Das gilt nur fuer den Artikel, den die Maske gerade zeigt: fuer einen frueher
+        geladenen und wieder verlassenen Artikel waere der gemerkte Stand veraltet
+        (Fremdaenderung, eigener Massenimport) - dort wird vom ersetzten Eintrag, also
+        von den Dateien, neu abgeleitet. Sonst liesse z. B. ein Entwurf, der den Artikel
+        ueberschreibt ('Nein' in _adopt_article_number), die Fremdzeilen stehen.
         """
         record = self.article_browser_records.get(article_number)
         entry = self._live_fingerprints.get(article_number)
-        if entry is None or entry[0] is not record:
+        if entry is None:
             entry = (record, {})
+            self._live_fingerprints[article_number] = entry
+        elif entry[0] is not record:
+            # Ohne gemerkten Verzeichnis-Eintrag (neuer Artikel, nur verankert) oder fuer
+            # einen Artikel ausserhalb der Maske wird vom Eintrag abgeleitet; sonst gilt
+            # der gemerkte Stand weiter.
+            keep = (
+                entry[0] is not None
+                and record is not None
+                and article_number == normalize_article_number(self._mask_article_number)
+            )
+            entry = (record, dict(entry[1]) if keep else {})
             self._live_fingerprints[article_number] = entry
         cache = entry[1]
         missing = [section for section in sections if section not in cache]
@@ -18861,6 +20110,16 @@ if ($copied) {{
             # Stand bereits anzeigen, der Fingerabdruck-Cache haelt aber den echten
             # Platten-Stand, und ein Nachholen darf nie uebersprungen werden.
             dirty |= self._live_failed_sections.get(article_number, set())
+            # Vorhandener Artikel ohne Text- bzw. Kurzbezeichnungs-Zeile: unterscheidet
+            # sich der leere Bereich nur durch die eben erzeugte Modul-ID, gibt es nichts
+            # zu schreiben (sonst eine leere Zeile mit frischem Zeitstempel - der Artikel
+            # stuende ohne Aenderung auf der Loeschliste seit Apollo-Import). Nie fuer
+            # gescheiterte Bereiche: deren gemerkter Fingerabdruck ist veraltet (ein Teil
+            # kann schon geschrieben sein), der Nachholer muss laufen.
+            if article_number in self.article_browser_records:
+                dirty -= text_sections_with_only_new_module_id(bundle, dirty, expected) - self._live_failed_sections.get(
+                    article_number, set()
+                )
 
             # Fachliche Fehler (z. B. OE-Nummer ohne Hersteller) sofort melden,
             # wie bisher - dafuer braucht es keinen Hintergrund-Auftrag.
@@ -18886,6 +20145,7 @@ if ($copied) {{
                 status_message=status_message,
             )
             self.live_writer.submit(job)
+            self._last_live_submit_sections = set(dirty)
             if not dirty_errors:
                 self.status_var.set(f"Speichere im Hintergrund: {article_number} ({job.section_labels()}) …")
             self._schedule_live_write_poll()
@@ -18925,8 +20185,9 @@ if ($copied) {{
             return
         current = self.status_var.get()
         # Nur die reine Erfolgsmeldung ersetzen - der Hinweis auf einen inzwischen
-        # gewechselten Ausgabeordner soll stehen bleiben.
-        if current.startswith("Live gespeichert") and "anderer Ausgabeordner" not in current:
+        # gewechselten Ausgabeordner oder einen gescheiterten Importstand-Vermerk
+        # soll stehen bleiben.
+        if current.startswith("Live gespeichert") and "anderer Ausgabeordner" not in current and IMPORT_STAND_NOTE_FAILED not in current:
             self.status_var.set(text)
 
     def _schedule_live_write_poll(self) -> None:
@@ -18954,9 +20215,10 @@ if ($copied) {{
 
     def _on_live_write_done(self, job: LiveWriteJob) -> None:
         article_number = job.article_number
-        if job.skipped:
-            # Auftrag wurde wegen eines laufenden Massenimports verworfen: nichts
-            # nachziehen (der Batch-Abschluss aktualisiert Eintrag und Maske).
+        if job.skipped or job.superseded:
+            # Auftrag wurde wegen eines laufenden Massenimports verworfen (der Batch-
+            # Abschluss aktualisiert Eintrag und Maske) bzw. Folgeauftrag ueberholt: nichts
+            # nachziehen.
             return
         section_errors = dict(job.section_errors)
         if job.error is not None and not section_errors:
@@ -18978,6 +20240,12 @@ if ($copied) {{
         except Exception:
             current_output = self.article_browser_cache_dir
         if str(job.output_root) != current_output:
+            note_failure = ""
+            if job.changed_sections:
+                # Der Importstand gehoert zum Ordner, in den geschrieben wurde.
+                note_failure = self._note_changed_since_import(
+                    job.output_root, {article_number: job.written_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                )
             if section_errors:
                 self.status_var.set(
                     f"Live-Speichern fehlgeschlagen ({article_number}, {format_live_section_labels(section_errors)}) – anderer Ausgabeordner."
@@ -18986,6 +20254,8 @@ if ($copied) {{
                 self.status_var.set(
                     f"Live gespeichert: {article_number} ({format_live_section_labels(succeeded)}) – anderer Ausgabeordner."
                 )
+            if note_failure:
+                self.status_var.set(f"{self.status_var.get()} – {note_failure}")
             return
 
         # Auswahl/Fokus/Detail des Nutzers merken: der Abschluss kommt asynchron und
@@ -18997,10 +20267,20 @@ if ($copied) {{
         # Bisher bekannten Fingerabdruck-Cache sichern (mergen statt ersetzen) und als
         # Rueckfalle den Platten-Stand des bisherigen Eintrags - BEVOR dieser mit dem
         # Formularstand ueberschrieben wird. So kennt der Cache fuer jeden Bereich den
-        # echten Platten-Stand, auch fuer die nicht geschriebenen.
+        # echten Platten-Stand, auch fuer die nicht geschriebenen. Wie in
+        # _live_saved_fingerprints gilt ein gemerkter Stand nach einem ersetzten Eintrag
+        # nur fuer den Artikel in der Maske; sonst zaehlt der Eintrag (die Dateien).
         prev_entry = self._live_fingerprints.get(article_number)
-        prev_cache = dict(prev_entry[1]) if prev_entry is not None else {}
         old_record = self.article_browser_records.get(article_number)
+        prev_valid = prev_entry is not None and (
+            prev_entry[0] is old_record
+            or (
+                prev_entry[0] is not None
+                and old_record is not None
+                and article_number == normalize_article_number(self._mask_article_number)
+            )
+        )
+        prev_cache = dict(prev_entry[1]) if prev_entry is not None and prev_valid else {}
         if old_record is not None:
             base_fingerprints = live_section_fingerprints(
                 bundle_from_snapshot(old_record, self.attribute_key_values_by_group)
@@ -19009,22 +20289,42 @@ if ($copied) {{
             base_fingerprints = {}
 
         # Nur die erfolgreich geschriebenen Bereiche in den Verzeichnis-Eintrag
-        # uebernehmen und die Ordner-Signatur merken.
-        if succeeded:
+        # uebernehmen und die Ordner-Signatur merken. Den Schreibzeitpunkt bekommen
+        # nur Bereiche, deren Zeilen sich wirklich geaendert haben - unveraenderte
+        # Zeilen behalten auf der Platte ihren Zeitstempel, der Eintrag ebenso.
+        written_at = job.written_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        mask_article = normalize_article_number(self._mask_article_number)
+        if succeeded and job.stored_input:
+            # Nachholer einer gemerkten Eingabe: das Bundle ist der Stand beim Scheitern. In
+            # den uebrigen Bereichen (und GenArt/Modul-IDs) koennen die Dateien inzwischen
+            # neuer sein (zweite Instanz, eigener Massenimport) - nie daraus upserten, sonst
+            # verschwaenden diese Zeilen aus Eintrag und Maske, gaelten als gespeichert und
+            # die naechste eigene Eingabe loeschte sie aus den Dateien. Stattdessen das
+            # Verzeichnis neu lesen (Zeilen-Cache: nur die geschriebenen Dateien werden neu
+            # geparst; im naechsten Leerlauf bzw. sofort in _retry_failed_live_write).
+            self._request_article_browser_reload()
+        elif succeeded:
+            stamp = {section: written_at for section in succeeded & job.changed_sections}
             if len(succeeded) == 1:
-                self._upsert_article_browser_section(next(iter(succeeded)), job.bundle, job.output_root)
+                self._upsert_article_browser_section(next(iter(succeeded)), job.bundle, job.output_root, stamp=stamp)
             else:
-                self._upsert_article_browser_from_bundle(job.bundle, job.output_root)
+                self._upsert_article_browser_from_bundle(job.bundle, job.output_root, stamp=stamp)
             self._mark_article_browser_in_sync(job.output_root)
+        note_failure = ""
+        if job.changed_sections:
+            # Im Aenderungsjournal des Importstands vermerken (auch ohne gesetzten Stand):
+            # haelt die Markierung auch ueber ein Neuladen von der Platte, wenn ein
+            # Bereich komplett geleert wurde. Ein Fehlschlag haengt an der Statuszeile
+            # (siehe unten), sonst ueberdeckte ihn sofort 'Live gespeichert'.
+            note_failure = self._note_changed_since_import(job.output_root, {article_number: written_at})
 
-        # Fehlgeschlagene Bereiche vormerken, erfolgreiche austragen.
+        # Fehlgeschlagene Bereiche vormerken, erfolgreiche austragen. Zu den gescheiterten
+        # die Eingabe merken (Bundle dieses, also des juengsten gescheiterten Auftrags):
+        # ist der Artikel schon verlassen, stuende sie sonst nirgends mehr.
         if section_errors:
             self._live_failed_sections.setdefault(article_number, set()).update(section_errors)
-        failed = self._live_failed_sections.get(article_number)
-        if failed:
-            failed -= succeeded
-            if not failed:
-                self._live_failed_sections.pop(article_number, None)
+            self._live_failed_bundles[article_number] = (job.bundle, job.output_root, dict(job.fingerprints))
+        self._drop_live_failed_sections(article_number, succeeded)
 
         # Fingerabdruck-Cache vollstaendig halten, damit der Dirty-Check nicht vom
         # Verzeichnis-Eintrag (der den Formularstand zeigt) in die Irre gefuehrt wird:
@@ -19041,27 +20341,60 @@ if ($copied) {{
                 cache[section] = prev_cache[section]
             elif section in base_fingerprints:
                 cache[section] = base_fingerprints[section]
-        self._live_fingerprints[article_number] = (record, cache)
+        if job.stored_input and succeeded and article_number != mask_article:
+            # Nachholer fuer einen Artikel ausserhalb der Maske: der Anker wird aus dem neu
+            # gelesenen Eintrag abgeleitet (_live_saved_fingerprints), nicht aus dem alten Bundle.
+            self._live_fingerprints.pop(article_number, None)
+        else:
+            self._live_fingerprints[article_number] = (record, cache)
 
         # Fahrzeugverknuepfungen tragen die GenArt je Zeile (build_vehicle_link_export_rows):
         # nach einem ERFOLGREICHEN GenArt-Schreiben die Fahrzeugzeilen desselben Artikels
         # nachziehen. Bewusst als eigener Folgeauftrag mit dem Bundle DIESES Auftrags
         # (nicht dem aktuellen Formular - der Nutzer koennte inzwischen gewechselt haben),
         # damit der GenArt-Auftrag selbst nur "genart" umfasst und bei fehlgeschlagener
-        # GenArt keine abweichenden Fahrzeugzeilen entstehen.
-        if "genart" in succeeded and not self.live_write_suspended:
-            vehicle_fp = job.fingerprints.get("vehicle_links")
-            if vehicle_fp is not None and cache.get("vehicle_links") != vehicle_fp:
-                self.live_writer.submit(
+        # GenArt keine abweichenden Fahrzeugzeilen entstehen. Nur ein laufender
+        # Massenimport verhindert ihn (_batch_owns_output), nicht das Fuellen der Maske:
+        # kommt der Abschluss waehrend eines Artikelwechsels, behielten die Fahrzeugzeilen
+        # sonst die alte GenArt.
+        # Wurde nach dem GenArt-Auftrag schon ein Auftrag mit Fahrzeugzeilen eingereicht
+        # (traegt die neue GenArt und die aktuellen Fahrzeuge), entfaellt der Folgeauftrag
+        # (LiveWriter.submit, bundle_seq) - sonst schriebe er die alte Fahrzeugliste darueber.
+        if "genart" in succeeded and "vehicle_links" not in succeeded and not self._batch_owns_output:
+            followup_bundle = job.bundle
+            followup_fingerprints = job.fingerprints
+            followup_seq = job.bundle_seq
+            if job.stored_input and old_record is not None:
+                # Gemerkte Eingabe: nur die GenArt stammt aus ihr; die Fahrzeuge aus den
+                # Dateien (Eintrag vor dem Schreiben), nicht aus dem alten Bundle - sonst
+                # kaeme eine inzwischen geaenderte Fahrzeugliste zurueck. Alter: die
+                # Einreichung des Nachholers (spaetere Fahrzeug-Auftraege ueberholen ihn).
+                followup_bundle = dataclass_replace(
+                    bundle_from_snapshot(old_record, self.attribute_key_values_by_group),
+                    genart_selections=list(job.bundle.genart_selections),
+                    genart_id=job.bundle.genart_id,
+                    genart_bezeichnung=job.bundle.genart_bezeichnung,
+                )
+                followup_fingerprints = live_section_fingerprints(followup_bundle)
+                followup_seq = job.submit_seq
+                written_vehicle_fp = base_fingerprints.get("vehicle_links")
+            else:
+                written_vehicle_fp = cache.get("vehicle_links")
+            vehicle_fp = followup_fingerprints.get("vehicle_links")
+            if vehicle_fp is not None and written_vehicle_fp != vehicle_fp:
+                submitted = self.live_writer.submit(
                     LiveWriteJob(
                         article_number=article_number,
                         sections={"vehicle_links"},
-                        bundle=job.bundle,
+                        bundle=followup_bundle,
                         output_root=job.output_root,
-                        fingerprints=job.fingerprints,
+                        fingerprints=followup_fingerprints,
+                        followup=True,
+                        bundle_seq=followup_seq,
                     )
                 )
-                self._schedule_live_write_poll()
+                if submitted:
+                    self._schedule_live_write_poll()
 
         if section_errors:
             representative = next(iter(section_errors.values()))
@@ -19085,6 +20418,8 @@ if ($copied) {{
             self.status_var.set(
                 f"Live gespeichert: {article_number} ({format_live_section_labels(succeeded)}) – weitere Änderungen werden gespeichert …"
             )
+        if note_failure:
+            self.status_var.set(f"{self.status_var.get()} – {note_failure}")
 
         # Auswahl/Detail des Nutzers nach dem Baumneuaufbau wiederherstellen.
         self._restore_article_browser_selection(prev_selection, prev_focus)
@@ -19157,6 +20492,11 @@ if ($copied) {{
 
     @perf_logged("_on_article_entry_focus_out")
     def _on_article_entry_focus_out(self, _event: tk.Event[tk.Misc]) -> None:
+        if self._mask_switch_busy():
+            # Laden wartet gerade auf den Nachholer (_retry_failed_live_write) bzw. ein Wechsel
+            # oder das Laufende des Massenimports auf das Schreiben (_block_mask_switch); der
+            # wartende Ablauf setzt die Nummer danach selbst.
+            return
         article_number = normalize_article_number(self.article_number_var.get())
         previous = self._mask_article_number
         self._mask_switch_aborted = ""
@@ -19203,10 +20543,20 @@ if ($copied) {{
                 "Gespeicherten Stand in die Maske laden?\n\n"
                 "Nein = gespeicherten Stand mit dem Maskeninhalt überschreiben.",
             ):
+                # Nach dem Verlassen gescheiterte Eingaben dieses Artikels zuerst nachholen.
+                if self._retry_failed_live_write(article_number):
+                    snapshot = self._stored_article_snapshot(article_number) or snapshot
                 with self._suspend_live_write():
                     self._apply_article_snapshot(snapshot)
                 self.status_var.set(f"{article_number}: gespeicherten Artikel in die Maske geladen.")
+                self._append_mask_restore_notice()
                 return
+            # 'Nein' = mit dem Maskeninhalt ueberschreiben: gegen die Dateien vergleichen,
+            # nicht gegen einen frueher gemerkten Lade-Stand (der Artikel kann seitdem von
+            # aussen oder vom eigenen Massenimport geaendert sein) - sonst blieben
+            # Bereiche, die der Entwurf wie damals geladen zeigt, mit dem neuen
+            # Dateistand stehen.
+            self._live_fingerprints.pop(article_number, None)
         elif mask_empty:
             self._clear_mask_for_new_article(article_number)
             self.status_var.set(f"{article_number}: neuer Artikel - gespeichert wird, sobald etwas eingegeben ist.")
@@ -19245,11 +20595,17 @@ if ($copied) {{
         die Maske leeren (Entwurfsmodus ohne geladenen Artikel).
         """
         unsaved = self._save_mask_article_before_leaving(previous)
+        batch_note = ""
         if unsaved:
-            self._report_switch_aborted(previous, unsaved)
-            return
+            if not self._batch_owns_output:
+                self._report_switch_aborted(previous, unsaved)
+                return
+            leave_note = self._confirm_leave_during_batch(previous, unsaved, "die Maske leeren", intercept_click=True)
+            if leave_note is None:
+                return
+            batch_note = f" – {leave_note}"
         self._clear_mask_for_new_article("")
-        self.status_var.set(f"Maske geleert ({previous} bleibt gespeichert) - neue Artikelnummer eingeben.")
+        self.status_var.set(f"Maske geleert ({previous} bleibt gespeichert) - neue Artikelnummer eingeben.{batch_note}")
 
     def _switch_mask_article(self, previous: str, article_number: str) -> None:
         """Die Artikelnummer wurde in der gefuellten Maske auf einen anderen Artikel geaendert.
@@ -19290,21 +20646,35 @@ if ($copied) {{
         #    (fachlicher Fehler, kein Ausgabeordner), darf nicht stillschweigend
         #    verloren gehen: dann bleibt die Maske beim alten Artikel.
         unsaved = self._save_mask_article_before_leaving(previous)
+        batch_note = ""
         if unsaved:
-            self._report_switch_aborted(previous, unsaved)
-            return
-        self.article_number_var.set(article_number)
+            if not self._batch_owns_output:
+                self._report_switch_aborted(previous, unsaved)
+                return
+            # Massenimport: Speichern ausgesetzt - verwerfen (gescheiterte Eingaben merken)
+            # oder beim Artikel bleiben.
+            leave_note = self._confirm_leave_during_batch(previous, unsaved, f"{article_number} laden", intercept_click=True)
+            if leave_note is None:
+                return
+            batch_note = f" – {leave_note}"
         # 2) Vorhandener Artikel (Verzeichnis oder noch nicht geschriebener
-        #    Auftrag): wie 'Ausgewaehlten Artikel laden'.
+        #    Auftrag): wie 'Ausgewaehlten Artikel laden'. Ist fuer ihn nach dem
+        #    Verlassen ein Schreiben gescheitert, zuerst die gemerkte Eingabe nachholen
+        #    (noch mit der alten Nummer im Feld - gewartet wird mit laufender Oberflaeche).
+        self._retry_failed_live_write(article_number)
+        self.article_number_var.set(article_number)
         snapshot = self._stored_article_snapshot(article_number)
         if snapshot is not None:
             with self._suspend_live_write():
                 self._apply_article_snapshot(snapshot)
-            self.status_var.set(f"{article_number}: gespeicherten Artikel in die Maske geladen ({previous} bleibt gespeichert).")
+            self.status_var.set(
+                f"{article_number}: gespeicherten Artikel in die Maske geladen ({previous} bleibt gespeichert).{batch_note}"
+            )
+            self._append_mask_restore_notice()
             return
         # 3) Neuer Artikel: leere Maske, noch nichts schreiben.
         self._clear_mask_for_new_article(article_number)
-        self.status_var.set(f"{article_number}: neuer Artikel, Maske geleert ({previous} bleibt gespeichert).")
+        self.status_var.set(f"{article_number}: neuer Artikel, Maske geleert ({previous} bleibt gespeichert).{batch_note}")
 
     def _save_mask_article_before_leaving(self, previous: str) -> list[str]:
         """Offene Aenderungen der Maske unter `previous` sichern, bevor die Maske
@@ -19312,35 +20682,132 @@ if ($copied) {{
 
         Rueckgabe: Bereiche, die NICHT gesichert werden konnten - fachlicher Fehler
         (z. B. OE-Nummer ohne Hersteller; _submit_live_write laesst solche Bereiche
-        weg) oder kein Ausgabeordner. Sie stehen nur in der Maske und gingen beim
-        Wechsel verloren. Bereiche, die ein eingereihter Auftrag noch schreibt
-        (auch Nachholer frueher gescheiterter Bereiche), zaehlen als gesichert.
+        weg), kein Ausgabeordner oder ein Bereich, dessen Schreiben schon gescheitert
+        ist und auch jetzt scheitert (Datei in Excel geoeffnet). Sie stehen nur in der
+        Maske und gingen beim Wechsel verloren. Bereiche, die ein eingereihter Auftrag
+        noch schreibt, zaehlen als gesichert - ausser bei bekannten Fehlschlaegen: dann
+        wird (begrenzt) auf den Nachholer gewartet. Bisher galt auch er als gesichert,
+        scheiterte nach dem Wechsel erneut, und zurueck im Artikel schrieb der naechste
+        Nachholer den Dateistand - die Eingabe war still verloren.
+        Waehrend eines Massenimports schreibt das nichts (Live-Speichern ausgesetzt); die
+        Aufrufer fragen dann (_confirm_leave_during_batch).
         """
         self.article_number_var.set(previous)
-        self._write_live_database()
+        self._last_live_submit_sections = set()
+        submitted = self._write_live_database()
+        # Nur fuer wirklich eingereihte Bereiche kann der Abbruch eine gesperrte Datei nennen.
+        self._leave_attempted_sections = set(self._last_live_submit_sections) if submitted else set()
+        if self._live_failed_sections.get(previous):
+            with self._block_mask_switch():
+                self._flush_live_writes(reason=f"{previous}: gescheiterte Bereiche nachholen – ")
+            self.article_number_var.set(previous)
         queued = self.live_writer.expected_fingerprints(previous)
         return [section for section in self._unsaved_live_sections() if section not in queued]
 
     def _report_switch_aborted(self, previous: str, unsaved: list[str]) -> None:
         # Den Grund aus _submit_live_write (fachlicher Fehler / kein Ausgabeordner) mitnehmen.
         detail = self.status_var.get()
-        hint = f" {detail}" if detail.startswith("Live-Speichern") else ""
+        # Gesperrte Datei nur nennen, wenn eben ein Schreiben versucht wurde und erneut
+        # scheiterte - ein Marker allein (z. B. waehrend eines Massenimports, der nichts
+        # schreibt) sagt nichts ueber die Datei jetzt.
+        failed = set(unsaved) & self._live_failed_sections.get(previous, set()) & self._leave_attempted_sections
+        if failed:
+            # Schreiben gescheitert (gesperrte Datei): die Datei nennen statt der langen
+            # Fehlermeldung mit Temp-Pfad.
+            hint = f" {self._live_failed_files_hint(failed)}"
+        else:
+            hint = f" {detail}" if detail.startswith("Live-Speichern") else ""
         message = f"Artikelwechsel abgebrochen: {format_live_section_labels(unsaved)} von {previous} nicht gespeichert.{hint}"
         self.status_var.set(message)
         # Der Klick, der den Fokusverlust ausloeste (z. B. 'Artikel anlegen'), laeuft
         # gleich noch - mit der zurueckgesetzten alten Nummer. Er soll den Abbruch
         # sichtbar machen statt stillschweigend den alten Artikel abzurufen.
         self._mask_switch_aborted = message
+        self._mask_switch_abort_silent = False
 
     def _consume_switch_abort(self) -> bool:
         """True (mit Warnung), wenn gerade ein Artikelwechsel abgebrochen wurde;
-        der auf den Fokusverlust folgende Klick wird damit einmal abgefangen."""
+        der auf den Fokusverlust folgende Klick wird damit einmal abgefangen. Wurde der
+        Abbruch schon im Dialog bestaetigt (Massenimport, 'Nein'), ohne zweite Meldung."""
         message = self._mask_switch_aborted
+        silent = self._mask_switch_abort_silent
         self._mask_switch_aborted = ""
+        self._mask_switch_abort_silent = False
         if not message:
             return False
-        messagebox.showwarning(APP_TITLE, f"{message}\n\nBitte zuerst korrigieren, dann die Artikelnummer erneut ändern.")
+        if not silent:
+            messagebox.showwarning(APP_TITLE, f"{message}\n\nBitte zuerst korrigieren, dann die Artikelnummer erneut ändern.")
         return True
+
+    def _expire_silent_switch_abort(self) -> None:
+        if self._mask_switch_abort_silent:
+            self._mask_switch_aborted = ""
+            self._mask_switch_abort_silent = False
+
+    def _confirm_leave_during_batch(
+        self, previous: str, unsaved: list[str], target_text: str, intercept_click: bool = False
+    ) -> str | None:
+        """Artikel mit ungespeicherten oder gescheiterten Bereichen verlassen, waehrend ein
+        Massenimport laeuft (Live-Speichern ausgesetzt, bis zu 2 h beim KI-Batch): fragen
+        statt 'Bitte zuerst korrigieren' (geht waehrend des Laufs nicht) - getippter Wechsel,
+        Doppelklick im Verzeichnis und in der Uebersicht, Leeren der Nummer gleich.
+
+        'Nein' (Vorgabe): beim Artikel bleiben, Rueckgabe None; intercept_click: der Klick,
+        der den Fokusverlust ausloeste, wird still abgefangen. 'Ja': Eingaben verwerfen -
+        ausser in Bereichen, deren Schreiben schon vor dem Lauf gescheitert war: deren
+        Eingabe wird als gemerkte Eingabe geparkt (_live_failed_bundles; Nachholen bzw.
+        Wiederherstellen beim naechsten Laden, beim Schliessen, verworfen, wenn der Lauf den
+        Bereich neu schreibt). Rueckgabe: Hinweis fuer die Statuszeile."""
+        failed = self._live_failed_sections.get(previous, set())
+        parked = [section for section in unsaved if section in failed]
+        discarded = [section for section in unsaved if section not in failed]
+        # Gemerkte Bereiche nicht als 'verwerfen' anbieten - sie gehen nicht verloren.
+        actions: list[str] = []
+        if discarded:
+            actions.append(f"Eingaben in {previous} ({format_live_section_labels(discarded)}) verwerfen")
+        if parked:
+            actions.append(
+                f"{format_live_section_labels(parked)} von {previous} merken (wird nach dem Lauf beim nächsten "
+                "Laden des Artikels bzw. beim Schließen nachgeholt, außer der Lauf schreibt den Bereich neu)"
+            )
+        answer = messagebox.askyesno(
+            APP_TITLE,
+            f"Während des Massenimports wird nicht gespeichert. {', '.join(actions)} und {target_text}?",
+            icon="warning",
+            default="no",
+        )
+        if not answer:
+            self.article_number_var.set(previous)
+            message = (
+                f"{previous} bleibt geladen: {format_live_section_labels(unsaved)} nicht gespeichert "
+                "(während des Massenimports wird nicht gespeichert)."
+            )
+            self.status_var.set(message)
+            if intercept_click:
+                self._mask_switch_aborted = message
+                self._mask_switch_abort_silent = True
+                # Nur den Klick abfangen, der den Fokusverlust ausloeste - kam keiner (Tab,
+                # Klick in ein anderes Feld), verfaellt der Vermerk, statt spaeter einen
+                # 'Artikel anlegen'-Klick still zu verschlucken.
+                self.root.after(1000, self._expire_silent_switch_abort)
+            return None
+        if parked:
+            try:
+                bundle = self.collect_bundle(ensure_ids=False)
+                output_root = self._resolve_output_root()
+            except ValueError:
+                pass  # Maske nicht auswertbar: die bisher gemerkte Eingabe bleibt
+            else:
+                self._live_failed_bundles[previous] = (bundle, output_root, live_section_fingerprints(bundle))
+        notes: list[str] = []
+        if discarded:
+            notes.append(f"Eingaben in {previous} verworfen ({format_live_section_labels(discarded)})")
+        if parked:
+            notes.append(
+                f"{format_live_section_labels(parked)} von {previous} gemerkt (wird beim nächsten Laden "
+                "des Artikels bzw. beim Schließen erneut geschrieben)"
+            )
+        return "; ".join(notes)
 
     def _stored_article_snapshot(self, article_number: str) -> StoredArticleSnapshot | None:
         """Gespeicherter Stand eines Artikels fuer die Maske: der Verzeichnis-Eintrag,
@@ -19354,7 +20821,12 @@ if ($copied) {{
             return snapshot
         queued = self.live_writer.latest_bundle(article_number)
         if queued is None:
-            return None
+            # Noch nie geschriebener Artikel, dessen Auftrag (nach dem Verlassen)
+            # gescheitert ist: die gemerkte Eingabe ist sein Stand, nicht 'neu und leer'.
+            failed_entry = self._failed_live_write_entry(article_number)
+            if failed_entry is None:
+                return None
+            queued = failed_entry[0]
         return self._snapshot_from_bundle(queued, Path(self.output_dir_var.get().strip()))
 
     def _mask_is_empty(self) -> bool:
@@ -19411,8 +20883,10 @@ if ($copied) {{
             self.kunzer_product_url_var.set("")
             self._mask_article_number = article_number
             # Nachholer eines frueheren, nie gespeicherten Standes dieser Nummer verfallen -
-            # sie wuerden sonst die leere Maske als Bereich erzwingen.
-            self._live_failed_sections.pop(article_number, None)
+            # sie wuerden sonst die leere Maske als Bereich erzwingen. (Eine gemerkte
+            # Eingabe fuer den aktuellen Ausgabeordner laedt _stored_article_snapshot statt
+            # hier zu leeren.)
+            self._drop_live_failed_sections(article_number)
             # Leere Maske als gespeicherten Stand verankern (Eintrag ohne Verzeichnis-
             # Snapshot; _live_saved_fingerprints behaelt ihn, solange der Artikel nicht
             # im Verzeichnis steht). Vergliche der Dirty-Check gegen 'unbekannt' (None),
@@ -19620,6 +21094,14 @@ if ($copied) {{
                 for section in failed:
                     if section in sources:
                         sources[section] = mask_bundle
+        elif failed and self.live_writer.latest_bundle(article_key) is None:
+            # Maske zeigt den Artikel nicht (mehr): die gemerkte Eingabe des gescheiterten
+            # Auftrags statt des Dateistands (siehe _restore_failed_sections_into_mask).
+            failed_entry = self._failed_live_write_entry(article_key)
+            if failed_entry is not None:
+                for section in failed:
+                    if section in sources:
+                        sources[section] = failed_entry[0]
         return sources
 
     def _fetch_source(self, section: str) -> object | None:
@@ -19788,6 +21270,8 @@ if ($copied) {{
         self.long_text_frame.apply_translations(long_translations)
 
     def _load_from_kunzer(self, article_number_or_url: str) -> None:
+        if self._mask_switch_busy():
+            return
         if self._consume_switch_abort():
             return
         identifier = article_number_or_url.strip()
@@ -20053,7 +21537,8 @@ if ($copied) {{
         # Offene Live-Auftraege zuerst abschliessen: sonst laeuft ein noch wartender
         # Auftrag NACH dem Batch-Export desselben Artikels und ueberschreibt dessen
         # frisch abgerufene Daten (gleiche Datei-Sperre, FIFO). live_write_suspended
-        # verhindert nur NEUE Auftraege, nicht bereits eingereihte.
+        # verhindert nur NEUE Auftraege; bereits eingereihte verwirft der Schreiber
+        # erst, sobald _batch_owns_output steht (nach 'trotzdem starten').
         if not self._flush_live_writes(reason=f"{run_label}: "):
             if not messagebox.askyesno(
                 APP_TITLE,
@@ -20105,13 +21590,20 @@ if ($copied) {{
         # damit die App während des Batches normal bedienbar wirkt. Das Flag
         # verhindert trotzdem parallele Einzel-Imports.
         self.background_task_running = True
+        # Von frueheren Laeufen noch nicht vermerkte Artikel (Importstand war gesperrt) zuerst -
+        # jeweils in ihrem Ausgabeordner; was wieder scheitert, bleibt fuer diesen Ordner vorgemerkt.
+        self._flush_batch_changed_since()
+        self._switch_batch_output_root(output_root)
+        self._batch_journal_flushed_at = time.monotonic()
         if resume is not None:
             self.status_var.set(f"{run_label}: Ergebnisse für {total} Artikel werden bei Anthropic abgeholt ...")
         else:
             self.status_var.set(f"{run_label} gestartet: {total} Artikel werden im Hintergrund abgerufen ...")
         # Während des Batches darf das Live-Speichern nicht parallel in
-        # dieselben Output-Dateien schreiben.
+        # dieselben Output-Dateien schreiben: keine neuen Auftraege (UI-Sperre),
+        # und der Schreiber verwirft noch wartende (_batch_owns_output).
         self.live_write_suspended = True
+        self._batch_owns_output = True
 
         # Der Worker-Thread darf Tkinter nicht direkt anfassen (auch after()
         # ist aus Fremd-Threads nicht zuverlässig). Er meldet Fortschritt über
@@ -20162,6 +21654,8 @@ if ($copied) {{
                 "search_term_candidate_count": 0,
                 "search_term_ai_count": 0,
                 "search_term_final": {},
+                # Ausgabeordner des Laufs (Importstand: geleerte Bereiche vermerken).
+                "output_root": str(output_root),
             }
             started_at = time.monotonic()
             ai_disabled = False
@@ -20353,9 +21847,11 @@ if ($copied) {{
             # Internet-Recherche laeuft je Artikel direkt (Websuche), nicht ueber die Batch API.
             ai_batch_mode = claude_client is not None and total > 3 and not attribute_web_worker
 
-            def run_attribute_step(result: KunzerScrapeResult, bundle: ExportBundle) -> None:
+            def run_attribute_step(result: KunzerScrapeResult, bundle: ExportBundle) -> bool:
                 """Attribut-Findung pro Artikel: Regel-Pass sofort, KI je nach
-                Modus synchron oder gesammelt über die Batch API."""
+                Modus synchron oder gesammelt über die Batch API. Rueckgabe: True, wenn
+                die Attributzeilen des Artikels jetzt geaendert wurden (nicht bei
+                Finalisierung nach dem KI-Batch, die meldet selbst)."""
                 nonlocal ai_disabled
                 combined_text = "\n".join(
                     part for part in [result.short_text_de, result.long_text_de] if str(part or "").strip()
@@ -20394,8 +21890,7 @@ if ($copied) {{
                         candidate_ids=search_ids_worker,
                         reference_lines=reference_lines_worker,
                     )
-                    finalize_attribute_step(bundle, hybrid, product_group)
-                    return
+                    return finalize_attribute_step(bundle, hybrid, product_group)
                 hybrid, combined = run_rule_attribute_pass(
                     combined_text,
                     pdf_texts,
@@ -20438,7 +21933,7 @@ if ($copied) {{
                                     "product_group": product_group,
                                 }
                             )
-                            return  # Finalisierung folgt nach dem KI-Batch.
+                            return False  # Finalisierung folgt nach dem KI-Batch.
                         try:
                             extractions = claude_client.extract_attributes(user_message)
                             hybrid.ai_used = True
@@ -20449,9 +21944,9 @@ if ($copied) {{
                             )
                         except ClaudeExtractionError as exc:
                             hybrid.ai_error = str(exc)
-                finalize_attribute_step(bundle, hybrid, product_group)
+                return finalize_attribute_step(bundle, hybrid, product_group)
 
-            def finalize_attribute_step(bundle: ExportBundle, hybrid: HybridAttributeResult, product_group: str) -> None:
+            def finalize_attribute_step(bundle: ExportBundle, hybrid: HybridAttributeResult, product_group: str) -> bool:
                 """Validierte Ergebnisse schreiben bzw. berichten (auch rules-only).
 
                 Mit Vorlage (Referenzartikel) wie im Einzelpfad: die Zeilen der
@@ -20459,8 +21954,11 @@ if ($copied) {{
                 Zeilen dieser IDs, gefundene Zeilen add-only, Sortierung wie der
                 Referenzartikel (apply_reference_attribute_rows); im Testlauf werden
                 die 1:1-Zeilen nur als 'Referenz 1:1' berichtet. Die Marke (8988)
-                bleibt unangetastet (eigener Schritt)."""
+                bleibt unangetastet (eigener Schritt). Rueckgabe: True, wenn die
+                Attributzeilen des Artikels in der Datei geaendert wurden (auch nur
+                umsortiert) - fuer das Aenderungsjournal des Importstands."""
                 nonlocal ai_disabled
+                attributes_changed = False
                 if search_ids_worker is not None:
                     # Vorlage: wie im Einzelpfad (run_hybrid_attribute_extraction) auch nach
                     # der KI auf die Vorlage beschraenken - die Verteilung von Zusatzinfos
@@ -20549,7 +22047,7 @@ if ($copied) {{
                 else:
                     added_ids: list[str] = []
                     if template_worker is not None and (accepted_rows or copy_rows):
-                        added_ids, copied_count, replaced_rows, _changed = apply_reference_attribute_rows(
+                        added_ids, copied_count, replaced_rows, attributes_changed = apply_reference_attribute_rows(
                             output_root / ATTRIBUTE_FILE[0],
                             bundle.article_number,
                             template_worker,
@@ -20582,6 +22080,7 @@ if ($copied) {{
                                 row for row in accepted_rows if row.criteria_id in set(added_ids)
                             ]
                     if added_ids:
+                        attributes_changed = True
                         attribute_ids_by_article.setdefault(bundle.article_number, set()).update(added_ids)
                         summary["attribute_added_count"] = int(summary["attribute_added_count"]) + len(added_ids)
                     for suggestion in hybrid.accepted:
@@ -20617,6 +22116,14 @@ if ($copied) {{
                             # Lauf ohne weiteren KI-Aufruf profitieren.
                             attribute_mapping_worker[key] = criteria_id
                             summary["learned_mappings"].append((label, criteria_id, note))
+                return attributes_changed
+
+            def finalize_deferred_attribute_step(entry: dict[str, object]) -> None:
+                """Finalisierung nach dem KI-Batch (bzw. Abbruch): ausserhalb der Versuchsschleife
+                des Artikels - eine Aenderung der Attributzeilen direkt ins Aenderungsjournal."""
+                bundle = entry["bundle"]
+                if finalize_attribute_step(bundle, entry["hybrid"], str(entry["product_group"])):  # type: ignore[arg-type]
+                    progress_queue.put(("changed", bundle.article_number))  # type: ignore[attr-defined]
 
             def post(done: int, detail: str) -> None:
                 progress_queue.put(("progress", (done, total, detail, time.monotonic() - started_at)))
@@ -20631,6 +22138,12 @@ if ($copied) {{
                     identifier = item.product_url or item.article_number
                     post(index - 1, f"{identifier}: Kunzer-Abruf ...")
                     last_error: Exception | None = None
+                    # Bereiche, deren Zeilen sich wirklich geaendert haben (fuer den
+                    # Verzeichnis-Eintrag, 'geaendert seit Apollo-Import') - ueber beide
+                    # Versuche gesammelt: leert der 1. Versuch einen Bereich und scheitert
+                    # danach, findet der 2. Versuch dort nichts mehr zu aendern.
+                    article_changed_sections: set[str] = set()
+                    changed_article = ""
                     # Ein automatischer zweiter Versuch fängt kurze Netzwerk-/
                     # Timeout-Aussetzer ab, die bei stundenlangen Läufen normal sind.
                     for attempt in (1, 2):
@@ -20651,6 +22164,7 @@ if ($copied) {{
                             post(index - 1, f"{identifier}: Übersetzung, Medien-Download & Export ...")
                             bundle = self._build_bundle_from_kunzer_result(result, client=deepl_client, options=options)
                             article_media_warnings: list[str] = []
+                            changed_article = bundle.article_number
                             # Gleiche Sperre wie der Live-Schreiber: ein vor dem Batch
                             # eingereihter Live-Auftrag darf nicht parallel in dieselbe Datei schreiben.
                             with WORKBOOK_WRITE_LOCK:
@@ -20660,6 +22174,10 @@ if ($copied) {{
                                     use_timestamp_subdir=False,
                                     refresh_media=refresh_media,
                                     media_warnings=article_media_warnings,
+                                    changed_sections=article_changed_sections,
+                                    # Im 1. Versuch schon ausgetauschte Mediendateien: der 2.
+                                    # Versuch findet gleiche Bytes vor - Zeilen trotzdem stempeln.
+                                    force_changed_sections=article_changed_sections & {"images", "documents"},
                                 )
                             summary["media_warnings"].extend(
                                 (bundle.article_number, warning) for warning in article_media_warnings
@@ -20681,7 +22199,8 @@ if ($copied) {{
                             if options.get("attributes"):
                                 post(index - 1, f"{identifier}: Attribute ermitteln ...")
                                 try:
-                                    run_attribute_step(result, bundle)
+                                    if run_attribute_step(result, bundle):
+                                        article_changed_sections.add("attributes")
                                 except Exception as attribute_exc:  # pragma: no cover - Attribut-Schritt darf den Artikel nie kippen
                                     summary["media_warnings"].append(
                                         (bundle.article_number, f"Attribut-Schritt fehlgeschlagen: {attribute_exc}")
@@ -20699,7 +22218,7 @@ if ($copied) {{
                             summary["last_result"] = result
                             summary["last_bundle"] = bundle
                             summary["updated_articles"].append(bundle.article_number)
-                            progress_queue.put(("article", bundle))
+                            progress_queue.put(("article", (bundle, article_changed_sections)))
                             last_error = None
                             break
                         except Exception as exc:  # pragma: no cover - user facing batch feedback
@@ -20709,6 +22228,10 @@ if ($copied) {{
                     if last_error is not None:
                         summary["error_messages"].append(f"{identifier}: {last_error}")
                         summary["failed_items"].append((item.article_number or identifier, str(last_error)))
+                        if article_changed_sections and changed_article:
+                            # Gescheitert, aber vorher schon Zeilen geaendert (z. B. Bereich
+                            # geleert): trotzdem ins Aenderungsjournal.
+                            progress_queue.put(("changed", changed_article))
                     summary["processed"] = index
                     post(index, "")
             except Exception as exc:  # pragma: no cover - defensive: Fehler pro Artikel werden oben gefangen
@@ -20743,7 +22266,7 @@ if ($copied) {{
                     if cancel_event.is_set() or claude_client is None:
                         # Abbruch: keine KI-Kosten mehr - Regel-Ergebnisse trotzdem abschließen.
                         for entry in pending_ai:
-                            finalize_attribute_step(entry["bundle"], entry["hybrid"], str(entry["product_group"]))
+                            finalize_deferred_attribute_step(entry)
                             finalized_articles.append(str(entry["bundle"].article_number))
                     else:
                         post(
@@ -20857,7 +22380,7 @@ if ($copied) {{
                                     hybrid.ai_error = (
                                         str(outcome) if outcome is not None else "Kein Batch-Ergebnis erhalten."
                                     )
-                                finalize_attribute_step(entry["bundle"], hybrid, str(entry["product_group"]))
+                                finalize_deferred_attribute_step(entry)
                                 finalized_articles.append(article_number)
                                 finalized_keys.append(entry_key)
                 except Exception as exc:  # pragma: no cover - Batch darf den Lauf nie hart kippen
@@ -20992,6 +22515,25 @@ if ($copied) {{
 
             progress_queue.put(("finish", summary))
 
+        def drain_for_close() -> None:
+            """Programm wird waehrend des Laufs geschlossen: schon gemeldete Artikel noch
+            uebernehmen (vorgemerkt fuer das Aenderungsjournal), Fortschritt und Laufende
+            entfallen."""
+            while True:
+                try:
+                    kind, payload = progress_queue.get_nowait()
+                except queue.Empty:
+                    return
+                if kind == "article":
+                    article_bundle, article_changed_sections = payload  # type: ignore[misc]
+                    self._upsert_article_browser_from_batch_bundle(
+                        article_bundle, output_root, changed_sections=article_changed_sections
+                    )
+                elif kind == "changed":
+                    self._note_batch_changed(str(payload))
+
+        self._batch_drain_for_close = drain_for_close
+
         def poll_queue() -> None:
             while True:
                 try:
@@ -21002,10 +22544,18 @@ if ($copied) {{
                     done, item_total, detail, elapsed = payload  # type: ignore[misc]
                     self._apply_batch_progress(done, item_total, detail, elapsed)
                 elif kind == "article":
-                    self._upsert_article_browser_from_batch_bundle(payload, output_root)  # type: ignore[arg-type]
+                    article_bundle, article_changed_sections = payload  # type: ignore[misc]
+                    self._upsert_article_browser_from_batch_bundle(
+                        article_bundle, output_root, changed_sections=article_changed_sections
+                    )
+                elif kind == "changed":
+                    self._note_batch_changed(str(payload))
                 else:
                     self._finish_batch_import(payload)  # type: ignore[arg-type]
                     return
+            # Waehrend des Laufs (auch beim Warten auf den KI-Batch) gesammelt vermerken:
+            # das Laufende kommt nicht, wenn das Programm vorher geschlossen wird.
+            self._flush_batch_changed_since(due_only=True)
             self.root.after(150, poll_queue)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -21164,6 +22714,1081 @@ if ($copied) {{
             f"Löschliste mit {len(articles)} Artikelnummern gespeichert:\n{target_path}\n\nSpalte A enthält {APOLLO_DELETE_LIST_COLUMN_A_VALUE}, Spalte B die Artikelnummern der aktualisierten Artikel.",
         )
 
+    # ------------------------------------------------------------------
+    # Apollo-Importstand (Projekt-Reiter, Zeile ueber dem Artikelverzeichnis)
+
+    def _load_import_stand(self, output_folder: Path | None) -> None:
+        """Importstand des Ausgabeordners nachladen, wenn sich die Datei geaendert hat (ein stat-Aufruf).
+
+        Ist die Datei nicht lesbar, bleibt der Fehler in _import_stand_error (Label 'nicht
+        lesbar' statt 'kein Importstand gesetzt'); die Signatur wird nicht gemerkt, der
+        naechste Aufruf liest erneut. Bei einem voruebergehenden Fehler (gesperrt,
+        Netzlaufwerk) im selben Ordner bleibt der zuletzt gelesene Stand samt Markierung
+        stehen; eine kaputte Datei (kein JSON) zeigt keinen Stand mehr."""
+        previous_error = self._import_stand_error
+        if output_folder is None:
+            self.import_stand = None
+            self._import_stand_dir = ""
+            self._import_stand_signature = None
+            self._import_stand_error = ""
+            return
+        key = str(output_folder)
+        signature = import_stand_signature(output_folder)
+        if key == self._import_stand_dir and signature == self._import_stand_signature:
+            return
+        previous_stand = self.import_stand if key == self._import_stand_dir else None
+        self._import_stand_dir = key
+        self._import_stand_signature = signature
+        self.import_stand = None
+        self._import_stand_error = ""
+        if signature is not None:
+            try:
+                self.import_stand = _read_import_stand_file(output_folder)
+            except FileNotFoundError:
+                # Gerade entfernt: wie keine Datei.
+                self._import_stand_signature = None
+            except (OSError, ValueError) as exc:
+                # Gerade nicht lesbar oder kaputt: Signatur nicht merken, der naechste
+                # Aufruf liest erneut - sonst bliebe der Zustand stehen, bis sich die
+                # Datei das naechste Mal aendert.
+                self._import_stand_signature = None
+                # Kurz fuer das Label (ohne Pfad): 'Permission denied' bzw. der JSON-Fehler.
+                short = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+                self._import_stand_error = (short or type(exc).__name__)[:160]
+                if isinstance(exc, OSError):
+                    self.import_stand = previous_stand
+        if self._import_stand_error != previous_error:
+            # Bleibt der Stand gleich, zeichnet die Liste nicht neu - das Label trotzdem nachziehen.
+            self._update_import_stand_label()
+
+    def _update_import_stand_label(self) -> None:
+        """Zaehler aus derselben Quelle wie die Loeschliste seit Apollo-Import
+        (changed_articles_since): 'geaendert' = geaendert oder neu, 'geloescht' =
+        Status geloescht - Label und Liste stimmen damit immer ueberein."""
+        changed_count = 0
+        deleted_count = 0
+        for change in changed_articles_since(self.article_browser_records, self.import_stand):
+            if change.status == "geloescht":
+                deleted_count += 1
+            else:
+                changed_count += 1
+        self.import_stand_label_var.set(
+            format_import_stand_label(self.import_stand, changed_count, deleted_count, self._import_stand_error)
+        )
+
+    def _import_stand_readable(self, output_root: Path, consequence: str) -> bool:
+        """Vor Loeschliste/erledigt: konnte die Importstand-Datei beim letzten Lesen nicht
+        gelesen werden, mit Wiederholungen erneut lesen (read_import_stand_for_update). Klappt
+        es, wird der Stand neu geladen; sonst Meldung (nicht 'kein Importstand gesetzt') und False."""
+        if not self._import_stand_error:
+            return True
+        try:
+            read_import_stand_for_update(output_root)
+        except OSError as exc:
+            self._warn_import_stand_unreadable(exc, consequence)
+            return False
+        self._import_stand_signature = None
+        self._load_import_stand(output_root)
+        if self._import_stand_error:
+            self._warn_import_stand_unreadable(OSError(self._import_stand_error), consequence)
+            return False
+        self._refresh_article_browser()
+        return True
+
+    def _write_import_stand_and_refresh(self, output_root: Path, stand: dict[str, object]) -> bool:
+        try:
+            write_import_stand(output_root, stand)
+        except (OSError, ValueError) as exc:
+            messagebox.showwarning(APP_TITLE, f"Der Importstand konnte nicht gespeichert werden:\n{exc}")
+            return False
+        # Neu lesen erzwingen; die Render-Kennung enthaelt den Stand, die Zeilen faerben um.
+        self._import_stand_signature = None
+        self._refresh_article_browser()
+        return True
+
+    def _note_deleted_since_import(self, output_root: Path, article_numbers: list[str]) -> None:
+        """Nach dem Loeschen im Verzeichnis: Artikel mit Loeschzeitpunkt im Aenderungsjournal
+        (changed_since) vermerken - auch ohne gesetzten Stand. Sie stehen in keiner
+        Output-Datei mehr; changed_articles_since fuehrt sie als 'geloescht'."""
+        deleted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._note_changed_since_import(output_root, {article: deleted_at for article in article_numbers}, deleted=True)
+
+    def _warn_import_stand_note_failed(
+        self, exc: Exception, articles: list[str], headline: str, consequence: str, output_root: Path | None = None
+    ) -> None:
+        """Meldung, wenn ein Vermerk im Importstand (Aenderungsjournal changed_since) nicht
+        gelesen oder geschrieben werden konnte - mit den Artikeln, die von Hand auf die
+        Loeschliste muessen, und dem Ausgabeordner (vorgemerkte Artikel eines frueheren
+        Massenimports koennen zu einem anderen Ordner gehoeren als dem eingestellten)."""
+        articles = [article for article in dict.fromkeys(articles) if article]
+        shown = articles[:40]
+        listing = "\n".join(shown)
+        if len(articles) > len(shown):
+            listing += f"\n... und {len(articles) - len(shown)} weitere"
+        folder_text = f"\n\nAusgabeordner: {output_root}" if output_root is not None else ""
+        messagebox.showwarning(
+            APP_TITLE,
+            f"{headline} ({IMPORT_STAND_FILENAME} gesperrt, nicht lesbar oder nicht beschreibbar):\n{exc}\n\n"
+            f"{consequence} Bitte diese Artikel vor dem nächsten Apollo-Import dieses Ausgabeordners von Hand "
+            f"auf die Apollo-Löschliste setzen:\n\n{listing}{folder_text}",
+        )
+
+    def _note_changed_since_import(
+        self, output_root: Path, written_at_by_article: dict[str, str], deleted: bool = False
+    ) -> str:
+        """Nach einem eigenen Schreibvorgang mit echter Aenderung: Artikel (-> Zeitpunkt)
+        im Aenderungsjournal changed_since des Importstands vermerken - auch ohne
+        gesetzten Stand (die Datei haelt dann nur das Journal), damit ein spaeter auf
+        einen frueheren Zeitpunkt gesetzter Stand die Aenderungen noch kennt.
+
+        Je Artikel zaehlt der JUENGSTE Zeitpunkt (ein spaeterer Vermerk ersetzt einen
+        frueheren); geschrieben wird nur, wenn sich dabei etwas erhoeht. Die Zeilen-
+        Zeitstempel der Dateien reichen nicht in jedem Fall: wird ein Bereich komplett
+        geleert oder der Artikel geloescht (deleted=True), steht dort nichts Juengeres
+        mehr. Scheitern Lesen oder Schreiben, kommt eine Meldung mit den Artikeln (je
+        Artikel einmal, Loeschungen immer). Rueckgabe: '' oder der Fehlertext fuer die
+        Statuszeile.
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        noted: dict[str, str] = {}
+        for article, written_at in written_at_by_article.items():
+            key = normalize_article_number(article)
+            value = normalize_written_at(written_at) or now
+            if key and value > noted.get(key, ""):
+                noted[key] = value
+        if not noted:
+            return ""
+        increased = False
+        try:
+            stand = read_import_stand_for_update(output_root)
+            changed = dict(stand.get("changed_since") or {})
+            for key, value in noted.items():
+                if value > changed.get(key, ""):
+                    changed[key] = value
+                    increased = True
+            if increased:
+                stand["changed_since"] = changed
+                write_import_stand(output_root, stand)
+        except (OSError, ValueError) as exc:
+            failure = f"{IMPORT_STAND_NOTE_FAILED} ({exc})"
+            what = "gelöschte" if deleted else "geänderte"
+            self.status_var.set(f"Importstand: {what} Artikel konnten nicht vermerkt werden ({exc}).")
+            if deleted:
+                # Immer melden (die Statuszeile ueberschreibt der Aufrufer gleich): die
+                # Artikel stehen in keiner Output-Datei mehr und fehlten sonst unbemerkt
+                # auf der Loeschliste - Apollo behielte sie.
+                self._changed_since_failures_reported.update(noted)
+                self._warn_import_stand_note_failed(
+                    exc,
+                    list(noted),
+                    "Die gelöschten Artikel konnten nicht im Apollo-Importstand vermerkt werden",
+                    "Sie stehen in keiner Output-Datei mehr und deshalb NICHT auf der Löschliste seit Apollo-Import.",
+                    output_root,
+                )
+                return failure
+            # Einmal je Artikel melden (bei dauerhaft gesperrter Datei nicht bei jedem
+            # Speichern); der naechste Schreibvorgang des Artikels versucht es erneut.
+            unreported = [article for article in noted if article not in self._changed_since_failures_reported]
+            if unreported:
+                self._changed_since_failures_reported.update(unreported)
+                self._warn_import_stand_note_failed(
+                    exc,
+                    unreported,
+                    "Die geänderten Artikel konnten nicht im Apollo-Importstand vermerkt werden",
+                    "Wurde dabei ein Bereich komplett geleert, fehlen sie nach dem nächsten Neuladen "
+                    "auf der Löschliste seit Apollo-Import.",
+                    output_root,
+                )
+            return failure
+        # Vermerkt: ein spaeterer Fehlschlag desselben Artikels wird wieder gemeldet.
+        self._changed_since_failures_reported.difference_update(noted)
+        if increased:
+            self._import_stand_signature = None
+        return ""
+
+    def _note_batch_changed(self, article_number: str) -> None:
+        """Massenimport: Artikel mit echter Aenderung fuer das Aenderungsjournal vormerken
+        (Wert = Verarbeitungszeitpunkt, nur zur Info); vermerkt wird gesammelt in
+        _flush_batch_changed_since."""
+        key = normalize_article_number(article_number)
+        if key:
+            self._batch_changed_since[key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _flush_batch_changed_since(self, due_only: bool = False) -> str:
+        """Im Massenimport vorgemerkte Artikel im Aenderungsjournal vermerken - ein Lese- und
+        Schreibvorgang fuer alle, aus dem UI-Thread. due_only: nur, wenn seit dem letzten
+        Vermerk BATCH_JOURNAL_FLUSH_SECONDS vergangen oder BATCH_JOURNAL_FLUSH_ARTICLES
+        Artikel vorgemerkt sind (Aufruf aus der Fortschritts-Abfrage des Laufs).
+
+        Vermerkt wird der Zeitpunkt des Vermerks, nicht der Verarbeitung: hat eine andere
+        Instanz inzwischen 'Apollo-Import erledigt' geklickt, laege der fruehere Zeitpunkt
+        vor ihrem neuen Stand und der Artikel (z. B. Bereich geleert) fiele von der
+        Loeschliste. Scheitert der Vermerk, bleiben die Artikel vorgemerkt (naechster
+        Versuch beim naechsten Vermerk, auch erst im naechsten Lauf oder beim Schliessen;
+        Meldung je Artikel einmal). Vorgemerkte Artikel frueherer Laeufe in einen anderen
+        Ausgabeordner (_batch_changed_other_roots) werden in IHREM Ordner vermerkt (mit
+        due_only nur nach Ablauf von BATCH_JOURNAL_FLUSH_SECONDS) und erst nach gelungenem
+        Vermerk verworfen.
+        Rueckgabe: '' oder der (erste) Fehlertext fuer die Statuszeile."""
+        failure = ""
+        timed_out = time.monotonic() - self._batch_journal_flushed_at >= BATCH_JOURNAL_FLUSH_SECONDS
+        pending = self._batch_changed_since
+        output_root = self._batch_output_root
+        # Nach einem gescheiterten Vermerk waehrend des Laufs nur nach Zeit erneut versuchen,
+        # nicht bei jeder Fortschritts-Abfrage (jeder Versuch wartet beim Lesen kurz).
+        enough = len(pending) >= BATCH_JOURNAL_FLUSH_ARTICLES and not self._batch_journal_failed
+        if pending and output_root is not None and (not due_only or timed_out or enough):
+            flushed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            articles = list(pending)
+            self._batch_changed_since = {}
+            self._batch_journal_flushed_at = time.monotonic()
+            failure = self._note_changed_since_import(output_root, {article: flushed_at for article in articles})
+            self._batch_journal_failed = bool(failure)
+            if failure:
+                for article in articles:
+                    self._batch_changed_since.setdefault(article, flushed_at)
+        if self._batch_changed_other_roots and (not due_only or timed_out):
+            if due_only:
+                self._batch_journal_flushed_at = time.monotonic()
+            for other_root, entries in list(self._batch_changed_other_roots.items()):
+                flushed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                other_failure = self._note_changed_since_import(other_root, {article: flushed_at for article in entries})
+                if other_failure:
+                    failure = failure or other_failure
+                else:
+                    self._batch_changed_other_roots.pop(other_root, None)
+        return failure
+
+    def _switch_batch_output_root(self, output_root: Path) -> None:
+        """Ausgabeordner des (naechsten) Massenimports fuer das Aenderungsjournal setzen. Noch
+        nicht vermerkte Artikel gehoeren zu ihrem Ordner: bei einem anderen Ordner wandern die
+        des bisherigen nach _batch_changed_other_roots, die eines frueheren Laufs im neuen
+        Ordner kommen zurueck - vermerkt wird nie in einem fremden Importstand."""
+        new_root = Path(output_root)
+        old_root = self._batch_output_root
+        if old_root is not None and old_root == new_root:
+            return
+        pending = self._batch_changed_since
+        self._batch_changed_since = {}
+        if old_root is not None and pending:
+            parked = self._batch_changed_other_roots.setdefault(old_root, {})
+            for article, noted_at in pending.items():
+                if noted_at > parked.get(article, ""):
+                    parked[article] = noted_at
+            pending = {}
+        # Ohne bisherigen Ordner (noch kein Lauf) gehoert Vorgemerktes zum neuen Ordner.
+        restored = self._batch_changed_other_roots.pop(new_root, {})
+        for article, noted_at in restored.items():
+            if noted_at > pending.get(article, ""):
+                pending[article] = noted_at
+        self._batch_changed_since = pending
+        self._batch_output_root = new_root
+        self._batch_journal_failed = False
+
+    def _flush_batch_journal_for(self, output_root: Path) -> list[str]:
+        """Vor 'Loeschliste seit Apollo-Import': noch nicht vermerkte Artikel frueherer
+        Massenimporte (Vermerk gescheitert, sonst erst beim naechsten Lauf oder beim
+        Schliessen erneut versucht) jetzt vermerken. Rueckgabe: Artikel DIESES Ausgabeordners,
+        die weiter nur vorgemerkt sind (Vermerk erneut gescheitert)."""
+        self._flush_batch_changed_since()
+        root = Path(output_root)
+        pending = dict(self._batch_changed_other_roots.get(root, {}))
+        if self._batch_output_root is not None and Path(self._batch_output_root) == root:
+            pending.update(self._batch_changed_since)
+        return sorted(pending)
+
+    def _import_stand_action_blocked(self) -> bool:
+        """Importstand setzen / Loeschliste seit Import nicht waehrend Massenimport, IMS-Uebernahme oder
+        anderem Hintergrundvorgang: der Stand laege sonst mitten im Lauf, die bis dahin geschriebenen
+        Artikel gaelten dauerhaft als importiert (bzw. die Loeschliste waere unvollstaendig)."""
+        if self.background_task_running or self.batch_import_running or self._ims_sync_running:
+            self.status_var.set("Es läuft bereits ein Hintergrundvorgang. Bitte kurz warten.")
+            return True
+        return False
+
+    def mark_apollo_import_done(self) -> None:
+        """'Apollo-Import erledigt': Importstand = Zeitpunkt der ERSTEN Loeschliste seit dem
+        bisherigen Stand (delete_list_at), wenn sie zu ihm passt (DeleteListRecord.fits:
+        delete_list_base <= Stand < delete_list_at) - sonst jetzt, bei nicht mehr passender
+        Liste mit Warnung (Stand inzwischen frueher gesetzt: Artikel dazwischen fehlen auf der
+        Liste). Gab es seitdem nur die Pruefung 'keine Loeschliste noetig', zaehlt deren
+        Zeitpunkt. Hat eine echte Liste eine solche Pruefung nach dem Stand ersetzt
+        (delete_list_checked_at), fragt 'erledigt' ausdruecklich (Warnung, Vorgabe 'Nein'),
+        ob die Liste importiert wurde: Ja = Zeitpunkt der Liste, Nein = Zeitpunkt der
+        Pruefung (die Liste bleibt vermerkt, das naechste 'erledigt' nimmt wieder ihren
+        Zeitpunkt - sicher), Abbrechen = nichts. Das Journal bleibt vollstaendig erhalten: Eintraege bis zum neuen Stand
+        zaehlen nur nicht mehr (ein spaeter mit 'Importstand setzen' frueher gesetzter Stand
+        sieht sie wieder), juengere bleiben markiert - auch was nach der Loeschliste oder
+        waehrend der Rueckfrage (in einer anderen Instanz) geaendert wurde. deleted_since
+        (Vorabformat) geht mit dem neuen Stand als Zeitpunkt ins Journal ueber."""
+        if self._import_stand_action_blocked():
+            return
+        try:
+            output_root = self._resolve_output_root()
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        if not output_root.exists():
+            messagebox.showwarning(APP_TITLE, f"Der Ausgabeordner existiert nicht:\n{output_root}")
+            return
+        # Noch nicht vermerkte Artikel frueherer Massenimporte (Vermerk war gescheitert) zuerst
+        # ins Journal. Scheitert es wieder, werden sie spaeter mit einem Zeitpunkt nach dem neuen
+        # Stand vermerkt und bleiben markiert - sicher, deshalb hier kein Abbruch.
+        self._flush_batch_changed_since()
+        # Offene Live-Auftraege zuerst schreiben: ihre Zeilen gehoeren noch zum Import.
+        self._flush_live_writes(reason="Importstand: ")
+        self._refresh_article_browser()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            current = read_import_stand_for_update(output_root)
+        except OSError as exc:
+            self._warn_import_stand_unreadable(exc, "Der Importstand wurde nicht geändert.")
+            return
+        last_import_at = str(current.get("last_import_at") or "")
+        record = delete_list_record(current)
+        list_since_stand = record is not None and bool(last_import_at) and last_import_at < record.at <= now
+        from_list = record is not None and list_since_stand and record.fits(last_import_at)
+        # Liste gegen einen spaeteren Stand erstellt ('Importstand setzen' danach auf einen
+        # frueheren Zeitpunkt): ihr fehlen die Artikel zwischen beiden Staenden.
+        list_mismatch = list_since_stand and not from_list
+        new_stand = record.at if from_list and record is not None else now
+        # Erst eine Pruefung ohne Liste nach dem Stand, danach eine echte Liste (sie hat die
+        # Pruefung ersetzt): ob die Liste oder schon der Stand der Pruefung in Apollo ging,
+        # weiss nur der Nutzer. Lief der Import nach der Pruefung ohne Liste und wurde die
+        # Liste nur zum Ansehen gespeichert, galten mit dem Listenzeitpunkt die dazwischen
+        # geaenderten Artikel still als importiert - deshalb ausdruecklich fragen, Vorgabe
+        # 'Nein' (Zeitpunkt der Pruefung: die Artikel der Liste bleiben markiert, sicher).
+        # Eine Pruefung vor dem aktuellen Stand (z. B. nach 'Importstand setzen') zaehlt nicht.
+        ask_which = bool(
+            from_list
+            and record is not None
+            and not record.empty
+            and record.checked_at
+            and record.checked_at > last_import_at
+        )
+        size_text = ""
+        if record is not None and record.size:
+            size_text = f"{record.size} {'Artikel' if record.size == 1 else 'Artikeln'}"
+        if from_list and record is not None:
+            new_stand_text = format_written_at_display(new_stand, with_seconds=True)
+            multi_text = ""
+            if not record.empty and record.count > 1:
+                multi_text = (
+                    f"\n\nSeit dem bisherigen Stand wurden {record.count} Löschlisten erstellt – es zählt die erste "
+                    f"({new_stand_text}). Wurde in Apollo eine spätere Liste "
+                    "importiert, danach mit 'Importstand setzen…' deren Zeitpunkt eintragen; sonst stehen die "
+                    "dazwischen geänderten Artikel nur noch einmal auf der nächsten Löschliste (erneutes Löschen "
+                    "und Importieren schadet nicht)."
+                )
+            if record.empty:
+                stand_text = (
+                    f"Neuer Importstand: {new_stand_text} (Zeitpunkt der Prüfung 'Löschliste seit Apollo-Import': "
+                    "es war keine Löschliste nötig).\n"
+                    "Änderungen danach bleiben markiert und kommen auf die nächste Löschliste."
+                )
+            elif ask_which:
+                checked_text = format_written_at_display(record.checked_at, with_seconds=True)
+                list_label = f"die Löschliste vom {new_stand_text}" + (f" ({record.size} Artikel)" if record.size else "")
+                stand_text = (
+                    f"Am {checked_text} wurde geprüft: keine Löschliste nötig. Danach wurde "
+                    f"{list_label} gespeichert.\n\n"
+                    f"Ja: neuer Importstand {new_stand_text} (Zeitpunkt der Löschliste). Änderungen danach "
+                    "bleiben markiert und kommen auf die nächste Löschliste.\n"
+                    f"Nein: Der Apollo-Import lief schon nach der Prüfung vom {checked_text} (ohne Liste) – neuer "
+                    f"Importstand {checked_text}. Die Artikel der Liste bleiben markiert und kommen noch einmal auf "
+                    "die nächste Löschliste (erneutes Löschen und Importieren schadet nicht). Die Liste bleibt "
+                    "vermerkt: das nächste 'Apollo-Import erledigt' nimmt wieder ihren Zeitpunkt (sicher – was "
+                    "danach geändert wurde, bleibt markiert).\n"
+                    "Abbrechen: nichts ändern (z. B. wenn der Apollo-Import noch gar nicht gelaufen ist)."
+                ) + multi_text
+            else:
+                stand_text = (
+                    f"Neuer Importstand: {new_stand_text} (Zeitpunkt der Löschliste seit Apollo-Import"
+                    + (f" mit {size_text}" if size_text else "")
+                    + ").\n"
+                    "Änderungen danach bleiben markiert und kommen auf die nächste Löschliste."
+                ) + multi_text
+        else:
+            stand_text = f"Neuer Importstand: {format_written_at_display(new_stand, with_seconds=True)} (jetzt).\n"
+            if list_mismatch and record is not None:
+                # Unterscheiden sich Basis und Stand nur in den Sekunden, beide mit Sekunden.
+                base_text = format_written_at_display(record.base)
+                stand_before_text = format_written_at_display(last_import_at)
+                if base_text == stand_before_text:
+                    base_text = format_written_at_display(record.base, with_seconds=True)
+                    stand_before_text = format_written_at_display(last_import_at, with_seconds=True)
+                list_text = format_written_at_display(record.at, with_seconds=True)
+                if record.empty:
+                    what = (
+                        f"Die Prüfung 'Löschliste seit Apollo-Import' vom {list_text} (keine Löschliste nötig) "
+                        f"bezog sich auf den Importstand vom {base_text}"
+                    )
+                    missing = "hat sie nicht erfasst."
+                else:
+                    what = f"Die Löschliste vom {list_text} wurde gegen den Importstand vom {base_text} erstellt"
+                    missing = "fehlen auf dieser Liste."
+                stand_text += (
+                    f"\nACHTUNG: {what}; der Stand steht "
+                    f"inzwischen früher ({stand_before_text}). Artikel, die dazwischen geändert wurden, {missing} "
+                    "Bitte die Löschliste neu erstellen und in Apollo importieren, bevor der Import als erledigt "
+                    "markiert wird."
+                )
+            elif last_import_at:
+                stand_text += "Seit dem bisherigen Importstand wurde keine Löschliste erstellt."
+            else:
+                stand_text += "Es wurde noch keine Löschliste seit Apollo-Import erstellt."
+        if ask_which and record is not None:
+            # Die Rueckfrage selbst als Ueberschrift: 'Nein' heisst hier nicht 'nicht markieren'.
+            headline = (
+                f"Apollo-Import erledigt: Wurde die Löschliste vom "
+                f"{format_written_at_display(record.at, with_seconds=True)}"
+                + (f" ({record.size} Artikel)" if record.size else "")
+                + " in Apollo importiert?"
+            )
+        else:
+            headline = "Apollo-Import als erledigt markieren?"
+        message = f"{headline}\n\n{stand_text}\n\nAusgabeordner: {output_root}"
+        if last_import_at:
+            changes = changed_articles_since(self.article_browser_records, current)
+            message += (
+                f"\n\nBisheriger Stand: {format_written_at_display(last_import_at)}"
+                f" ({len(changes)} Artikel seitdem geändert, neu oder gelöscht)."
+            )
+        message += "\n\nAlle bis zum neuen Stand geänderten und gelöschten Artikel gelten danach als importiert."
+        from_text = ""
+        # 'Nein' auf die Rueckfrage: Stand = Pruefung, die Liste bleibt aber vermerkt (sie passt
+        # weiter: Basis <= Pruefung < Liste). Wird sie spaeter doch importiert, bietet das naechste
+        # 'erledigt' ihren Zeitpunkt an; ohne Vermerk naehme es 'jetzt', und was waehrend des
+        # Imports geaendert wurde, galte still als importiert.
+        keep_list_record = False
+        if ask_which and record is not None:
+            answer = messagebox.askyesnocancel(APP_TITLE, message, icon="warning", default="no")
+            if answer is None:
+                return
+            if answer:
+                from_text = " = Zeitpunkt der Löschliste"
+            else:
+                new_stand = record.checked_at
+                keep_list_record = True
+                from_text = " = Zeitpunkt der Prüfung (keine Löschliste nötig)"
+        else:
+            if list_mismatch:
+                confirmed = messagebox.askyesno(APP_TITLE, message, icon="warning", default="no")
+            else:
+                confirmed = messagebox.askyesno(APP_TITLE, message)
+            if not confirmed:
+                return
+            if from_list and record is not None:
+                from_text = " = Zeitpunkt der Prüfung (keine Löschliste nötig)" if record.empty else " = Zeitpunkt der Löschliste"
+        if self._import_stand_action_blocked():
+            # Waehrend der Rueckfrage wurde ein Lauf gestartet.
+            return
+        # Neu lesen: waehrend der Rueckfrage kann eine andere Instanz vermerkt haben. Das
+        # Journal bleibt ganz stehen (Eintraege bis zum neuen Stand zaehlen nicht mehr, nach
+        # einer Korrektur auf einen frueheren Stand wieder); deleted_since (Vorabformat, ohne
+        # Zeitpunkt) geht mit dem neuen Stand als Zeitpunkt ins Journal, der Vermerk der
+        # Loeschliste entfaellt.
+        try:
+            stand = read_import_stand_for_update(output_root)
+        except OSError as exc:
+            self._warn_import_stand_unreadable(exc, "Der Importstand wurde nicht geändert.")
+            return
+        journal = dict(stand.get("changed_since") or {})
+        for article in stand.get("deleted_since") or []:
+            key = normalize_article_number(str(article))
+            if key and new_stand > journal.get(key, ""):
+                journal[key] = new_stand
+        stand_record = delete_list_record(stand) if keep_list_record else None
+        stand.update(new_import_stand(new_stand, note="Apollo-Import erledigt", deleted_since=[], changed_since=journal))
+        if stand_record is not None and not stand_record.empty and stand_record.fits(new_stand):
+            # Nur der Pruefungs-Vermerk entfaellt (er liegt jetzt auf dem Stand).
+            stand.pop("delete_list_checked_at", None)
+        else:
+            for key in DELETE_LIST_KEYS:
+                stand.pop(key, None)
+        if self._write_import_stand_and_refresh(output_root, stand):
+            self._changed_since_failures_reported.clear()
+            self.status_var.set(
+                f"Apollo-Importstand gesetzt: {format_written_at_display(new_stand, with_seconds=True)}"
+                + from_text
+                + f" ({IMPORT_STAND_FILENAME} im Ausgabeordner)."
+            )
+
+    def _warn_import_stand_unreadable(self, exc: Exception, consequence: str = "Der Importstand wurde nicht geändert.") -> None:
+        """Importstand-Datei nicht lesbar (Loeschliste, erledigt, Importstand setzen): nichts
+        schreiben - sonst gingen die darin vermerkten Aenderungen (Journal) verloren - und
+        nicht 'kein Importstand gesetzt' melden."""
+        messagebox.showwarning(
+            APP_TITLE,
+            f"Der Apollo-Importstand konnte nicht gelesen werden ({IMPORT_STAND_FILENAME} gesperrt oder beschädigt):\n{exc}\n\n"
+            f"{consequence} Bitte kurz warten und erneut versuchen. Bleibt die Datei "
+            "unlesbar (beschädigt), kann sie im Ausgabeordner gelöscht werden - die darin vermerkten "
+            "Änderungen gehen dabei verloren.",
+        )
+
+    def _set_import_stand(self, output_root: Path, last_import_at: str, note: str, with_seconds: bool = False) -> None:
+        """'Importstand setzen…': Stand auf den eingegebenen Zeitpunkt. Das Aenderungsjournal
+        (changed_since, auch aus der Zeit vor dem ersten Stand und vor frueheren 'erledigt'),
+        deleted_since (Vorabformat) und der Loeschlisten-Vermerk (DELETE_LIST_KEYS) bleiben
+        erhalten - Eintraege zaehlen, wenn sie nach dem neuen Stand liegen; ob die Liste noch
+        zum Stand passt, pruefen 'erledigt' und die naechste Liste (DeleteListRecord.fits).
+        Nur der Zeitpunkt einer Pruefung ohne Liste (delete_list_checked_at) entfaellt, wenn
+        der neue Stand nicht davor liegt: sie ist dann erledigt, und 'erledigt' fragt nicht
+        mehr nach ihr. with_seconds: Statuszeile mit Sekunden (Eingabe enthielt Sekunden)."""
+        if self._import_stand_action_blocked():
+            return
+        self._flush_live_writes(reason="Importstand: ")
+        try:
+            stand = read_import_stand_for_update(output_root)
+        except OSError as exc:
+            self._warn_import_stand_unreadable(exc, "Der Importstand wurde nicht geändert.")
+            return
+        stand.update(
+            new_import_stand(
+                last_import_at,
+                note=note,
+                deleted_since=list(stand.get("deleted_since") or []),
+                changed_since=dict(stand.get("changed_since") or {}),
+            )
+        )
+        checked_at = normalize_written_at(stand.get("delete_list_checked_at"))
+        if checked_at and normalize_written_at(stand.get("last_import_at")) >= checked_at:
+            stand.pop("delete_list_checked_at", None)
+        if self._write_import_stand_and_refresh(output_root, stand):
+            self._changed_since_failures_reported.clear()
+            self.status_var.set(
+                f"Apollo-Importstand gesetzt: {format_written_at_display(last_import_at, with_seconds=with_seconds)} "
+                f"({IMPORT_STAND_FILENAME} im Ausgabeordner)."
+            )
+
+    def open_import_stand_dialog(self) -> None:
+        if self._import_stand_action_blocked():
+            return
+        try:
+            output_root = self._resolve_output_root()
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        if not output_root.exists():
+            messagebox.showwarning(APP_TITLE, f"Der Ausgabeordner existiert nicht:\n{output_root}")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Importstand setzen")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Zeitpunkt des letzten Apollo-Imports (TT.MM.JJJJ HH:MM, Sekunden optional):").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        value_var = tk.StringVar(value=datetime.now().strftime("%d.%m.%Y %H:%M"))
+        entry = ttk.Entry(frame, textvariable=value_var, width=24)
+        entry.grid(row=1, column=0, sticky="w", pady=(4, 10))
+        ttk.Button(frame, text="Jetzt", width=8, command=lambda: value_var.set(datetime.now().strftime("%d.%m.%Y %H:%M"))).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(4, 10)
+        )
+        ttk.Label(frame, text="Notiz (optional):").grid(row=2, column=0, columnspan=2, sticky="w")
+        note_var = tk.StringVar(value=str(self.import_stand.get("note", "")) if self.import_stand else "")
+        ttk.Entry(frame, textvariable=note_var, width=48).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 10))
+        ttk.Label(
+            frame,
+            text=(
+                "Alle Artikel, die nach diesem Zeitpunkt geändert, neu angelegt oder gelöscht wurden, kommen auf die "
+                "Löschliste. Änderungen und Löschungen werden laufend vermerkt – auch bevor ein Importstand gesetzt ist –, "
+                "ein Stand in der Vergangenheit erfasst sie also mit. 'Apollo-Import erledigt' setzt den Stand "
+                "später auf den Zeitpunkt der ersten Löschliste seit diesem Stand."
+            ),
+            foreground=UI_TEXT_MUTED,
+            wraplength=420,
+        ).grid(row=4, column=0, columnspan=2, sticky="w")
+        error_var = tk.StringVar()
+        ttk.Label(frame, textvariable=error_var, foreground="#B42318", wraplength=420).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+
+        def apply() -> None:
+            try:
+                value = parse_import_stand_input(value_var.get())
+            except ValueError as exc:
+                error_var.set(str(exc))
+                return
+            if value > datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
+                error_var.set("Der Importstand darf nicht in der Zukunft liegen.")
+                return
+            # Mit Sekunden eingegeben (z. B. Zeitpunkt einer Loeschliste): auch so anzeigen.
+            time_part = value_var.get().strip().replace("T", " ").partition(" ")[2]
+            dialog.destroy()
+            self._set_import_stand(output_root, value, note_var.get().strip(), with_seconds=time_part.count(":") >= 2)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Abbrechen", command=dialog.destroy).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Übernehmen", style="Accent.TButton", command=apply).grid(row=0, column=1)
+        dialog.bind("<Return>", lambda _event: apply())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        entry.focus_set()
+        entry.selection_range(0, "end")
+        dialog.grab_set()
+
+    def save_apollo_delete_list_since_import(self, target_path: Path | None = None) -> None:
+        """'Löschliste seit Apollo-Import': alle seit dem Importstand geaenderten, neuen und
+        geloeschten Artikel (Blatt 'Loeschliste' A = 757 / B = Artikelnummer, Blatt 'Aenderungen').
+        Der Zeitpunkt der ersten Liste seit dem Stand landet als delete_list_at im Importstand
+        ('Apollo-Import erledigt' setzt den Stand darauf, nicht auf die Klickzeit); ist nichts
+        geaendert, wird die Pruefung mit Groesse 0 vermerkt (_record_delete_list_at). Bestaetigung
+        und Statuszeile nennen den Listenzeitpunkt mit Sekunden. Eine nicht lesbare
+        Importstand-Datei wird gemeldet (nicht als 'kein Importstand gesetzt')."""
+        if self._import_stand_action_blocked():
+            return
+        try:
+            output_root = self._resolve_output_root()
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return
+        if not self._flush_live_writes(reason="Löschliste: "):
+            # Ein noch laufender Auftrag fehlte auf der Liste und galte nach 'erledigt'
+            # (Stand = Zeitpunkt der Liste) als importiert.
+            messagebox.showwarning(
+                APP_TITLE,
+                "Es werden noch Änderungen gespeichert – die Löschliste wäre unvollständig.\n\n"
+                "Bitte kurz warten und erneut versuchen.",
+            )
+            return
+        # Im Massenimport geaenderte Artikel, deren Vermerk im Journal gescheitert war, jetzt
+        # vermerken (vor dem Listenzeitpunkt): ein geleerter Bereich steht nur im Journal.
+        not_noted = self._flush_batch_journal_for(output_root)
+        if not_noted:
+            shown = ", ".join(not_noted[:10]) + (" …" if len(not_noted) > 10 else "")
+            messagebox.showwarning(
+                APP_TITLE,
+                f"{len(not_noted)} im Massenimport geänderte Artikel konnten noch nicht im Apollo-Importstand "
+                f"vermerkt werden ({IMPORT_STAND_FILENAME} gesperrt?): {shown}\n\n"
+                "Die Löschliste wäre unvollständig und wurde nicht erstellt. Bitte kurz warten und erneut versuchen.",
+            )
+            return
+        # Zeitpunkt der Liste: nach dem Schreiben aller offenen Auftraege, vor dem
+        # Neuladen (dazwischen laeuft keine Ereignisschleife, also kein Live-Auftrag) -
+        # was danach geschrieben wird, ist juenger und bleibt nach 'Apollo-Import
+        # erledigt' markiert, alles davor steht auf der Liste.
+        list_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._refresh_article_browser()
+        if not self._import_stand_readable(output_root, "Die Löschliste wurde nicht erstellt."):
+            return
+        stand = self.import_stand
+        if stand is None:
+            messagebox.showinfo(
+                APP_TITLE,
+                "Es ist noch kein Apollo-Importstand gesetzt.\n\n"
+                "Mit 'Apollo-Import erledigt' oder 'Importstand setzen…' festlegen, "
+                "wann die Output-Dateien zuletzt in Apollo importiert wurden.",
+            )
+            return
+        if self.article_browser_cache_dir != str(output_root):
+            # Das Verzeichnis ist (noch) nicht aus diesem Ordner geladen, z. B. weil ein
+            # Neuladen gerade aufgeschoben ist - die Liste waere unvollstaendig.
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Das Artikelverzeichnis zeigt noch nicht den Ausgabeordner {output_root} - "
+                "bitte kurz warten und erneut versuchen.",
+            )
+            return
+        stand_label = format_written_at_display(str(stand.get("last_import_at", "")))
+        list_base = str(stand.get("last_import_at") or "")
+        list_at_text = format_written_at_display(list_at, with_seconds=True)
+        changes = changed_articles_since(self.article_browser_records, stand)
+        if not changes:
+            # Pruefung ohne Liste (Groesse 0): 'erledigt' nimmt ihren Zeitpunkt nur, solange
+            # keine echte Liste folgt - die erste echte Liste ersetzt sie.
+            record_error, fallback, fallback_empty = self._record_delete_list_at(output_root, list_at, list_base, 0)
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Seit dem Apollo-Import vom {stand_label} wurde kein Artikel geändert, neu angelegt oder gelöscht.\n\n"
+                f"Eine Löschliste ist nicht nötig (geprüft am {list_at_text}).",
+            )
+            if record_error:
+                self._warn_delete_list_at_not_recorded(record_error, fallback, fallback_empty)
+            return
+
+        if target_path is None:
+            stand_date = str(stand.get("last_import_at", ""))[:10]
+            default_name = f"Apollo-Loeschliste_seit_{stand_date}.xlsx"
+            target = filedialog.asksaveasfilename(
+                title="Löschliste seit Apollo-Import speichern",
+                defaultextension=".xlsx",
+                initialfile=default_name,
+                filetypes=[("Excel Dateien", "*.xlsx"), ("CSV Dateien", "*.csv")],
+            )
+            if not target:
+                return
+            target_path = Path(target)
+
+        try:
+            write_import_delete_list(target_path, changes)
+        except OSError as exc:
+            messagebox.showwarning(APP_TITLE, f"Löschliste konnte nicht gespeichert werden:\n{exc}")
+            return
+        record_error, fallback, fallback_empty = self._record_delete_list_at(output_root, list_at, list_base, len(changes))
+
+        counts = {"geaendert": 0, "neu": 0, "geloescht": 0}
+        for change in changes:
+            counts[change.status] = counts.get(change.status, 0) + 1
+        summary = f"{counts['geaendert']} geändert, {counts['neu']} neu, {counts['geloescht']} gelöscht seit {stand_label}"
+        # Listenzeitpunkt mit Sekunden: so kann er bei Bedarf mit 'Importstand setzen…' eingetragen werden.
+        self.status_var.set(f"Löschliste vom {list_at_text} gespeichert: {len(changes)} Artikel ({summary}) – {target_path}")
+        messagebox.showinfo(
+            APP_TITLE,
+            f"Löschliste vom {list_at_text} mit {len(changes)} Artikelnummern gespeichert:\n{target_path}\n\n{summary}.\n\n"
+            f"Blatt 'Loeschliste': Spalte A = {APOLLO_DELETE_LIST_COLUMN_A_VALUE}, Spalte B = Artikelnummer "
+            "(Aufbau wie VLoesch.xlsx). Blatt 'Aenderungen': je Artikel letzte Änderung, geänderte Bereiche und Status.",
+        )
+        if record_error:
+            self._warn_delete_list_at_not_recorded(record_error, fallback, fallback_empty)
+
+    def _record_delete_list_at(
+        self, output_root: Path, list_at: str, list_base: str, size: int
+    ) -> tuple[str, str | None, bool]:
+        """Zeitpunkt der Loeschliste im Importstand merken - 'Apollo-Import erledigt' setzt den
+        Stand darauf. size = Artikel auf der Liste, 0 = Pruefung 'keine Loeschliste noetig'
+        (keine Datei). list_base = Stand, gegen den die Liste erstellt wurde.
+
+        Es zaehlt die ERSTE echte Liste seit dem aktuellen Stand: Gilt der vorhandene Vermerk
+        fuer den Stand (DeleteListRecord.fits - dieselbe Regel wie in 'erledigt'), laesst eine
+        spaetere Liste (nur zum Ansehen oder aus einer anderen Instanz) ihn stehen und zaehlt
+        nur delete_list_count hoch - sonst gaelten nach 'erledigt' auch die Aenderungen
+        zwischen importierter und spaeterer Liste als importiert. Eine Pruefung ohne Liste
+        belegt den Platz nur, bis die erste echte Liste kommt: die ersetzt sie (Zeitpunkt der
+        Pruefung bleibt als delete_list_checked_at fuer die Rueckfrage in 'erledigt'); eine
+        weitere Pruefung ohne Liste aendert nichts. Ersetzt wird ausserdem ein Vermerk, der
+        nicht zum Stand passt (fehlt, nicht juenger als der Stand oder gegen einen spaeteren
+        Stand erstellt).
+
+        Rueckgabe: ('', None, False) oder (Fehlertext, was 'erledigt' stattdessen nimmt:
+        Zeitpunkt des vorhandenen Vermerks, '' = Klickzeitpunkt, None = unbekannt; True, wenn
+        dieser Vermerk nur eine Pruefung ohne Liste ist)."""
+        fallback: str | None = None
+        fallback_empty = False
+        try:
+            stand = read_import_stand_for_update(output_root)
+            last_import_at = str(stand.get("last_import_at") or "")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            existing = delete_list_record(stand)
+            if existing is not None and existing.fits(last_import_at) and existing.at <= now:
+                fallback = existing.at
+                fallback_empty = existing.empty
+                if size <= 0:
+                    # Weitere Pruefung ohne Liste: der vorhandene Vermerk bleibt, wie er ist.
+                    return "", None, False
+                if existing.empty:
+                    # Erste echte Liste nach einer Pruefung ohne Liste: sie zaehlt.
+                    stand["delete_list_checked_at"] = existing.at
+                    stand["delete_list_at"] = list_at
+                    stand["delete_list_base"] = list_base or last_import_at
+                    stand["delete_list_size"] = size
+                    stand["delete_list_count"] = 1
+                else:
+                    stand["delete_list_count"] = existing.count + 1
+            else:
+                fallback = ""
+                for key in DELETE_LIST_KEYS:
+                    stand.pop(key, None)
+                stand["delete_list_at"] = list_at
+                stand["delete_list_base"] = list_base or last_import_at
+                stand["delete_list_size"] = max(size, 0)
+                stand["delete_list_count"] = 1 if size > 0 else 0
+            write_import_stand(output_root, stand)
+        except (OSError, ValueError) as exc:
+            return str(exc), fallback, fallback_empty
+        self._import_stand_signature = None
+        return "", None, False
+
+    def _warn_delete_list_at_not_recorded(self, error: str, fallback: str | None, fallback_empty: bool = False) -> None:
+        """Meldung, wenn der Zeitpunkt der Loeschliste nicht vermerkt werden konnte - mit
+        dem Zeitpunkt, den 'Apollo-Import erledigt' im unveraenderten Importstand wirklich
+        nimmt (gleiche Regel wie dort: DeleteListRecord.fits)."""
+        if fallback and fallback_empty:
+            consequence = (
+                "'Apollo-Import erledigt' setzt den Stand dann auf die Prüfung vom "
+                f"{format_written_at_display(fallback, with_seconds=True)} (keine Löschliste nötig) – die Artikel "
+                "dieser Liste bleiben danach markiert und kommen noch einmal auf die nächste Löschliste (erneutes "
+                "Löschen und Importieren schadet nicht)."
+            )
+        elif fallback:
+            consequence = (
+                "'Apollo-Import erledigt' setzt den Stand weiter auf die erste Löschliste seit dem Stand "
+                f"({format_written_at_display(fallback, with_seconds=True)}) – es geht nichts verloren, nur die "
+                "Rückfrage zählt diese Liste nicht mit."
+            )
+        elif fallback == "":
+            consequence = (
+                "'Apollo-Import erledigt' setzt den Stand dann auf den Zeitpunkt des Klicks – was zwischen "
+                "Löschliste und Klick geändert wird, wäre danach nicht mehr markiert. Bitte die Löschliste "
+                "erneut speichern, sobald die Datei wieder frei ist."
+            )
+        else:
+            consequence = (
+                "'Apollo-Import erledigt' setzt den Stand dann auf eine früher seit dem Stand erstellte "
+                "Löschliste, falls eine vermerkt ist, sonst auf den Zeitpunkt des Klicks – was zwischen "
+                "Löschliste und Klick geändert wird, wäre dann nicht mehr markiert. Bitte die Löschliste "
+                "erneut speichern, sobald die Datei wieder frei ist."
+            )
+        messagebox.showwarning(
+            APP_TITLE,
+            f"Der Zeitpunkt der Löschliste konnte nicht im Apollo-Importstand vermerkt werden "
+            f"({IMPORT_STAND_FILENAME} gesperrt oder nicht beschreibbar):\n{error}\n\n{consequence}",
+        )
+
+    # ------------------------------------------------------------------
+    # Reiter 'Uebersicht'
+
+    def _build_overview_tab(self) -> None:
+        tab = self.overview_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=1)
+        ttk.Label(
+            tab,
+            text=(
+                "Alle Artikel des Ausgabeordners auf einen Blick. Je Reiter steht 'Anzahl (TT.MM.)' = Zeilen in der "
+                "Output-Datei und Datum der letzten Änderung; Kurzbezeichnung und Text zeigen Text-Modul-ID und "
+                "Anzahl gefüllter Sprachen. Hellorange = seit dem Apollo-Importstand geändert. "
+                "Spaltenkopf anklicken sortiert (nochmal: umgekehrt), Doppelklick lädt den Artikel in die Maske."
+            ),
+            foreground=UI_TEXT_MUTED,
+            wraplength=1100,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        toolbar = ttk.Frame(tab)
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="Suche:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.overview_search_entry = ttk.Entry(toolbar, textvariable=self.overview_search_var)
+        self.overview_search_entry.grid(row=0, column=1, sticky="ew")
+        self.overview_search_entry.bind("<Return>", self._on_overview_search_return)
+        self.overview_search_entry.bind("<Escape>", self._on_overview_search_escape)
+        ttk.Button(toolbar, text="Leeren", width=8, command=self._clear_overview_search).grid(row=0, column=2, padx=(6, 10))
+        ttk.Label(toolbar, textvariable=self.overview_count_var, foreground=UI_TEXT_MUTED).grid(row=0, column=3, padx=(0, 12))
+        ttk.Button(toolbar, text="Liste aktualisieren", command=self.refresh_overview).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(toolbar, text="Als Excel speichern…", command=self.export_overview_to_excel).grid(row=0, column=5)
+        self.overview_search_var.trace_add("write", self._on_overview_search_changed)
+
+        table = ttk.Frame(tab)
+        table.grid(row=2, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        self.overview_tree = ttk.Treeview(table, columns=OVERVIEW_COLUMN_KEYS, show="headings", selectmode="browse")
+        self.overview_tree.grid(row=0, column=0, sticky="nsew")
+        for key, label, width, anchor, _kind in OVERVIEW_COLUMNS:
+            self.overview_tree.heading(key, text=label, command=lambda column=key: self._overview_sort_by(column))
+            self.overview_tree.column(key, width=width, minwidth=60, anchor=anchor, stretch=(key == "short_de"))
+        self.overview_tree.tag_configure(ARTICLE_CHANGED_ROW_TAG, background=ARTICLE_CHANGED_ROW_COLOR)
+        vertical = ttk.Scrollbar(table, orient="vertical", command=self.overview_tree.yview)
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.overview_tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.overview_tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.overview_tree.bind("<Double-1>", self._on_overview_double_click)
+        self._update_overview_headings()
+        self.main_notebook.bind("<<NotebookTabChanged>>", self._on_main_notebook_tab_changed)
+
+    def _is_overview_visible(self) -> bool:
+        if not hasattr(self, "overview_tree"):
+            return False
+        try:
+            return self.main_notebook.select() == str(self.overview_tab)
+        except tk.TclError:
+            return False
+
+    def _on_main_notebook_tab_changed(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        if not self._is_overview_visible():
+            return
+        # Nur zeichnen, wenn sich seit dem letzten Aufbau Datensaetze, Importstand oder Suchtext geaendert haben.
+        if self._overview_rendered_key != self._article_browser_render_key() or self._overview_rendered_search != self.overview_search_var.get():
+            self._render_overview()
+
+    def _refresh_overview_if_visible(self) -> None:
+        """Nach einem Neuaufbau des Verzeichnisses: die Uebersicht im naechsten Leerlauf-Tick
+        nachziehen (gebuendelt - im Massenimport kommt je Artikel ein Upsert)."""
+        if not self._is_overview_visible() or self._overview_render_after_id is not None:
+            return
+        self._overview_render_after_id = self.root.after_idle(self._run_deferred_overview_render)
+
+    def _run_deferred_overview_render(self) -> None:
+        self._overview_render_after_id = None
+        if self._is_overview_visible():
+            self._render_overview()
+
+    def refresh_overview(self) -> None:
+        """'Liste aktualisieren' in der Uebersicht: Dateien gegen die Signatur pruefen und neu zeichnen."""
+        self._refresh_article_browser()
+        self._render_overview()
+
+    def _overview_entry(self, article_number: str, snapshot: StoredArticleSnapshot, changed_at: str) -> tuple[list[str], list[object], str]:
+        """Zeile aus dem Cache (Objektidentitaet des Snapshots + Aenderungszeitpunkt), sonst neu bauen."""
+        cached = self._overview_rows_cache.get(article_number)
+        if cached is not None and cached[0]() is snapshot and cached[1] == changed_at:
+            return cached[2], cached[3], cached[4]
+        values, keys = overview_row_for_snapshot(snapshot, changed_at)
+        blob = "\n".join(values).casefold()
+        self._overview_rows_cache[article_number] = (weakref.ref(snapshot), changed_at, values, keys, blob)
+        return values, keys, blob
+
+    def _overview_visible_articles(self, changed_map: dict[str, str]) -> list[str]:
+        """Artikel, die der Suchtext der Uebersicht uebrig laesst (Begriffe wie im Verzeichnis:
+        alle muessen vorkommen - im Such-Blob des Artikels oder in den Zellen der Zeile)."""
+        records = self.article_browser_records
+        if len(self._overview_rows_cache) > len(records):
+            for cached_article in list(self._overview_rows_cache):
+                if cached_article not in records:
+                    del self._overview_rows_cache[cached_article]
+        tokens = [token.casefold() for token in self.overview_search_var.get().split()]
+        visible: list[str] = []
+        for article_number, snapshot in records.items():
+            _values, _keys, row_blob = self._overview_entry(article_number, snapshot, changed_map.get(article_number, ""))
+            if tokens:
+                blob = self._article_search_blob(article_number, snapshot)
+                if not all(token in blob or token in row_blob for token in tokens):
+                    continue
+            visible.append(article_number)
+        return visible
+
+    def _render_overview(self) -> None:
+        if not hasattr(self, "overview_tree"):
+            return
+        tree = self.overview_tree
+        query = self.overview_search_var.get()
+        self._overview_rendered_key = self._article_browser_render_key()
+        self._overview_rendered_search = query
+        records = self.article_browser_records
+        changed_map = changed_since_import_map(records, self.import_stand)
+        visible = self._overview_visible_articles(changed_map)
+        column_index = OVERVIEW_COLUMN_KEYS.index(self._overview_sort_column)
+        visible.sort(key=lambda article: self._overview_rows_cache[article][3][column_index], reverse=self._overview_sort_desc)
+        self._overview_visible = visible
+
+        selected = tree.selection()
+        selected_article = str(selected[0]) if selected else ""
+        tree.delete(*tree.get_children())
+        for article_number in visible:
+            entry = self._overview_rows_cache[article_number]
+            tree.insert("", "end", iid=article_number, values=entry[2], tags=(ARTICLE_CHANGED_ROW_TAG,) if entry[1] else ())
+        if selected_article and tree.exists(selected_article):
+            tree.selection_set(selected_article)
+            tree.focus(selected_article)
+
+        total = len(records)
+        changed_total = len(changed_map)
+        total_label = f"{total:,}".replace(",", ".")
+        if query.strip():
+            self.overview_count_var.set(
+                f"{len(visible):,}".replace(",", ".") + f" von {total_label} Artikeln ({changed_total} geändert seit Import)"
+            )
+        else:
+            self.overview_count_var.set(f"{total_label} Artikel ({changed_total} geändert seit Import)")
+
+    def _update_overview_headings(self) -> None:
+        if not hasattr(self, "overview_tree"):
+            return
+        arrow = " ▼" if self._overview_sort_desc else " ▲"
+        for key, label, _width, _anchor, _kind in OVERVIEW_COLUMNS:
+            self.overview_tree.heading(key, text=label + (arrow if key == self._overview_sort_column else ""))
+
+    def _overview_sort_by(self, column: str) -> None:
+        if column not in OVERVIEW_COLUMN_KEYS:
+            return
+        if column == self._overview_sort_column:
+            self._overview_sort_desc = not self._overview_sort_desc
+        else:
+            self._overview_sort_column = column
+            self._overview_sort_desc = False
+        self._update_overview_headings()
+        self._render_overview()
+
+    def _on_overview_search_changed(self, *_args: object) -> None:
+        # Entprellen wie im Verzeichnis (250 ms nach dem letzten Tastendruck).
+        self._cancel_overview_search_timer()
+        self._overview_search_after_id = self.root.after(250, self._apply_overview_search)
+
+    def _cancel_overview_search_timer(self) -> None:
+        if self._overview_search_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._overview_search_after_id)
+        except tk.TclError:
+            pass
+        self._overview_search_after_id = None
+
+    def _apply_overview_search(self) -> None:
+        self._overview_search_after_id = None
+        if not hasattr(self, "overview_tree"):
+            return
+        if self.overview_search_var.get() == self._overview_rendered_search and self._overview_rendered_key == self._article_browser_render_key():
+            return
+        self._render_overview()
+
+    def _clear_overview_search(self) -> None:
+        self.overview_search_var.set("")
+        self._cancel_overview_search_timer()
+        self._apply_overview_search()
+
+    def _on_overview_search_escape(self, _event: tk.Event[tk.Misc]) -> str:
+        self._clear_overview_search()
+        return "break"
+
+    def _on_overview_search_return(self, _event: tk.Event[tk.Misc]) -> str:
+        self._cancel_overview_search_timer()
+        self._apply_overview_search()
+        visible = self.overview_tree.get_children()
+        if len(visible) == 1:
+            article_number = str(visible[0])
+            self.overview_tree.selection_set(article_number)
+            self.overview_tree.focus(article_number)
+            self.overview_tree.see(article_number)
+        return "break"
+
+    def _on_overview_double_click(self, event: tk.Event[tk.Misc]) -> None:
+        item_id = self.overview_tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.load_article_from_overview(str(item_id))
+
+    def load_article_from_overview(self, article_number: str) -> bool:
+        """Doppelklick in der Uebersicht: Artikel wie aus dem Verzeichnis in die Maske laden."""
+        article_number = normalize_article_number(article_number)
+        if not article_number:
+            return False
+        if self.article_browser_tree.exists(article_number):
+            self.article_browser_tree.selection_set(article_number)
+            self.article_browser_tree.focus(article_number)
+            self.article_browser_tree.see(article_number)
+        return self._load_article_from_records(article_number)
+
+    def export_overview_to_excel(self, target_path: Path | None = None) -> Path | None:
+        """'Als Excel speichern…': die Uebersicht (aktuelle Suche und Sortierung) als XLSX, Blatt 'Übersicht'."""
+        # Immer den aktuellen Stand zeichnen - der Reiter kann noch nie sichtbar gewesen sein.
+        self._refresh_article_browser()
+        self._render_overview()
+        rows = [list(self._overview_rows_cache[article][2]) for article in self._overview_visible]
+        if target_path is None:
+            default_name = f"Uebersicht_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+            target = filedialog.asksaveasfilename(
+                title="Übersicht als Excel speichern",
+                defaultextension=".xlsx",
+                initialfile=default_name,
+                filetypes=[("Excel Dateien", "*.xlsx")],
+            )
+            if not target:
+                return None
+            target_path = Path(target)
+        try:
+            write_workbook(target_path, "Übersicht", list(OVERVIEW_HEADERS), rows)
+        except Exception as exc:
+            messagebox.showwarning(APP_TITLE, f"Die Übersicht konnte nicht gespeichert werden:\n{exc}")
+            return None
+        self.status_var.set(f"Übersicht gespeichert: {len(rows)} Artikel – {target_path}")
+        return target_path
+
     def _set_batch_ui_running(self, running: bool, total: int = 0) -> None:
         self.batch_import_running = running
         if running:
@@ -21174,6 +23799,10 @@ if ($copied) {{
             self.batch_cancel_button.configure(state="normal")
             self.batch_delete_list_button.configure(state="disabled")
             self.batch_resume_button.configure(state="disabled")
+            # Importstand und Loeschliste seit Import erst nach dem Lauf (siehe _import_stand_action_blocked).
+            self.import_done_button.configure(state="disabled")
+            self.import_stand_button.configure(state="disabled")
+            self.import_delete_list_button.configure(state="disabled")
             self.batch_progress_bar.configure(maximum=max(total, 1), value=0)
             self.batch_progress_var.set(f"0/{total} Artikel verarbeitet")
             self.batch_progress_bar.grid()
@@ -21182,6 +23811,9 @@ if ($copied) {{
             self.batch_import_button.configure(state="normal")
             self.batch_update_button.configure(state="normal")
             self.batch_cancel_button.configure(state="disabled")
+            self.import_done_button.configure(state="normal")
+            self.import_stand_button.configure(state="normal")
+            self.import_delete_list_button.configure(state="normal")
             self._update_ki_batch_resume_button()
 
     def _apply_batch_progress(self, done: int, total: int, detail: str, elapsed: float) -> None:
@@ -21204,6 +23836,7 @@ if ($copied) {{
 
     def _finish_batch_import(self, summary: dict[str, object]) -> None:
         self.live_write_suspended = False
+        self._batch_owns_output = False
         self._set_batch_ui_running(False)
         self.background_task_running = False
 
@@ -21227,6 +23860,28 @@ if ($copied) {{
         mask_article = normalize_article_number(self._mask_article_number)
         mask_unsaved: list[str] = []
         updated_articles = {normalize_article_number(article) for article in self.last_batch_updated_articles}
+        # Eingaben, die waehrend des Laufs in der Maske gemacht wurden, sind nicht gespeichert
+        # (Live-Speichern ausgesetzt). Bis v0.1.52 lud der Abschluss den letzten Artikel des
+        # Laufs darueber und verwarf sie still.
+        mask_note = ""
+        # Der Lauf hat den Artikel der Maske nicht neu geschrieben: nach dem Neuladen des
+        # Verzeichnisses (unten) zuerst sichern, bevor eine andere Maske geladen wird.
+        save_mask_first = bool(mask_article and mask_article not in updated_articles)
+        if (
+            not save_mask_first
+            and reload_article
+            and mask_article
+            and normalize_article_number(self.article_number_var.get()) == mask_article
+        ):
+            # Der Lauf hat den Artikel der Maske neu geschrieben: der Lauf gewinnt (wie bisher),
+            # aber nicht mehr still. Gescheiterte Bereiche behalten ihre gemerkte Eingabe.
+            failed_now = self._live_failed_sections.get(mask_article, set())
+            discarded = [section for section in self._unsaved_live_sections() if section not in failed_now]
+            if discarded:
+                mask_note = (
+                    f"Eingaben in {mask_article} ({format_live_section_labels(discarded)}) verworfen: "
+                    f"der Lauf ({self.batch_run_label}) hat den Artikel neu geschrieben."
+                )
         if not reload_article and mask_article and mask_article in updated_articles:
             # Vor dem Neuladen des Verzeichnisses pruefen: danach gilt der neue
             # Dateistand als gespeichert, und jede Abweichung der Maske zaehlt als offen.
@@ -21237,9 +23892,47 @@ if ($copied) {{
             if not mask_unsaved:
                 reload_article = mask_article
 
+        # Noch nicht vermerkte, im Lauf geaenderte Artikel ins Aenderungsjournal (auch nach
+        # Abbruch oder Fehlern) - vor dem Neuladen, das sonst nur noch die Zeilen-
+        # Zeitstempel saehe. Waehrend des Laufs vermerkt _flush_batch_changed_since schon
+        # laufend (Schliessen mitten im Lauf).
+        self._batch_drain_for_close = None
+        batch_output_root = str(summary.get("output_root") or "").strip()
+        if batch_output_root:
+            self._switch_batch_output_root(Path(batch_output_root))
+        self._flush_batch_changed_since()
+
         # Bewusst kein refresh_preview(): das würde für den geladenen Artikel
         # sofort Text-IDs generieren, auch wenn Texte nicht im Abrufumfang waren.
         self._refresh_article_browser()
+        if save_mask_first:
+            # Erst NACH dem Neuladen: der Abschluss eines Live-Auftrags merkt die Ordner-
+            # Signatur als aktuell - davor geschrieben, verdeckte er die Dateien des Laufs,
+            # und der letzte Artikel kaeme aus dem veralteten Eintrag in die Maske. Die
+            # Sperren sind schon frei; der Anker des Maskenartikels bleibt ueber das Neuladen.
+            with self._block_mask_switch():
+                self._save_mask_article_before_leaving(mask_article)
+                self._flush_live_writes(reason=f"{self.batch_run_label}: ")
+            if normalize_article_number(self._mask_article_number) != mask_article:
+                # Waehrend des Wartens (die Ereignisschleife laeuft) hat der Nutzer schon einen
+                # anderen Artikel geladen bzw. die Nummer geleert - sein Wechsel hat den alten
+                # Artikel gesichert. Die Nummer NICHT zuruecksetzen: Feld und Maske zeigten sonst
+                # verschiedene Artikel, und der naechste Fokusverlust schriebe den Maskeninhalt
+                # unter die falsche Nummer. Den letzten Artikel des Laufs nicht darueber laden.
+                reload_article = ""
+                mask_note = ""
+            else:
+                self.article_number_var.set(mask_article)
+                # Gescheiterte Bereiche (gesperrte Datei) behalten ihre gemerkte Eingabe; was
+                # sonst offen bleibt (fachlicher Fehler), stuende nur in der Maske - dann bleibt sie.
+                failed_now = self._live_failed_sections.get(mask_article, set())
+                lost = [section for section in self._unsaved_live_sections() if section not in failed_now]
+                if lost and reload_article:
+                    reload_article = ""
+                    mask_note = (
+                        f"{mask_article} bleibt in der Maske: {format_live_section_labels(lost)} nicht gespeichert – "
+                        "bitte korrigieren."
+                    )
         if reload_article:
             # Den zusammengeführten Eintrag aus der Artikelliste laden (nicht das
             # rohe Scrape-Ergebnis): so zeigt der Editor auch die nicht abgerufenen
@@ -21261,10 +23954,18 @@ if ($copied) {{
             if current_article in search_term_final and current_snapshot is not None:
                 with self._suspend_live_write():
                     self.search_term_frame.set_terms(current_snapshot.search_terms)
-                self._live_fingerprints[current_article] = (
-                    current_snapshot,
-                    live_section_fingerprints(bundle_from_snapshot(current_snapshot, self.attribute_key_values_by_group)),
-                )
+                # Nur den Suchwort-Anker nachziehen: die uebrigen Bereiche vergleichen weiter
+                # mit dem, was die Maske zeigt (siehe _live_saved_fingerprints) - sonst gaelte
+                # eine nicht neu geladene Maske in jedem vom Lauf geaenderten Bereich als offen.
+                previous_entry = self._live_fingerprints.get(current_article)
+                if previous_entry is not None and previous_entry[0] is not None:
+                    cache = dict(previous_entry[1])
+                    cache["search_terms"] = live_section_fingerprint(
+                        bundle_from_snapshot(current_snapshot, self.attribute_key_values_by_group), "search_terms"
+                    )[0]
+                else:
+                    cache = live_section_fingerprints(bundle_from_snapshot(current_snapshot, self.attribute_key_values_by_group))
+                self._live_fingerprints[current_article] = (current_snapshot, cache)
         run_label = self.batch_run_label
         error_list_path = str(summary.get("error_list_path") or "")
         error_list_hint = (
@@ -21385,9 +24086,12 @@ if ($copied) {{
             )
             error_list_hint += f"\nKI-Verbrauch: {ai_usage_in:,} in / {ai_usage_out:,} out Token ≈ {ai_cost:.2f} $".replace(",", ".")
 
+        status_suffix = f" – {mask_note}" if mask_note else ""
         if cancelled:
             self.batch_progress_var.set(f"Abgebrochen: {processed}/{total} Artikel verarbeitet, {success_count} erfolgreich")
-            self.status_var.set(f"{run_label} abgebrochen: {success_count} von {processed} verarbeiteten Artikeln erfolgreich")
+            self.status_var.set(
+                f"{run_label} abgebrochen: {success_count} von {processed} verarbeiteten Artikeln erfolgreich{status_suffix}"
+            )
             self._show_batch_completion_dialog(
                 "cancel",
                 f"{run_label} abgebrochen.\n\nVerarbeitet: {processed} von {total}\nErfolgreich geschrieben: {success_count}{error_list_hint}",
@@ -21402,7 +24106,7 @@ if ($copied) {{
                 f"Fertig mit Fehlern: {success_count}/{total} Artikel erfolgreich"
                 + (f" – Fehlerliste: {BATCH_ERROR_LIST_FILENAME}" if error_list_path else "")
             )
-            self.status_var.set(f"{run_label} abgeschlossen mit Fehlern: {success_count}/{total} erfolgreich")
+            self.status_var.set(f"{run_label} abgeschlossen mit Fehlern: {success_count}/{total} erfolgreich{status_suffix}")
             self._show_batch_completion_dialog(
                 "warn",
                 f"{run_label} abgeschlossen und direkt in den Output-Pfad geschrieben: {success_count} von {total} Produkten erfolgreich.\n\nFehler:\n{preview}{error_list_hint}",
@@ -21411,7 +24115,7 @@ if ($copied) {{
             )
         else:
             self.batch_progress_var.set(f"Fertig: {success_count}/{total} Artikel erfolgreich verarbeitet")
-            self.status_var.set(f"{run_label} abgeschlossen: {success_count}/{total} Produkte erfolgreich")
+            self.status_var.set(f"{run_label} abgeschlossen: {success_count}/{total} Produkte erfolgreich{status_suffix}")
             self._show_batch_completion_dialog(
                 "info",
                 f"{run_label} erfolgreich abgeschlossen:\n{success_count} Produkte verarbeitet und direkt in den Output-Pfad geschrieben.{error_list_hint}",
@@ -21569,6 +24273,9 @@ if ($copied) {{
         signature: tuple[tuple[str, int, int], ...] = ()
 
         # Leerer Ausgabeordner: Path("") waere "." und listete das Arbeitsverzeichnis.
+        # Importstand immer mit pruefen (ein stat-Aufruf): eine andere Instanz kann
+        # ihn gesetzt haben, und er steckt in der Render-Kennung.
+        self._load_import_stand(output_folder if output_text and output_folder.exists() else None)
         if output_text and output_folder.exists():
             if self._ims_sync_running or (self.article_browser_cache_dir == str(output_folder) and not self.live_writer.is_idle()):
                 # Der Hintergrund-Schreiber (oder die IMS-Uebernahme) ist gerade an
@@ -21619,14 +24326,26 @@ if ($copied) {{
         self._article_browser_reload_pending = False
         self._render_article_browser()
 
-    def _article_browser_render_key(self) -> tuple[tuple[str, int], ...]:
+    def _article_browser_render_key(self) -> tuple[object, ...]:
         """Kennung des Datenstands der Artikelliste.
 
         Jeder Upsert ersetzt den Snapshot eines Artikels durch ein neues Objekt
         (siehe _copy_snapshot/_snapshot_from_bundle), daher reicht die Objekt-
         Identitaet je Artikel, um "seit dem letzten Aufbau geaendert" zu erkennen.
+        Der Apollo-Importstand steht mit in der Kennung: 'Import erledigt' oder ein
+        neuer Stand aus einer anderen Instanz faerbt die Zeilen um.
         """
-        return tuple((article_number, id(snapshot)) for article_number, snapshot in self.article_browser_records.items())
+        stand = self.import_stand
+        stand_key = (
+            (
+                stand.get("last_import_at"),
+                tuple(stand.get("deleted_since") or ()),
+                tuple((stand.get("changed_since") or {}).items()),
+            )
+            if stand
+            else None
+        )
+        return (stand_key, *((article_number, id(snapshot)) for article_number, snapshot in self.article_browser_records.items()))
 
     def _sync_article_browser_selection(self) -> None:
         """Gleicht Auswahl und Detailansicht ab, ohne die Liste neu aufzubauen."""
@@ -21727,7 +24446,10 @@ if ($copied) {{
             # juenger als der Verzeichnis-Eintrag (der wird erst nach dem
             # Schreiben nachgezogen). Sonst wuerde die Maske auf den alten Stand
             # zurueckfallen und die naechste Aenderung ihn auch auf den
-            # Datentraeger zurueckschreiben.
+            # Datentraeger zurueckschreiben. Ein noch laufender Nachholer einer gemerkten
+            # Eingabe zaehlt nicht (latest_bundle): sein Bundle ist alt - die Maske zeigt
+            # dann den Dateistand, die gescheiterten Bereiche stellt
+            # _restore_failed_sections_into_mask aus der gemerkten Eingabe wieder her.
             snapshot = self._snapshot_from_bundle(queued_bundle, snapshot.source_folder)
         self.article_number_var.set(snapshot.article_number)
         self.current_id_article_number = snapshot.article_number
@@ -21770,11 +24492,37 @@ if ($copied) {{
         # geschriebenen Artikel (kein Eintrag) bleibt (None, Fingerabdruecke) -
         # sonst gaelten alle nicht eingereihten Bereiche als unbekannt, und der
         # naechste Fokusverlust haengte leere Text-/Kurzbezeichnungszeilen an.
+        # Fingerabdruecke aus dem, was die Maske nach dem Fuellen zeigt (ohne neue
+        # Text-IDs): normalisiert eine Maske beim Fuellen etwas anders als der
+        # Verzeichnis-Eintrag (z. B. GenArt-Bezeichnung aus dem Katalog), gilt das nicht
+        # als Eingabe - geschrieben wird ein Bereich erst nach einer echten Aenderung.
+        try:
+            mask_bundle = self.collect_bundle(ensure_ids=False)
+        except ValueError:
+            mask_bundle = bundle_from_snapshot(snapshot, self.attribute_key_values_by_group)
         self._live_fingerprints[snapshot.article_number] = (
             self.article_browser_records.get(snapshot.article_number),
-            live_section_fingerprints(bundle_from_snapshot(snapshot, self.attribute_key_values_by_group)),
+            live_section_fingerprints(mask_bundle),
         )
-        self.status_var.set(f"Artikel geladen: {snapshot.article_number} ({snapshot.source_label})")
+        # Bereiche, deren Schreiben gescheitert ist (auch erst nach dem Verlassen des
+        # Artikels): die Eingabe zurueck in die Maske, statt sie mit dem Dateistand zu
+        # verdecken - der Nachholer (Marker bleibt) schriebe sonst den Dateistand und
+        # die Eingabe waere still verloren. Erst NACH dem Anker: der gespeicherte Stand
+        # dieser Bereiche bleibt der der Dateien.
+        self._mask_restore_notice = ""
+        restored = self._restore_failed_sections_into_mask(snapshot)
+        if restored:
+            files_hint = ", ".join(
+                name for section in restored for name in LIVE_SECTION_FILES.get(section, ())
+            )
+            self._mask_restore_notice = (
+                f"{format_live_section_labels(set(restored))} noch nicht in den Dateien ({files_hint} gesperrt?): "
+                "Eingabe wiederhergestellt, sie wird beim nächsten Speichern erneut geschrieben."
+            )
+        self.status_var.set(
+            f"Artikel geladen: {snapshot.article_number} ({snapshot.source_label})"
+            + (f" – {self._mask_restore_notice}" if self._mask_restore_notice else "")
+        )
 
     @perf_logged("load_selected_article_from_browser")
     def load_selected_article_from_browser(self) -> None:
@@ -21790,22 +24538,74 @@ if ($copied) {{
             messagebox.showwarning(APP_TITLE, "Bitte zum Laden genau einen Artikel im Verzeichnis auswählen.")
             return
 
+        self._load_article_from_records(selection[0])
+
+    def _load_article_from_records(self, article_number: str) -> bool:
+        """Laedt einen Artikel des Verzeichnisses in die Maske (Verzeichnis und Uebersicht).
+
+        Zeigt die Maske einen anderen Artikel, gilt das wie ein getippter Artikelwechsel
+        (_switch_mask_article): offene Aenderungen erst unter dem bisherigen Artikel
+        sichern; was sich nicht sichern laesst (fachlicher Fehler, gesperrte Datei),
+        bricht das Laden mit Meldung ab - die Maske bleibt beim bisherigen Artikel.
+        Bis v0.1.52 lud der Doppelklick ohne diese Pruefung, und eine nicht
+        gespeicherte Eingabe war still verloren. Derselbe Artikel wird wie bisher
+        einfach neu geladen.
+        """
+        article_number = normalize_article_number(article_number)
+        if self._ims_sync_running:
+            self.status_var.set("IMS-Übernahme läuft noch - bitte danach aus dem Verzeichnis laden.")
+            return False
+        if self._mask_switch_busy():
+            return False
+        previous = normalize_article_number(self._mask_article_number)
+        # Lade-Anker des bisherigen Artikels ueber den Abgleich retten (wie
+        # _switch_mask_article, Schritt 0): ersetzt der Abgleich seinen Eintrag, zaehlen
+        # beim Sichern nur die eigenen Eingaben, nicht die Fremdaenderung.
+        stale_anchor = self._live_fingerprints.get(previous) if previous else None
         # Erst gegen die Dateien abgleichen (Signatur-Pruefung, ohne Aenderung nur ein
         # paar stat-Aufrufe): wurden die Output-Dateien ausserhalb dieser App geaendert
         # (zweite Instanz, Bereinigung, Excel), muss die Maske den aktuellen Stand
         # zeigen - sonst schreibt das naechste Speichern den veralteten Stand zurueck.
-        selected_article = selection[0]
         self._refresh_article_browser()
-        snapshot = self.article_browser_records.get(selected_article)
+        batch_note = ""
+        if previous and previous != article_number:
+            record = self.article_browser_records.get(previous)
+            if stale_anchor is not None and stale_anchor[0] is not None and stale_anchor[0] is not record:
+                self._live_fingerprints[previous] = (record, dict(stale_anchor[1]))
+            unsaved = self._save_mask_article_before_leaving(previous)
+            if unsaved and self._batch_owns_output:
+                # Massenimport: Speichern ausgesetzt - fragen (wie der getippte Wechsel).
+                leave_note = self._confirm_leave_during_batch(previous, unsaved, f"{article_number} laden")
+                if leave_note is None:
+                    return False
+                batch_note = leave_note
+            elif unsaved:
+                self._report_switch_aborted(previous, unsaved)
+                # Die Meldung kommt hier direkt (kein folgender Klick wie beim Tippen).
+                message = self._mask_switch_aborted
+                self._mask_switch_aborted = ""
+                messagebox.showwarning(
+                    APP_TITLE,
+                    f"{message}\n\n{article_number} wurde nicht geladen. Bitte zuerst korrigieren, "
+                    "dann den Artikel erneut laden.",
+                )
+                return False
+        # Nach dem Verlassen gescheiterte Eingaben des Ziel-Artikels zuerst nachholen.
+        self._retry_failed_live_write(article_number)
+        snapshot = self.article_browser_records.get(article_number)
         if snapshot is None:
             messagebox.showwarning(APP_TITLE, "Der ausgewählte Artikel konnte nicht geladen werden.")
-            return
+            return False
 
         # Beim Befuellen der Maske darf kein Live-Schreiben auf das Netzlaufwerk
         # ausgeloest werden (der Batch-Pfad macht das genauso).
         with self._suspend_live_write():
             self._apply_article_snapshot(snapshot)
         self.refresh_preview()
+        self._append_mask_restore_notice()
+        if batch_note:
+            self.status_var.set(f"{self.status_var.get()} – {batch_note}")
+        return True
 
     def _on_article_browser_select(self, _event: tk.Event[tk.Misc]) -> None:
         selection = self.article_browser_tree.selection()
@@ -21889,6 +24689,7 @@ if ($copied) {{
             )
             self.status_var.set("Löschen abgebrochen: Output-Dateien sind gerade belegt.")
             return
+        delete_error: Exception | None = None
         try:
             for file_spec, headers in [
                 (SHORT_TEXT_FILE, SHORT_TEXT_HEADERS),
@@ -21908,18 +24709,29 @@ if ($copied) {{
             ]:
                 remove_article_rows_from_workbook(output_root / file_spec[0], file_spec[1], headers, set(article_numbers))
         except Exception as exc:  # pragma: no cover - defensive UI feedback
-            messagebox.showerror(APP_TITLE, f"Artikel konnten nicht gelöscht werden:\n{exc}")
-            self.status_var.set(f"Löschen fehlgeschlagen: {exc}")
-            return
+            delete_error = exc
         finally:
             WORKBOOK_WRITE_LOCK.release()
+        if delete_error is not None:
+            # Mittendrin gescheitert (z. B. Bilder.xlsx in Excel geoeffnet): die Dateien davor
+            # sind schon ohne die Artikel geschrieben - trotzdem im Aenderungsjournal vermerken,
+            # sonst fehlte ein halb geloeschter Artikel (alte Zeitstempel) auf der Loeschliste,
+            # waehrend Apollo noch den vollstaendigen alten Artikel hat.
+            self._note_deleted_since_import(output_root, article_numbers)
+            messagebox.showerror(APP_TITLE, f"Artikel konnten nicht gelöscht werden:\n{delete_error}")
+            self.status_var.set(f"Löschen fehlgeschlagen: {delete_error}")
+            return
 
         for article_number in article_numbers:
             self.article_browser_records.pop(article_number, None)
             self._article_search_blob_cache.pop(article_number, None)
-            # Gemerkte Platten-Staende und Nachholer des geloeschten Artikels verfallen.
+            # Gemerkte Platten-Staende und Nachholer (samt gemerkter Eingabe) des
+            # geloeschten Artikels verfallen.
             self._live_fingerprints.pop(article_number, None)
-            self._live_failed_sections.pop(article_number, None)
+            self._drop_live_failed_sections(article_number)
+        # Geloeschte Artikel stehen in keiner Output-Datei mehr, muessen aber vor dem
+        # naechsten Apollo-Import trotzdem auf die Loeschliste: im Importstand merken.
+        self._note_deleted_since_import(output_root, article_numbers)
         mask_cleared = False
         if self._mask_article_number in article_numbers or normalize_article_number(self.article_number_var.get()) in article_numbers:
             # Die Maske zeigte einen geloeschten Artikel: leeren (Entwurfsmodus ohne
@@ -22009,12 +24821,15 @@ if ($copied) {{
             self.status_var.set("Suchwort-Import abgebrochen: Output-Dateien sind gerade belegt.")
             return
         started = time.perf_counter()
+        changed_articles: set[str] = set()
         try:
             # Wirft nur, wenn die Gebrauchsnummern.xlsx selbst nicht geschrieben
             # werden konnte (dann ist nichts geschrieben). Eine gescheiterte
             # Raeumung der 9595-Altzeilen kommt als Warnung zurueck - der Import
             # ist dann trotzdem vollstaendig und wird unten normal nachgezogen.
-            final_terms, legacy_warning = apply_search_term_import(output_root, imported.terms_by_article, mode)
+            final_terms, legacy_warning = apply_search_term_import(
+                output_root, imported.terms_by_article, mode, changed_articles=changed_articles
+            )
         except Exception as exc:  # pragma: no cover - defensive UI feedback (z. B. Datei in Excel geoeffnet)
             messagebox.showerror(APP_TITLE, f"Die Suchwörter konnten nicht geschrieben werden:\n{exc}")
             self.status_var.set(f"Suchwort-Import fehlgeschlagen: {exc}")
@@ -22022,8 +24837,14 @@ if ($copied) {{
         finally:
             WORKBOOK_WRITE_LOCK.release()
 
+        # Im Aenderungsjournal des Importstands vermerken (auch ohne gesetzten Stand):
+        # beim Ersetzen durch eine leere Liste bleibt in der Datei kein juengerer
+        # Zeitstempel - nach dem naechsten Laden von der Platte waere der Artikel sonst
+        # nicht mehr markiert.
+        written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._note_changed_since_import(output_root, {article: written_at for article in sorted(changed_articles)})
         if records_in_sync:
-            self._apply_search_term_import_to_memory(final_terms, output_root)
+            self._apply_search_term_import_to_memory(final_terms, output_root, changed_articles, written_at)
         else:
             self._request_article_browser_reload()
             self._refresh_article_browser()
@@ -22069,7 +24890,13 @@ if ($copied) {{
         else:
             messagebox.showinfo(APP_TITLE, "\n".join(summary))
 
-    def _apply_search_term_import_to_memory(self, final_terms: dict[str, list[str]], output_root: Path) -> None:
+    def _apply_search_term_import_to_memory(
+        self,
+        final_terms: dict[str, list[str]],
+        output_root: Path,
+        changed_articles: set[str] | None = None,
+        written_at: str = "",
+    ) -> None:
         """Zieht nach apply_search_term_import Verzeichnis, Fingerabdruecke und Maske nach.
 
         Je betroffenem Artikel ein neuer Snapshot (Objektidentitaet steuert
@@ -22077,9 +24904,12 @@ if ($copied) {{
         den neuen Plattenstand - sonst hielte der Dirty-Check die Maske fuer
         geaendert bzw. wuerde den Import beim naechsten Fokusverlust
         zurueckdrehen. Die uebrigen Bereiche behalten ihren bekannten
-        Platten-Fingerabdruck (siehe _on_live_write_done).
+        Platten-Fingerabdruck (siehe _on_live_write_done). Den Schreibzeitpunkt
+        ('geaendert seit Apollo-Import') bekommen nur die Artikel aus
+        `changed_articles` (None = alle) - wie die Zeilen auf der Platte.
         """
         current_article = normalize_article_number(self.article_number_var.get())
+        written_at = written_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for article, terms in final_terms.items():
             existing_snapshot = self.article_browser_records.get(article)
             if existing_snapshot is not None:
@@ -22087,20 +24917,26 @@ if ($copied) {{
             else:
                 snapshot = StoredArticleSnapshot(article_number=article, source_label="Output", source_folder=output_root)
             snapshot.search_terms = list(terms)
+            if changed_articles is None or article in changed_articles:
+                snapshot.note_written_at("search_terms", written_at)
             self.article_browser_records[article] = snapshot
             self._article_search_blob_cache.pop(article, None)
 
             prev_entry = self._live_fingerprints.get(article)
-            cache = dict(prev_entry[1]) if prev_entry is not None and prev_entry[0] is existing_snapshot else {}
+            # Gemerkten Stand behalten, solange er zum Eintrag passt - nach einem ersetzten
+            # Eintrag nur fuer den Artikel in der Maske (siehe _live_saved_fingerprints).
+            keep = prev_entry is not None and (
+                prev_entry[0] is existing_snapshot
+                or (prev_entry[0] is not None and article == normalize_article_number(self._mask_article_number))
+            )
+            cache = dict(prev_entry[1]) if keep else {}
             cache["search_terms"] = live_section_fingerprint(
                 bundle_from_snapshot(snapshot, self.attribute_key_values_by_group), "search_terms"
             )[0]
             self._live_fingerprints[article] = (snapshot, cache)
-            failed_sections = self._live_failed_sections.get(article)
-            if failed_sections:
-                failed_sections.discard("search_terms")
-                if not failed_sections:
-                    self._live_failed_sections.pop(article, None)
+            # Der Import hat die Suchwoerter geschrieben: ein gescheiterter Suchwort-
+            # Nachholer (samt gemerkter Eingabe) ist damit ueberholt.
+            self._drop_live_failed_sections(article, {"search_terms"})
 
         if current_article in final_terms:
             with self._suspend_live_write():
@@ -22195,8 +25031,176 @@ if ($copied) {{
         expected.update(self.live_writer.completed_fingerprints(article_number))
         expected.update(self.live_writer.expected_fingerprints(article_number))
         unsaved = {section for section in LIVE_SECTIONS if expected.get(section) != live_section_fingerprint(bundle, section)[0]}
-        unsaved |= self._live_failed_sections.get(article_number, set())
+        failed = self._live_failed_sections.get(article_number, set())
+        unsaved |= failed
+        if article_number in self.article_browser_records:
+            # Wie _submit_live_write: nur eine neu erzeugte Modul-ID ohne Text ist nichts
+            # Offenes - ausser der Bereich ist gescheitert.
+            unsaved -= text_sections_with_only_new_module_id(bundle, unsaved, expected) - failed
         return [section for section in LIVE_SECTIONS if section in unsaved]
+
+    def _drop_live_failed_sections(self, article_number: str, sections: set[str] | None = None) -> None:
+        """Gescheiterte Bereiche austragen (None = alle), weil sie inzwischen geschrieben
+        bzw. ueberholt sind (Live-Speichern, Massenimport, Export, Suchwort-Import,
+        Loeschen, neuer Artikel). Ist nichts mehr offen, entfaellt auch die gemerkte Eingabe."""
+        failed = self._live_failed_sections.get(article_number)
+        if failed is not None and sections is not None:
+            failed -= sections
+        if failed is None or sections is None or not failed:
+            self._live_failed_sections.pop(article_number, None)
+            self._live_failed_bundles.pop(article_number, None)
+
+    def _failed_live_write_entry(self, article_number: str) -> tuple[ExportBundle, Path, dict[str, str]] | None:
+        """Gemerkte Eingabe des Artikels zu seinen gescheiterten Bereichen - nur fuer den
+        aktuellen Ausgabeordner (sonst None: ein anderer Ordner wird nicht beschrieben)."""
+        entry = self._live_failed_bundles.get(article_number)
+        if entry is None or not self._live_failed_sections.get(article_number):
+            return None
+        output_text = self.output_dir_var.get().strip()
+        if not output_text or str(entry[1]) != str(Path(output_text)):
+            return None
+        return entry
+
+    def _live_failed_files_hint(self, sections: set[str] | list[str]) -> str:
+        """Satz fuer Meldungen: welche Output-Dateien sich nicht schreiben liessen."""
+        files: list[str] = []
+        for section in LIVE_SECTIONS:
+            if section in sections:
+                for name in LIVE_SECTION_FILES.get(section, ()):
+                    if name not in files:
+                        files.append(name)
+        if not files:
+            return ""
+        names = ", ".join(files)
+        verb = "konnte" if len(files) == 1 else "konnten"
+        return (
+            f"{names} {verb} nicht geschrieben werden (z. B. in Excel geöffnet) – "
+            "bitte die Datei schließen und erneut versuchen."
+        )
+
+    def _retry_failed_live_write(self, article_number: str) -> bool:
+        """Vor dem Laden eines Artikels in die Maske: Bereiche, deren Schreiben scheiterte
+        (auch erst nachdem der Artikel verlassen wurde), mit der gemerkten Eingabe erneut
+        schreiben und begrenzt darauf warten. Gelingt es, wird der Artikel aus den Dateien
+        neu gelesen (kein Upsert aus dem alten Bundle, siehe LiveWriteJob.stored_input) und
+        der Aufrufer laedt den geschriebenen Stand samt inzwischen geaenderter anderer
+        Bereiche; scheitert es wieder (oder ist es nach der Wartezeit noch nicht fertig),
+        stellt _apply_article_snapshot die Eingabe in der Maske wieder her. Rueckgabe True,
+        wenn ein Versuch lief (der Aufrufer holt den Verzeichnis-Eintrag dann neu)."""
+        if self._batch_owns_output or self._closing:
+            return False
+        if self._failed_live_write_entry(article_number) is None:
+            return False
+        if not self.live_writer.is_idle():
+            # Erst abschliessen, was noch laeuft - ein wartender Auftrag des Artikels
+            # traegt ohnehin den juengsten Stand (samt gescheiterter Bereiche).
+            self._flush_live_writes(reason=f"{article_number}: ")
+        entry = self._failed_live_write_entry(article_number)
+        if entry is None:
+            return True
+        bundle, output_root, fingerprints = entry
+        self.live_writer.submit(
+            LiveWriteJob(
+                article_number=article_number,
+                sections=set(self._live_failed_sections.get(article_number, set())),
+                bundle=bundle,
+                output_root=output_root,
+                fingerprints=dict(fingerprints),
+                stored_input=True,
+            )
+        )
+        self._schedule_live_write_poll()
+        # Waehrend des Wartens laeuft die Ereignisschleife: ein Fokusverlust der
+        # Artikelnummer darf das gerade laufende Laden nicht ein zweites Mal ausloesen.
+        self._live_retry_running = True
+        try:
+            completed = self._flush_live_writes(reason=f"{article_number}: gescheiterte Eingaben nachholen – ")
+        finally:
+            self._live_retry_running = False
+        if completed and self._article_browser_reload_pending:
+            # Geschrieben: der Abschluss hat das Neuladen angefordert (kein Upsert aus dem
+            # alten Bundle) - jetzt sofort, damit der Aufrufer den Dateistand laedt.
+            self._refresh_article_browser()
+        return True
+
+    def _retry_failed_live_writes_on_close(self) -> None:
+        """Schliessen: gescheiterte Bereiche verlassener Artikel mit der gemerkten Eingabe
+        noch einmal einreihen (der Artikel in der Maske schreibt aus der Maske). Gewartet
+        wird beim Aufrufer; was weiter scheitert, nennt die Warnung vor dem Beenden."""
+        if self._batch_owns_output:
+            return
+        mask_article = normalize_article_number(self.article_number_var.get())
+        for article_number in list(self._live_failed_bundles):
+            if article_number == mask_article or self.live_writer.latest_bundle(article_number) is not None:
+                continue
+            entry = self._failed_live_write_entry(article_number)
+            if entry is None:
+                continue
+            bundle, output_root, fingerprints = entry
+            self.live_writer.submit(
+                LiveWriteJob(
+                    article_number=article_number,
+                    sections=set(self._live_failed_sections.get(article_number, set())),
+                    bundle=bundle,
+                    output_root=output_root,
+                    fingerprints=dict(fingerprints),
+                    stored_input=True,
+                )
+            )
+        self._schedule_live_write_poll()
+
+    def _restore_failed_sections_into_mask(self, snapshot: StoredArticleSnapshot) -> list[str]:
+        """Nach dem Fuellen der Maske (in _apply_article_snapshot): gescheiterte Bereiche
+        des Artikels aus der gemerkten Eingabe wiederherstellen, statt den Dateistand zu
+        zeigen. Der Marker bleibt, der naechste Speichervorgang schreibt also die Eingabe
+        (nie den Dateistand); der gespeicherte Stand dieser Bereiche bleibt der der Dateien.
+        Rueckgabe: wiederhergestellte Bereiche."""
+        article_number = snapshot.article_number
+        entry = self._failed_live_write_entry(article_number)
+        if entry is None or self.live_writer.latest_bundle(article_number) is not None:
+            # Ein noch wartender Auftrag hat den Stand schon geliefert (juengster Stand). Ein
+            # noch laufender Nachholer zaehlt nicht (latest_bundle): dann wiederherstellen.
+            return []
+        bundle = entry[0]
+        failed = [section for section in LIVE_SECTIONS if section in self._live_failed_sections.get(article_number, set())]
+        for section in failed:
+            if section == "short_text":
+                self.short_module_id_var.set(bundle.short_module_id or self.short_module_id_var.get())
+                self.short_text_frame.set_value(bundle.short_texts, auto_uni=bundle.short_auto_uni)
+            elif section == "long_text":
+                self.long_module_id_var.set(bundle.long_module_id or self.long_module_id_var.get())
+                self.long_text_frame.set_value(bundle.long_texts, auto_uni=bundle.long_auto_uni)
+            elif section == "genart":
+                self._set_selected_genart_selections(bundle.genart_selections)
+            elif section == "oe_numbers":
+                self.oe_frame.set_rows(bundle.oe_number_rows)
+            elif section == "comparison_numbers":
+                self.comparison_frame.set_rows(bundle.comparison_number_rows)
+            elif section == "search_terms":
+                self.search_term_frame.set_terms(bundle.search_terms)
+            elif section == "vehicle_links":
+                self.vehicle_link_frame.set_rows(bundle.vehicle_link_rows)
+            elif section == "article_lists":
+                self.article_list_frame.set_rows(bundle.article_list_rows)
+            elif section == "attributes":
+                self.attribute_frame.set_rows(bundle.attribute_rows)
+            elif section == "images":
+                self.image_frame.set_rows(bundle.image_rows)
+            elif section == "documents":
+                self.document_frame.set_rows(bundle.document_rows)
+            elif section == "videos":
+                self.video_frame.set_rows(bundle.video_rows)
+            elif section == "web_links":
+                self.web_frame.set_rows(bundle.web_rows)
+                self.kunzer_product_url_var.set(bundle.web_rows[0].path_or_link if bundle.web_rows else "")
+        return failed
+
+    def _append_mask_restore_notice(self) -> None:
+        """Hinweis des letzten Ladens (wiederhergestellte Eingaben) an die Statuszeile haengen,
+        falls die Statuszeile nach dem Laden ueberschrieben wurde."""
+        current = self.status_var.get()
+        if self._mask_restore_notice and self._mask_restore_notice not in current:
+            self.status_var.set(f"{current} – {self._mask_restore_notice}")
 
     def _prepare_output_for_ims_sync(self) -> bool:
         """Schreibt offene Aenderungen der Maske, leert die Warteschlange und prueft,
@@ -22363,6 +25367,9 @@ if ($copied) {{
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
             return False
+        # Maskenstand vor dem Export (export_bundle ersetzt Medien-Links durch lokale Pfade):
+        # nach dem Export in den festen Pfad der gespeicherte Stand fuer das Live-Speichern.
+        mask_fingerprints = live_section_fingerprints(bundle)
 
         # Offene Live-Auftraege zuerst abschliessen, dann unter der Datei-Sperre
         # exportieren - der manuelle Export soll den juengsten Stand enthalten
@@ -22380,18 +25387,51 @@ if ($copied) {{
             )
             self.status_var.set("Export abgebrochen: Output-Dateien sind gerade belegt.")
             return False
+        fixed_path = bool(self.fixed_export_path_var.get())
+        # Fester Pfad: Bereiche, deren Zeilen sich wirklich geaendert haben - wie beim
+        # Live-Speichern im Verzeichnis-Eintrag stempeln und im Aenderungsjournal
+        # vermerken (ein komplett geleerter Bereich hinterlaesst keinen Zeitstempel).
+        changed_sections: set[str] = set()
+        export_error: Exception | None = None
         try:
-            export_dir = export_bundle(bundle, output_root, use_timestamp_subdir=not self.fixed_export_path_var.get())
+            export_dir = export_bundle(
+                bundle, output_root, use_timestamp_subdir=not fixed_path, changed_sections=changed_sections
+            )
         except Exception as exc:  # pragma: no cover - defensive user feedback
-            messagebox.showerror(APP_TITLE, f"Export fehlgeschlagen:\n{exc}")
-            self.status_var.set(f"Export fehlgeschlagen: {exc}")
-            return False
+            export_error = exc
         finally:
             WORKBOOK_WRITE_LOCK.release()
 
+        note_failure = ""
+        if fixed_path and changed_sections:
+            # Auch nach einem Fehler mittendrin: schon geaenderte (z. B. geleerte) Bereiche vermerken.
+            written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if export_error is None:
+                self._upsert_article_browser_from_bundle(
+                    bundle, output_root, stamp={section: written_at for section in changed_sections}
+                )
+            note_failure = self._note_changed_since_import(output_root, {bundle.article_number: written_at})
+        if export_error is not None:
+            messagebox.showerror(APP_TITLE, f"Export fehlgeschlagen:\n{export_error}")
+            self.status_var.set(f"Export fehlgeschlagen: {export_error}")
+            return False
         self.refresh_preview()
-        if self.fixed_export_path_var.get():
-            self.status_var.set(f"Exportdateien im festen Pfad aktualisiert: {export_dir}")
+        if fixed_path:
+            # Der Export hat alle Bereiche aus der Maske geschrieben: gescheiterte
+            # Nachholer des Artikels (samt gemerkter Eingabe) sind erledigt.
+            self._drop_live_failed_sections(bundle.article_number)
+        if fixed_path and bundle.article_number in self.article_browser_records:
+            # Die Dateien enthalten jetzt den Maskenstand: wie nach dem Live-Speichern
+            # verankern (das Neuladen ersetzt den Eintrag, der gemerkte Stand bliebe sonst
+            # der vom Laden - die exportierten Eingaben gaelten weiter als offen).
+            self._live_fingerprints[bundle.article_number] = (
+                self.article_browser_records[bundle.article_number],
+                mask_fingerprints,
+            )
+        if fixed_path:
+            self.status_var.set(
+                f"Exportdateien im festen Pfad aktualisiert: {export_dir}" + (f" – {note_failure}" if note_failure else "")
+            )
             messagebox.showinfo(APP_TITLE, f"Exportdateien erfolgreich aktualisiert:\n{export_dir}")
         else:
             self.status_var.set(f"Export erstellt: {export_dir}")
