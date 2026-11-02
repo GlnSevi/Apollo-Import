@@ -29,7 +29,7 @@ import tkinter as tk
 import unicodedata
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 # Laeuft diese Datei als Skript oder EXE, heisst das Modul '__main__'. Unter seinem
 # Dateinamen registriert, bekommt `import apollo_import_gui` (z. B. aus taf_sync)
@@ -128,7 +128,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.52"
+APP_VERSION = "0.1.53"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -768,8 +768,17 @@ class CompetitorOption:
 class VehicleLinkRow:
     """Eine Fahrzeugverknüpfung eines Artikels (ein Fahrzeug / KTyp).
 
-    Ein Fahrzeug trägt beide KTyp-Nummern (Topmotive + TecDoc); beim Export
-    wird daraus je Nummer eine Zeile erzeugt.
+    Ein Fahrzeug trägt beide KTyp-Nummern (Topmotive + TecDoc); exportiert wird
+    nur die TecDoc-Nummer, je verknüpfter GenArt eine Zeile (Apollo liest KTypNr
+    immer als TecDoc-KTyp, Topmotive-Nummern bezeichnen dort andere Fahrzeuge).
+
+    genart_ids: GenArts, mit denen das Fahrzeug in der Datei verknüpft war (in
+    Datei-Reihenfolge); beide Listen leer = mit allen GenArts des Artikels (neues Fahrzeug).
+    excluded_genart_ids: GenArts, die der Artikel beim Laden hatte, das Fahrzeug
+    aber nicht (IMS führt Fahrzeuge je GenArt). Eine später hinzugefügte GenArt
+    steht in keiner der beiden Listen und gilt deshalb für alle Fahrzeuge; eine
+    entfernte GenArt wird aus beiden Listen gestrichen, und ein Fahrzeug, das danach
+    an keiner GenArt des Artikels mehr hängt, fällt weg (vehicle_rows_after_genart_removal).
     """
 
     vehicle_type_id: str = DEFAULT_VEHICLE_TYPE_ID
@@ -783,6 +792,8 @@ class VehicleLinkRow:
     year_from: str = ""
     year_to: str = ""
     power: str = ""
+    genart_ids: tuple[str, ...] = ()
+    excluded_genart_ids: tuple[str, ...] = ()
 
     def has_ktyp(self) -> bool:
         return bool(self.ktyp_topmotive.strip() or self.ktyp_tecdoc.strip())
@@ -1150,6 +1161,9 @@ class StoredArticleSnapshot:
     last_written: dict[str, str] = field(default_factory=dict)
     last_written_at: str = ""
     first_written_at: str = ""
+    # Hinweis beim Laden: Zeilen der Fahrzeugdatei, die nicht zu den GenArts des Artikels
+    # passen (siehe _vehicle_rows_from_file) - bis zum naechsten Schreiben der Fahrzeuge.
+    vehicle_link_note: str = ""
 
     def __post_init__(self) -> None:
         self.sync_genart_fields()
@@ -1428,36 +1442,261 @@ def normalize_article_list_rows(rows: list[ArticleListRow]) -> list[ArticleListR
     return [row for list_type in ARTICLE_LIST_TYPES for row in by_type[list_type]]
 
 
+def _unique_ids(values: Iterable[object]) -> tuple[str, ...]:
+    """IDs bereinigt, ohne Leere und Doppelte, Reihenfolge bleibt."""
+    unique: list[str] = []
+    for value in values:
+        text = str(value if value is not None else "").strip()
+        if text and text not in unique:
+            unique.append(text)
+    return tuple(unique)
+
+
+# Merker an einer schon bereinigten VehicleLinkRow (siehe _mark_vehicle_row_normalized).
+_NORMALIZED_VEHICLE_ROW_ATTR = "_normalized_vehicle_row"
+
+
+def _mark_vehicle_row_normalized(row: VehicleLinkRow) -> VehicleLinkRow:
+    """Merkt am (unveraenderlichen) Objekt, dass es bereinigt ist: normalize_vehicle_link_rows
+    uebernimmt es dann unveraendert. get_rows, collect_bundle und ExportBundle bereinigen bei
+    jedem Fokuswechsel alle Fahrzeuge - bei ~1.800 Fahrzeugen kostete das Neu-Anlegen jeder
+    Zeile spuerbar Zeit. dataclass_replace liefert ein neues Objekt ohne Merker."""
+    object.__setattr__(row, _NORMALIZED_VEHICLE_ROW_ATTR, True)
+    return row
+
+
 def normalize_vehicle_link_rows(rows: list[VehicleLinkRow]) -> list[VehicleLinkRow]:
     normalized: list[VehicleLinkRow] = []
-    seen_values: set[tuple[str, str, str]] = set()
+    index_by_key: dict[tuple[str, str, str], int] = {}
     for row in rows:
-        vehicle_type_id = row.vehicle_type_id.strip() or DEFAULT_VEHICLE_TYPE_ID
-        vehicle_type_label = row.vehicle_type_label.strip() or vehicle_type_label_for_id(vehicle_type_id)
-        ktyp_topmotive = row.ktyp_topmotive.strip()
-        ktyp_tecdoc = row.ktyp_tecdoc.strip()
-        if not ktyp_topmotive and not ktyp_tecdoc:
+        if getattr(row, _NORMALIZED_VEHICLE_ROW_ATTR, False):
+            clean = row
+        else:
+            vehicle_type_id = row.vehicle_type_id.strip() or DEFAULT_VEHICLE_TYPE_ID
+            vehicle_type_label = row.vehicle_type_label.strip() or vehicle_type_label_for_id(vehicle_type_id)
+            ktyp_topmotive = row.ktyp_topmotive.strip()
+            ktyp_tecdoc = row.ktyp_tecdoc.strip()
+            if not ktyp_topmotive and not ktyp_tecdoc:
+                continue
+            genart_ids = _unique_ids(row.genart_ids)
+            clean = _mark_vehicle_row_normalized(
+                VehicleLinkRow(
+                    vehicle_type_id=vehicle_type_id,
+                    vehicle_type_label=vehicle_type_label,
+                    motorcode=row.motorcode.strip(),
+                    ktyp_topmotive=ktyp_topmotive,
+                    ktyp_tecdoc=ktyp_tecdoc,
+                    manufacturer=row.manufacturer.strip(),
+                    model=row.model.strip(),
+                    description=row.description.strip(),
+                    year_from=row.year_from.strip(),
+                    year_to=row.year_to.strip(),
+                    power=row.power.strip(),
+                    genart_ids=genart_ids,
+                    excluded_genart_ids=tuple(
+                        genart_id for genart_id in _unique_ids(row.excluded_genart_ids) if genart_id not in genart_ids
+                    ),
+                )
+            )
+        dedupe_key = (clean.vehicle_type_id, clean.ktyp_topmotive, clean.ktyp_tecdoc)
+        index = index_by_key.get(dedupe_key)
+        if index is not None:
+            # Dasselbe Fahrzeug doppelt: verknuepft ist, was eine der beiden Zeilen
+            # verknuepft (eigene GenArts vereinigt, ausgeschlossen nur, was beide ausschliessen).
+            normalized[index] = _merge_vehicle_link_genarts(normalized[index], clean)
             continue
-        dedupe_key = (vehicle_type_id, ktyp_topmotive, ktyp_tecdoc)
-        if dedupe_key in seen_values:
-            continue
-        seen_values.add(dedupe_key)
-        normalized.append(
-            VehicleLinkRow(
-                vehicle_type_id=vehicle_type_id,
-                vehicle_type_label=vehicle_type_label,
-                motorcode=row.motorcode.strip(),
-                ktyp_topmotive=ktyp_topmotive,
-                ktyp_tecdoc=ktyp_tecdoc,
-                manufacturer=row.manufacturer.strip(),
-                model=row.model.strip(),
-                description=row.description.strip(),
-                year_from=row.year_from.strip(),
-                year_to=row.year_to.strip(),
-                power=row.power.strip(),
+        index_by_key[dedupe_key] = len(normalized)
+        normalized.append(clean)
+    return normalized
+
+
+def _merge_vehicle_link_genarts(first: VehicleLinkRow, other: VehicleLinkRow) -> VehicleLinkRow:
+    """Zwei Zeilen desselben Fahrzeugs: die erste bleibt, GenArts vereinigt (siehe normalize)."""
+    merged_ids = _unique_ids([*first.genart_ids, *other.genart_ids])
+    merged_excluded = tuple(
+        genart_id
+        for genart_id in first.excluded_genart_ids
+        if genart_id in other.excluded_genart_ids and genart_id not in merged_ids
+    )
+    if merged_ids == first.genart_ids and merged_excluded == first.excluded_genart_ids:
+        return first
+    return _mark_vehicle_row_normalized(dataclass_replace(first, genart_ids=merged_ids, excluded_genart_ids=merged_excluded))
+
+
+def _linked_genart_ids(row: VehicleLinkRow, current: tuple[str, ...], current_set: set[str]) -> list[str]:
+    """vehicle_link_genart_ids mit schon bereinigten GenArts des Artikels (Schleifen ueber viele Fahrzeuge)."""
+    if not row.genart_ids and not row.excluded_genart_ids:
+        return list(current)
+    skip = set(row.genart_ids)
+    skip.update(row.excluded_genart_ids)
+    return [genart_id for genart_id in row.genart_ids if genart_id in current_set] + [
+        genart_id for genart_id in current if genart_id not in skip
+    ]
+
+
+def vehicle_link_genart_ids(row: VehicleLinkRow, article_genart_ids: list[str] | tuple[str, ...]) -> list[str]:
+    """Die GenArts des Artikels, mit denen das Fahrzeug verknuepft ist.
+
+    Zuerst die eigenen GenArts des Fahrzeugs (Reihenfolge wie geladen), dann neu
+    hinzugefuegte GenArts des Artikels - die gelten fuer alle Fahrzeuge. Eine
+    entfernte GenArt faellt bei jedem Fahrzeug weg; eine GenArt, die das Fahrzeug
+    beim Laden nicht hatte (excluded_genart_ids), bleibt aussen vor."""
+    current = _unique_ids(article_genart_ids)
+    return _linked_genart_ids(row, current, set(current))
+
+
+# Spalte 'GenArt' fuer ein Fahrzeug, dessen TecDoc-Nummer erst der KTyp-Katalog liefert
+# (alte Topmotive-Zeile, Katalog noch nicht geladen).
+VEHICLE_LINK_WAITING_LABEL = "wartet auf KTyp-Stammdaten"
+VEHICLE_LINK_NOT_EXPORTED_LABEL = "nicht exportiert (keine TecDoc-Nr.)"
+
+
+def _vehicle_genart_label(row: VehicleLinkRow, current: tuple[str, ...], current_set: set[str], catalog_ready: bool) -> str:
+    if not row.ktyp_tecdoc.strip():
+        if row.ktyp_topmotive.strip() and not catalog_ready:
+            return VEHICLE_LINK_WAITING_LABEL
+        return VEHICLE_LINK_NOT_EXPORTED_LABEL
+    if not current:
+        return "-"
+    linked = _linked_genart_ids(row, current, current_set)
+    if not linked:
+        return "keine"
+    if len(linked) == len(current):
+        return "alle"
+    return ", ".join(linked)
+
+
+def vehicle_link_genart_label(
+    row: VehicleLinkRow, article_genart_ids: list[str] | tuple[str, ...], catalog_ready: bool = True
+) -> str:
+    """Anzeige der verknuepften GenArts eines Fahrzeugs (Spalte 'GenArt' im Reiter Fahrzeuge).
+    catalog_ready=False: KTyp-Stammdaten noch nicht geladen - ein Fahrzeug nur mit TopMotive-
+    Nummer bekommt seine TecDoc-Nummer erst noch (kein 'nicht exportiert')."""
+    current = _unique_ids(article_genart_ids)
+    return _vehicle_genart_label(row, current, set(current), catalog_ready)
+
+
+def count_vehicle_links_without_tecdoc(rows: list[VehicleLinkRow]) -> int:
+    """Fahrzeuge ohne TecDoc-Nummer - sie werden nicht exportiert (Apollo kennt nur TecDoc)."""
+    return sum(1 for row in normalize_vehicle_link_rows(rows) if not row.ktyp_tecdoc)
+
+
+def vehicle_links_waiting_for_catalog(rows: list[VehicleLinkRow]) -> int:
+    """Fahrzeuge, die nur eine TopMotive-Nummer tragen: ohne KTyp-Katalog ist ihre TecDoc-
+    Nummer (die einzige, die exportiert wird) noch unbekannt."""
+    return sum(1 for row in normalize_vehicle_link_rows(rows) if row.ktyp_topmotive and not row.ktyp_tecdoc)
+
+
+def vehicle_link_tecdoc_hint(rows: list[VehicleLinkRow], catalog_ready: bool) -> str:
+    """Hinweis fuer Ergebniszeile und Zusammenfassung: Fahrzeuge, die nicht exportiert werden
+    (keine TecDoc-Nummer) bzw. noch auf die KTyp-Stammdaten warten. Leer, wenn alles passt."""
+    normalized = normalize_vehicle_link_rows(rows)
+    without = [row for row in normalized if not row.ktyp_tecdoc]
+    if not without:
+        return ""
+    waiting = sum(1 for row in without if row.ktyp_topmotive) if not catalog_ready else 0
+    parts: list[str] = []
+    if waiting:
+        parts.append(f"{waiting} warten auf die KTyp-Stammdaten (TecDoc-Nr. noch offen)")
+    if len(without) - waiting:
+        parts.append(f"{len(without) - waiting} ohne TecDoc-Nummer, nicht exportiert")
+    return ", ".join(parts)
+
+
+def _vehicle_row_after_genart_removal(
+    row: VehicleLinkRow, removed: set[str], current: tuple[str, ...], current_set: set[str]
+) -> VehicleLinkRow | None:
+    """Eine Zeile nach dem Entfernen von GenArts (siehe vehicle_rows_after_genart_removal);
+    None = das Fahrzeug faellt weg."""
+    if removed & set(row.genart_ids) or removed & set(row.excluded_genart_ids):
+        row = _mark_vehicle_row_normalized(
+            dataclass_replace(
+                row,
+                genart_ids=tuple(genart_id for genart_id in row.genart_ids if genart_id not in removed),
+                excluded_genart_ids=tuple(genart_id for genart_id in row.excluded_genart_ids if genart_id not in removed),
             )
         )
-    return normalized
+    if removed and not _linked_genart_ids(row, current, current_set):
+        return None
+    return row
+
+
+def vehicle_rows_after_genart_removal(
+    rows: list[VehicleLinkRow], removed_genart_ids: list[str] | tuple[str, ...], remaining_genart_ids: list[str] | tuple[str, ...]
+) -> tuple[list[VehicleLinkRow], list[VehicleLinkRow]]:
+    """GenArts wurden aus dem Artikel entfernt: (bleibende Fahrzeuge, wegfallende Fahrzeuge).
+
+    Die entfernten GenArts werden bei allen Fahrzeugen vergessen (eine spaeter wieder
+    hinzugefuegte gilt wie jede neue fuer alle Fahrzeuge). Ein Fahrzeug, das danach an keiner
+    GenArt des Artikels mehr haengt, faellt weg - genau wie beim Neuladen aus der Datei, in der
+    seine Zeilen mit der GenArt verschwunden sind. Sonst kaeme es mit der naechsten neuen GenArt
+    zurueck bzw. stuende nach dem Entfernen der letzten GenArt mit leerer GenArt in der Datei."""
+    removed = set(_unique_ids(removed_genart_ids))
+    current = _unique_ids(remaining_genart_ids)
+    current_set = set(current)
+    kept: list[VehicleLinkRow] = []
+    dropped: list[VehicleLinkRow] = []
+    for row in normalize_vehicle_link_rows(rows):
+        after = _vehicle_row_after_genart_removal(row, removed, current, current_set)
+        if after is None:
+            dropped.append(row)
+        else:
+            kept.append(after)
+    return kept, dropped
+
+
+def resolve_vehicle_link_rows(rows: list[VehicleLinkRow], catalog: "VehicleCatalog | None") -> list[VehicleLinkRow]:
+    """Fahrzeuge mit den KTyp-Stammdaten vervollstaendigen - wie beim Laden mit Katalog.
+
+    Fehlt die TecDoc-Nummer (alte Topmotive-Zeile, ohne Katalog geladen), kommt sie ueber die
+    TopMotive-Nummer; fehlt die TopMotive-Nummer, kommen sie und die Fahrzeugdaten ueber die
+    TecDoc-Nummer. Danach gleiche Fahrzeuge (Fahrzeugtyp + TecDoc-Nr.) zusammengefasst, die
+    GenArts vereinigt (wie load_article_snapshots_from_folder). Ohne Katalog oder ohne Treffer
+    bleibt eine Zeile, wie sie ist. Liest den Katalog nur (auch aus dem Schreib-Thread)."""
+    normalized = normalize_vehicle_link_rows(rows)
+    if catalog is None or not catalog.count:
+        return normalized
+    resolved: list[VehicleLinkRow] = []
+    index_by_key: dict[tuple[str, str], int] = {}
+    changed = False
+    for row in normalized:
+        match = None
+        if row.ktyp_tecdoc and not row.ktyp_topmotive:
+            match = catalog.lookup_by_ktyp(ktyp_tecdoc=row.ktyp_tecdoc)
+        elif row.ktyp_topmotive and not row.ktyp_tecdoc:
+            match = catalog.lookup_by_ktyp(ktyp_topmotive=row.ktyp_topmotive)
+            if match is not None and not match.ktyp_tecdoc:
+                match = None
+        if match is not None:
+            row = normalize_vehicle_link_rows(
+                [
+                    VehicleLinkRow(
+                        vehicle_type_id=row.vehicle_type_id,
+                        vehicle_type_label=row.vehicle_type_label,
+                        motorcode=match.motorcode,
+                        ktyp_topmotive=match.ktyp_topmotive,
+                        ktyp_tecdoc=match.ktyp_tecdoc,
+                        manufacturer=match.manufacturer,
+                        model=match.model,
+                        description=match.description,
+                        year_from=match.year_from,
+                        year_to=match.year_to,
+                        power=match.power,
+                        genart_ids=row.genart_ids,
+                        excluded_genart_ids=row.excluded_genart_ids,
+                    )
+                ]
+            )[0]
+            changed = True
+        key = (row.vehicle_type_id, row.ktyp_tecdoc or f"TM:{row.ktyp_topmotive}")
+        index = index_by_key.get(key)
+        if index is not None:
+            resolved[index] = _merge_vehicle_link_genarts(resolved[index], row)
+            changed = True
+            continue
+        index_by_key[key] = len(resolved)
+        resolved.append(row)
+    return resolved if changed else normalized
 
 
 def normalize_search_terms(terms: list[str]) -> list[str]:
@@ -6671,6 +6910,9 @@ class KunzerScraper:
         return ""
 
     def _select_long_text(self, title: str, description_text: str, info_text: str) -> str:
+        """Langtext aus 'Artikelbeschreibung', sonst 'Artikelinformationen'. Hat der Shop
+        keinen Text (oder nur die Ueberschrift), bleibt er leer - bis v0.1.52 wurde dann die
+        Kurzbezeichnung als Text angelegt."""
         description = self._normalize_multiline_text(description_text)
         if description and description != title:
             return description
@@ -6679,7 +6921,7 @@ class KunzerScraper:
         if info and info != title:
             return info
 
-        return title
+        return ""
 
     def _extract_article_number(self, page_url: str, body_text: str, title: str) -> str:
         url_segment = unquote(urlparse(page_url).path.rstrip("/").rsplit("/", 1)[-1])
@@ -7871,74 +8113,120 @@ def replace_article_rows_preserving_timestamps(
     Datei (z. B. Blattname normalisiert) zaehlt nicht. force_changed: der Bereich
     gilt als geaendert, auch wenn die Zeilen gleich bleiben (z. B. Mediendatei
     unter gleichem Pfad ausgetauscht) - alle Zeilen des Artikels bekommen 'jetzt'."""
+    changed = replace_articles_rows_preserving_timestamps(
+        path, sheet_name, headers, {article_number: rows}, key_index=key_index, force_changed=force_changed
+    )
+    return bool(changed)
+
+
+def _rebuild_article_rows_preserving_timestamps(
+    old_article_rows: list[list[str]],
+    rows: list[list[str]],
+    headers: list[str],
+    written_at: str,
+    force_changed: bool = False,
+) -> tuple[list[list[str]], bool]:
+    """Neue Zeilen eines Artikels mit den Zeitstempeln seiner bisherigen Zeilen (siehe
+    replace_article_rows_preserving_timestamps). Rueckgabe: (Zeilen, Artikel geaendert)."""
+    has_last_written = bool(headers) and headers[-1] == LAST_WRITTEN_HEADER
+    rebuilt_rows = rows
+    if has_last_written:
+        existing_timestamps_by_signature: dict[tuple[str, ...], list[str]] = {}
+        signature_width = len(headers) - 1
+        for row in old_article_rows:
+            signature = tuple(str(cell) for cell in row[:signature_width])
+            existing_timestamps_by_signature.setdefault(signature, []).append(row[-1].strip() or written_at)
+
+        rebuilt_rows = []
+        for row in rows:
+            # Bereinigt wie beim Schreiben (verbotene Steuerzeichen, Zellenlaenge):
+            # sonst passte eine Zeile mit Steuerzeichen nie zur gespeicherten Zeile
+            # und bekaeme bei jedem Speichern einen neuen Zeitstempel.
+            signature_values = [str(_sanitize_cell_value(str(cell))) for cell in row[:signature_width]]
+            if len(signature_values) < signature_width:
+                signature_values.extend([""] * (signature_width - len(signature_values)))
+            signature = tuple(signature_values)
+            known_timestamps = existing_timestamps_by_signature.get(signature, [])
+            timestamp = known_timestamps.pop(0) if known_timestamps else written_at
+            rebuilt_rows.append(signature_values + [timestamp])
+
+    # Wie _workbook_already_holds: die gelesenen Zeilen sind bereinigt geschrieben.
+    article_changed = len(old_article_rows) != len(rebuilt_rows) or any(
+        existing != new and existing != [_sanitize_cell_value(cell) for cell in new]
+        for existing, new in zip(old_article_rows, ([str(cell) for cell in row] for row in rebuilt_rows))
+    )
+    # Haben sich die Zeilen geaendert, ohne dass eine Zeile den aktuellen Stempel
+    # traegt (Zeilen weggefallen, nur die Reihenfolge geaendert), bliebe in der
+    # Datei kein juengeres 'Zuletzt geschrieben am' zurueck - der Artikel fiele
+    # beim naechsten Laden von der Platte von der Loeschliste seit Apollo-Import.
+    # Dann gilt der ganze Bereich als jetzt geschrieben (ebenso bei force_changed).
+    if has_last_written and rebuilt_rows and (
+        force_changed or (article_changed and not any(row[-1] == written_at for row in rebuilt_rows))
+    ):
+        rebuilt_rows = [row[:-1] + [written_at] for row in rebuilt_rows]
+    if force_changed:
+        article_changed = True
+    return rebuilt_rows, article_changed
+
+
+def replace_articles_rows_preserving_timestamps(
+    path: Path,
+    sheet_name: str,
+    headers: list[str],
+    rows_by_article: dict[str, list[list[str]]],
+    key_index: int = 0,
+    force_changed: bool = False,
+    written_at: str | None = None,
+) -> set[str]:
+    """replace_article_rows_preserving_timestamps fuer mehrere Artikel in EINEM Schreibvorgang
+    (z. B. 'GenArten einfuegen…' in der Uebersicht): je Artikel dieselbe Zeitstempel-Regel,
+    seine Zeilen stehen an der Stelle seiner bisherigen ersten Zeile, neue Artikel kommen in
+    der Reihenfolge von rows_by_article ans Ende, alle anderen Zeilen bleiben unberuehrt.
+    written_at: Schreibzeitpunkt (Standard: jetzt). Rueckgabe: die (normalisierten)
+    Artikelnummern, deren Zeilen sich geaendert haben. Ist die Datei danach unveraendert,
+    entfaellt das Schreiben."""
     with _workbook_file_lock(_workbook_cache_key(path)):
         existing_rows = prepare_existing_rows_for_write(path, sheet_name, headers)
-        article_key = normalize_article_number(article_number)
-        has_last_written = bool(headers) and headers[-1] == LAST_WRITTEN_HEADER
-        written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        old_article_rows = [
-            row
-            for row in existing_rows
-            if len(row) > key_index and normalize_article_number(str(row[key_index])) == article_key
-        ]
+        written_at = written_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_rows_by_key: dict[str, list[list[str]]] = {}
+        for article_number, rows in rows_by_article.items():
+            new_rows_by_key[normalize_article_number(article_number)] = rows
+        old_rows_by_key: dict[str, list[list[str]]] = {key: [] for key in new_rows_by_key}
+        row_keys: list[str | None] = []
+        for row in existing_rows:
+            key = normalize_article_number(str(row[key_index])) if len(row) > key_index else None
+            row_keys.append(key)
+            if key is not None and key in old_rows_by_key:
+                old_rows_by_key[key].append(row)
 
-        rebuilt_rows = rows
-        if has_last_written:
-            existing_timestamps_by_signature: dict[tuple[str, ...], list[str]] = {}
-            signature_width = len(headers) - 1
-            for row in old_article_rows:
-                signature = tuple(str(cell) for cell in row[:signature_width])
-                existing_timestamps_by_signature.setdefault(signature, []).append(row[-1].strip() or written_at)
-
-            rebuilt_rows = []
-            for row in rows:
-                # Bereinigt wie beim Schreiben (verbotene Steuerzeichen, Zellenlaenge):
-                # sonst passte eine Zeile mit Steuerzeichen nie zur gespeicherten Zeile
-                # und bekaeme bei jedem Speichern einen neuen Zeitstempel.
-                signature_values = [str(_sanitize_cell_value(str(cell))) for cell in row[:signature_width]]
-                if len(signature_values) < signature_width:
-                    signature_values.extend([""] * (signature_width - len(signature_values)))
-                signature = tuple(signature_values)
-                known_timestamps = existing_timestamps_by_signature.get(signature, [])
-                timestamp = known_timestamps.pop(0) if known_timestamps else written_at
-                rebuilt_rows.append(signature_values + [timestamp])
-
-        # Wie _workbook_already_holds: die gelesenen Zeilen sind bereinigt geschrieben.
-        article_changed = len(old_article_rows) != len(rebuilt_rows) or any(
-            existing != new and existing != [_sanitize_cell_value(cell) for cell in new]
-            for existing, new in zip(old_article_rows, ([str(cell) for cell in row] for row in rebuilt_rows))
-        )
-        # Haben sich die Zeilen geaendert, ohne dass eine Zeile den aktuellen Stempel
-        # traegt (Zeilen weggefallen, nur die Reihenfolge geaendert), bliebe in der
-        # Datei kein juengeres 'Zuletzt geschrieben am' zurueck - der Artikel fiele
-        # beim naechsten Laden von der Platte von der Loeschliste seit Apollo-Import.
-        # Dann gilt der ganze Bereich als jetzt geschrieben (ebenso bei force_changed).
-        if has_last_written and rebuilt_rows and (
-            force_changed or (article_changed and not any(row[-1] == written_at for row in rebuilt_rows))
-        ):
-            rebuilt_rows = [row[:-1] + [written_at] for row in rebuilt_rows]
-        if force_changed:
-            article_changed = True
+        rebuilt_by_key: dict[str, list[list[str]]] = {}
+        changed: set[str] = set()
+        for key, rows in new_rows_by_key.items():
+            rebuilt_rows, article_changed = _rebuild_article_rows_preserving_timestamps(
+                old_rows_by_key[key], rows, headers, written_at, force_changed
+            )
+            rebuilt_by_key[key] = rebuilt_rows
+            if article_changed:
+                changed.add(key)
 
         merged_rows: list[list[str]] = []
-        inserted = False
-        for existing_row in existing_rows:
-            if len(existing_row) > key_index and normalize_article_number(str(existing_row[key_index])) == article_key:
-                if not inserted:
-                    merged_rows.extend(rebuilt_rows)
-                    inserted = True
+        inserted: set[str] = set()
+        for existing_row, key in zip(existing_rows, row_keys):
+            if key is not None and key in rebuilt_by_key:
+                if key not in inserted:
+                    merged_rows.extend(rebuilt_by_key[key])
+                    inserted.add(key)
                 continue
             merged_rows.append(existing_row)
+        for key, rebuilt_rows in rebuilt_by_key.items():
+            if key not in inserted:
+                merged_rows.extend(rebuilt_rows)
 
-        if not inserted:
-            merged_rows.extend(rebuilt_rows)
-
-        # Unveraenderte Zeilen behalten ihren Zeitstempel - ist der Artikel also
+        # Unveraenderte Zeilen behalten ihren Zeitstempel - sind die Artikel also
         # unveraendert, ist die Datei es auch und das Schreiben entfaellt.
-        if _workbook_already_holds(path, sheet_name, headers, merged_rows):
-            return article_changed
-        write_workbook(path, sheet_name, headers, merged_rows)
-        return article_changed
+        if not _workbook_already_holds(path, sheet_name, headers, merged_rows):
+            write_workbook(path, sheet_name, headers, merged_rows)
+        return changed
 
 
 def merge_usage_number_import_rows(
@@ -8240,25 +8528,45 @@ def build_article_list_export_rows(bundle: ExportBundle) -> list[list[str]]:
 
 
 def build_vehicle_link_export_rows(bundle: ExportBundle) -> list[list[str]]:
-    """Je Fahrzeug eine Zeile pro KTyp-Nummer (Topmotive und TecDoc) und GenArt."""
+    """Je Fahrzeug eine Zeile pro verknuepfter GenArt, nur mit der TecDoc-Nummer.
+
+    Apollo (IMS-Import) liest KTypNr immer als TecDoc-KTyp - eine Topmotive-Nummer
+    verknuepfte dort ein anderes Fahrzeug (die Nummernkreise ueberschneiden sich).
+    Fahrzeuge ohne TecDoc-Nummer werden deshalb nicht exportiert. Welche GenArts ein
+    Fahrzeug hat, regelt vehicle_link_genart_ids: unveraenderte Fahrzeuge behalten
+    ihre Zeilen aus der Datei (z. B. aus IMS nur an einem Teil der GenArts)."""
     genart_values = [
         (selection.id.strip(), selection.bezeichnung.strip())
         for selection in bundle.genart_selections
         if selection.id.strip() or selection.bezeichnung.strip()
-    ] or [("", "")]
+    ]
+    bezeichnung_by_id: dict[str, str] = {}
+    for genart_id, genart_bezeichnung in genart_values:
+        bezeichnung_by_id.setdefault(genart_id, genart_bezeichnung)
+    article_genart_ids = _unique_ids(bezeichnung_by_id)
+    article_genart_set = set(article_genart_ids)
     export_rows: list[list[str]] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for row in normalize_vehicle_link_rows(bundle.vehicle_link_rows):
-        for ktyp, system in ((row.ktyp_topmotive, "Topmotive"), (row.ktyp_tecdoc, "TecDoc")):
-            ktyp = ktyp.strip()
-            if not ktyp:
+        ktyp = row.ktyp_tecdoc.strip()
+        if not ktyp:
+            continue
+        if article_genart_ids:
+            values = [
+                (genart_id, bezeichnung_by_id[genart_id])
+                for genart_id in _linked_genart_ids(row, article_genart_ids, article_genart_set)
+            ]
+        else:
+            # Artikel ohne GenArt (noch nie eine gesetzt): Fahrzeug ohne GenArt festhalten
+            # (wie bisher). Nach dem Entfernen der letzten GenArt gibt es hier keine
+            # Fahrzeuge mehr (vehicle_rows_after_genart_removal), also keine leeren GenArts.
+            values = [("", "")]
+        for genart_id, genart_bezeichnung in values:
+            dedupe_key = (row.vehicle_type_id, ktyp, genart_id)
+            if dedupe_key in seen:
                 continue
-            for genart_id, genart_bezeichnung in genart_values:
-                dedupe_key = (row.vehicle_type_id, ktyp, genart_id, genart_bezeichnung)
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                export_rows.append([bundle.article_number, row.vehicle_type_id, ktyp, system, genart_id, genart_bezeichnung])
+            seen.add(dedupe_key)
+            export_rows.append([bundle.article_number, row.vehicle_type_id, ktyp, "TecDoc", genart_id, genart_bezeichnung])
     return export_rows
 
 
@@ -8705,6 +9013,7 @@ def export_bundle(
 
 
 def build_preview(bundle: ExportBundle) -> str:
+    missing_tecdoc = count_vehicle_links_without_tecdoc(bundle.vehicle_link_rows)
     lines = [
         f"Artikelnummer: {bundle.article_number or '(leer)'}",
         "",
@@ -8721,7 +9030,8 @@ def build_preview(bundle: ExportBundle) -> str:
         f"- OE-Nummern: {len(normalize_oe_number_rows(bundle.oe_number_rows))}",
         f"- Vergleichsnummern: {len(normalize_comparison_number_rows(bundle.comparison_number_rows))}",
         f"- Stückliste/Zubehör: {len(normalize_article_list_rows(bundle.article_list_rows))}",
-        f"- Fahrzeugverknüpfungen: {len(normalize_vehicle_link_rows(bundle.vehicle_link_rows))} Fahrzeuge / {len(build_vehicle_link_export_rows(bundle))} Zeilen",
+        f"- Fahrzeugverknüpfungen: {len(normalize_vehicle_link_rows(bundle.vehicle_link_rows))} Fahrzeuge / {len(build_vehicle_link_export_rows(bundle))} Zeilen"
+        + (f" ({missing_tecdoc} ohne TecDoc-Nummer, nicht exportiert)" if missing_tecdoc else ""),
         f"- Attribute: {len(normalize_attribute_rows(bundle.attribute_rows))}",
         f"- Suchwörter: {len(normalize_search_terms(bundle.search_terms))} (als Gebrauchsnummern, Referenztyp {USAGE_NUMBER_TECDOC_ID})",
         "",
@@ -8857,6 +9167,64 @@ def translation_set_from_export_row(row: list[str]) -> TranslationSet:
     )
 
 
+def _vehicle_rows_from_file(
+    vehicles: dict[tuple[str, str], tuple[VehicleLinkRow, list[str], list[int]]], article_genart_ids: list[str]
+) -> tuple[list[VehicleLinkRow], str]:
+    """Fahrzeuge eines Artikels aus seinen Dateizeilen (load_article_snapshots_from_folder).
+
+    Rueckgabe: (Fahrzeuge, Hinweis). Regeln:
+    - Fahrzeug mit mindestens einer Zeile an einer GenArt des Artikels: genart_ids = seine
+      GenArts (Datei-Reihenfolge), excluded_genart_ids = die uebrigen GenArts des Artikels.
+      Exportiert werden genau diese Zeilen wieder (Rundlauf ohne Aenderung).
+    - Zeilen mit einer GenArt, die nicht am Artikel ist, und Zeilen ohne GenArt neben solchen
+      mit GenArt werden nicht mehr exportiert (die GenArt gilt als entfernt, Regel 3).
+    - Fahrzeug nur mit solchen Zeilen (GenArt nicht am Artikel bzw. ohne GenArt): gilt wie ein
+      neues Fahrzeug, also mit allen GenArts des Artikels (Regel 4) - es geht nicht verloren.
+    - Artikel ohne GenArt: je Fahrzeug eine Zeile ohne GenArt (wie bisher).
+    Weicht etwas davon ab, was in der Datei steht, nennt der Hinweis die Zeilenzahl (Ergebnis-
+    zeile im Reiter Fahrzeuge); in den echten Daten kommt das nicht vor."""
+    article_ids = _unique_ids(article_genart_ids)
+    article_set = set(article_ids)
+    rows: list[VehicleLinkRow] = []
+    foreign_rows = 0
+    blank_rows = 0
+    # Zeilen ohne GenArt bei Fahrzeugen, die gar keine GenArt-Zeile haben: altes Dateiformat
+    # ohne GenArt-Spalte (bzw. noch nicht umgestellte Artikel) - kein Widerspruch zur Datei,
+    # nur ein neutraler Hinweis.
+    legacy_rows = 0
+    for link_row, vehicle_genart_ids, blank_count in vehicles.values():
+        on_article = [genart_id for genart_id in vehicle_genart_ids if genart_id in article_set]
+        if article_ids:
+            foreign_rows += len(vehicle_genart_ids) - len(on_article)
+            if vehicle_genart_ids:
+                blank_rows += blank_count[0]
+            else:
+                legacy_rows += blank_count[0]
+        else:
+            foreign_rows += len(vehicle_genart_ids)
+        excluded = tuple(genart_id for genart_id in article_ids if genart_id not in vehicle_genart_ids) if on_article else ()
+        rows.append(dataclass_replace(link_row, genart_ids=tuple(vehicle_genart_ids), excluded_genart_ids=excluded))
+    notes: list[str] = []
+    if foreign_rows or blank_rows:
+        details = []
+        if foreign_rows:
+            details.append(f"{foreign_rows} mit einer GenArt, die nicht am Artikel ist")
+        if blank_rows:
+            details.append(f"{blank_rows} ohne GenArt neben GenArt-Zeilen")
+        notes.append(
+            f"Hinweis: {foreign_rows + blank_rows} Zeile(n) in {VEHICLE_LINK_FILE[0]} passen nicht zu den GenArts "
+            f"des Artikels ({', '.join(details)}). Beim nächsten Speichern der Fahrzeuge gilt die Spalte GenArt "
+            "(Fahrzeuge ohne passende GenArt: mit allen GenArts des Artikels)."
+        )
+    if legacy_rows:
+        notes.append(
+            f"Hinweis: {legacy_rows} Zeile(n) in {VEHICLE_LINK_FILE[0]} ohne GenArt (z. B. altes Dateiformat ohne "
+            "GenArt-Spalte) – diese Fahrzeuge gelten als mit allen GenArts des Artikels verknüpft; beim nächsten "
+            "Speichern der Fahrzeuge wird das so geschrieben."
+        )
+    return normalize_vehicle_link_rows(rows), " ".join(notes)
+
+
 def load_article_snapshots_from_folder(
     folder: Path,
     source_label: str,
@@ -8975,7 +9343,16 @@ def load_article_snapshots_from_folder(
             ArticleListRow(list_type=row[1], item_number=row[2], quantity=row[3], genart_id=row[4], product_group=row[5])
         )
 
-    vehicle_link_rows = read_rows(VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS)
+    # Die Datei hat je Fahrzeug und GenArt eine Zeile. Daraus wird je Artikel ein
+    # Fahrzeug je Fahrzeugtyp + TecDoc-KTyp, mit den GenArts seiner Zeilen (aus IMS
+    # haengen viele Fahrzeuge nur an einem Teil der GenArts des Artikels). Alte
+    # Topmotive-Zeilen werden ueber den Katalog ihrem TecDoc-Fahrzeug zugeordnet.
+    # Je Fahrzeug: (Zeile, GenArts seiner Dateizeilen, Anzahl Zeilen ohne GenArt).
+    vehicles_by_article: dict[str, dict[tuple[str, str], tuple[VehicleLinkRow, list[str], list[int]]]] = {}
+    # Wie OE-Nummern und Attribute ueber prepare_existing_rows_for_write: das alte Format
+    # ohne GenArt-Spalten (5 Spalten) wird erkannt - sonst landete 'Zuletzt geschrieben am'
+    # in der GenArt-Spalte, und das naechste Schreiben verlor alle Fahrzeuge des Artikels.
+    vehicle_link_rows = prepare_existing_rows_for_write(folder / VEHICLE_LINK_FILE[0], VEHICLE_LINK_FILE[1], VEHICLE_LINK_HEADERS)
     for row in vehicle_link_rows:
         article_number = normalize_article_number(row[0])
         if not article_number:
@@ -8986,14 +9363,14 @@ def load_article_snapshots_from_folder(
             continue
         ensure_snapshot(article_number).note_written_at("vehicle_links", row[-1])
         system = row[3].strip().casefold()
+        # Ohne Angabe gilt TecDoc - so liest auch der IMS-Import die KTypNr.
+        is_topmotive = system.startswith("topmotive") or system.startswith("tm")
         match = None
         if vehicle_catalog is not None:
-            if system.startswith("topmotive") or system.startswith("tm"):
+            if is_topmotive:
                 match = vehicle_catalog.lookup_by_ktyp(ktyp_topmotive=ktyp)
-            elif system.startswith("tecdoc"):
-                match = vehicle_catalog.lookup_by_ktyp(ktyp_tecdoc=ktyp)
             else:
-                match = vehicle_catalog.lookup_by_ktyp(ktyp_topmotive=ktyp, ktyp_tecdoc=ktyp)
+                match = vehicle_catalog.lookup_by_ktyp(ktyp_tecdoc=ktyp)
         if match is not None:
             link_row = VehicleLinkRow(
                 vehicle_type_id=vehicle_type_id,
@@ -9012,16 +9389,19 @@ def load_article_snapshots_from_folder(
             link_row = VehicleLinkRow(
                 vehicle_type_id=vehicle_type_id,
                 vehicle_type_label=vehicle_type_label_for_id(vehicle_type_id),
-                ktyp_topmotive=ktyp if system.startswith("topmotive") or system.startswith("tm") else "",
-                ktyp_tecdoc=ktyp if system.startswith("tecdoc") else "",
+                ktyp_topmotive=ktyp if is_topmotive else "",
+                ktyp_tecdoc="" if is_topmotive else ktyp,
             )
-            if not link_row.has_ktyp():
-                link_row = VehicleLinkRow(
-                    vehicle_type_id=vehicle_type_id,
-                    vehicle_type_label=vehicle_type_label_for_id(vehicle_type_id),
-                    ktyp_tecdoc=ktyp,
-                )
-        ensure_snapshot(article_number).vehicle_link_rows.append(link_row)
+        vehicle_key = (vehicle_type_id, link_row.ktyp_tecdoc or f"TM:{link_row.ktyp_topmotive}")
+        article_vehicles = vehicles_by_article.setdefault(article_number, {})
+        if vehicle_key not in article_vehicles:
+            article_vehicles[vehicle_key] = (link_row, [], [0])
+        genart_id = row[4].strip()
+        vehicle_genart_ids = article_vehicles[vehicle_key][1]
+        if not genart_id:
+            article_vehicles[vehicle_key][2][0] += 1
+        elif genart_id not in vehicle_genart_ids:
+            vehicle_genart_ids.append(genart_id)
 
     usage_number_rows = read_rows(USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS)
     for row in usage_number_rows:
@@ -9123,12 +9503,14 @@ def load_article_snapshots_from_folder(
         if snapshot is not None:
             snapshot.note_written_at("short_text", row[-1])
 
-    for snapshot in snapshots.values():
+    for article_key, snapshot in snapshots.items():
         snapshot.sync_genart_fields()
         snapshot.oe_number_rows = normalize_oe_number_rows(snapshot.oe_number_rows)
         snapshot.comparison_number_rows = normalize_comparison_number_rows(snapshot.comparison_number_rows)
         snapshot.article_list_rows = normalize_article_list_rows(snapshot.article_list_rows)
-        snapshot.vehicle_link_rows = normalize_vehicle_link_rows(snapshot.vehicle_link_rows)
+        snapshot.vehicle_link_rows, snapshot.vehicle_link_note = _vehicle_rows_from_file(
+            vehicles_by_article.get(article_key, {}), [selection.id for selection in snapshot.genart_selections]
+        )
         snapshot.attribute_rows = normalize_attribute_rows(snapshot.attribute_rows)
         snapshot.search_terms = normalize_search_terms(snapshot.search_terms)
 
@@ -9672,6 +10054,320 @@ def overview_row_for_snapshot(snapshot: StoredArticleSnapshot, changed_at: str) 
         values.append(cell)
         keys.append(key)
     return values, keys
+
+
+# ---------------------------------------------------------------------------
+# Reiter 'Uebersicht': GenArten eines Artikels kopieren und auf markierte Artikel
+# uebertragen ('GenArten einfuegen…'). Die Regeln sind genau die des Reiters GenArt in
+# der Maske - mit denselben Hilfsfunktionen (vehicle_rows_after_genart_removal,
+# build_genart_export_rows, build_vehicle_link_export_rows), keine zweite Umsetzung.
+GENART_TRANSFER_MODE_LABELS = {"append": "Ergänzen", "replace": "Ersetzen"}
+GENART_TRANSFER_UNCHANGED_LABEL = "unverändert"
+
+
+def format_count_de(value: int) -> str:
+    """Zahl mit Tausenderpunkt (1.849)."""
+    return f"{value:,}".replace(",", ".")
+
+
+def format_genart_id_list(selections: list[GenArtSelection]) -> str:
+    return ", ".join(selection.id for selection in selections if selection.id) or OVERVIEW_EMPTY_CELL
+
+
+def format_genart_id_labels(selections: list[GenArtSelection]) -> str:
+    """'4463 Bremsbelagsatz, 6911 Warnkontakt' (ID und Bezeichnung, ohne doppelte ID)."""
+    return ", ".join(
+        selection.id if selection.bezeichnung.strip() in ("", selection.id) else f"{selection.id} {selection.bezeichnung.strip()}"
+        for selection in selections
+    )
+
+
+def genart_selections_after_transfer(
+    current: list[GenArtSelection], source: list[GenArtSelection], mode: str
+) -> list[GenArtSelection]:
+    """GenArten eines Zielartikels nach 'GenArten einfuegen…'.
+
+    append (Ergaenzen): die vorhandenen bleiben in ihrer Reihenfolge, fehlende GenArten der
+    Quelle kommen in Quell-Reihenfolge dahinter - wie nacheinander im Reiter GenArt
+    hinzugefuegt. replace (Ersetzen): genau die GenArten der Quelle in Quell-Reihenfolge.
+    Hat das Ziel schon genau diese GenArten (nur in anderer Reihenfolge), bleibt es
+    unveraendert: eine reine Umsortierung schriebe alle Zeilen neu und setzte den Artikel
+    ohne fachliche Aenderung auf die Loeschliste seit Apollo-Import. Gleich ist eine GenArt
+    wie im Reiter GenArt bei gleicher ID (ohne Gross-/Kleinschreibung)."""
+    current = normalize_genart_selections(list(current))
+    source = normalize_genart_selections(list(source))
+    current_keys = {selection.id.casefold() for selection in current}
+    if mode == "append":
+        return current + [selection for selection in source if selection.id.casefold() not in current_keys]
+    if mode == "replace":
+        if {selection.id.casefold() for selection in source} == current_keys:
+            return current
+        return source
+    raise ValueError(f"Unbekannter Modus: {mode}")
+
+
+@dataclass
+class GenArtTransferPlan:
+    """Was 'GenArten einfuegen…' an einem Zielartikel aendert (plan_genart_transfer).
+
+    bundle = neuer Stand des Artikels (GenArten und Fahrzeuge, sonst wie gespeichert),
+    None = der Artikel bleibt unveraendert. rows_added/rows_removed zaehlen Fahrzeug-
+    Verknuepfungen (Fahrzeug + GenArt) gegenueber der Datei."""
+
+    article_number: str
+    old_selections: list[GenArtSelection]
+    new_selections: list[GenArtSelection]
+    added_ids: list[str] = field(default_factory=list)
+    removed_ids: list[str] = field(default_factory=list)
+    bundle: ExportBundle | None = None
+    vehicles_before: int = 0
+    vehicles_dropped: int = 0
+    vehicle_rows_after: list[list[str]] = field(default_factory=list)
+    vehicle_export_changed: bool = False
+    rows_added: int = 0
+    rows_removed: int = 0
+    waiting_for_catalog: int = 0
+
+    @property
+    def changed(self) -> bool:
+        return self.bundle is not None
+
+    def before_label(self) -> str:
+        return format_genart_id_list(self.old_selections)
+
+    def after_label(self) -> str:
+        return format_genart_id_list(self.new_selections) if self.changed else GENART_TRANSFER_UNCHANGED_LABEL
+
+    def vehicle_label(self) -> str:
+        """Spalte 'Fahrzeuge' der Vorschau, z. B. '+1 GenArt-Verknüpfung je Fahrzeug, +35 Zeilen'."""
+        if not self.changed:
+            return OVERVIEW_EMPTY_CELL
+        if not self.vehicles_before:
+            return "keine Fahrzeuge"
+        parts: list[str] = []
+        kept = self.vehicles_before - self.vehicles_dropped
+        if self.added_ids and kept:
+            count = len(self.added_ids)
+            parts.append(f"+{count} GenArt-Verknüpfung{'en' if count != 1 else ''} je Fahrzeug")
+        if self.vehicles_dropped:
+            if self.vehicles_dropped == 1:
+                parts.append("1 Fahrzeug fällt weg")
+            else:
+                parts.append(f"{format_count_de(self.vehicles_dropped)} Fahrzeuge fallen weg")
+        added = f"+{format_count_de(self.rows_added)}"
+        removed = f"−{format_count_de(self.rows_removed)}"
+        if self.rows_added and self.rows_removed:
+            parts.append(f"{added} / {removed} Zeilen")
+        elif self.rows_added or self.rows_removed:
+            count = self.rows_added or self.rows_removed
+            parts.append(f"{added if self.rows_added else removed} Zeile{'n' if count != 1 else ''}")
+        else:
+            parts.append("Zeilen unverändert")
+        return ", ".join(parts)
+
+
+def plan_genart_transfer(
+    snapshot: StoredArticleSnapshot,
+    source_selections: list[GenArtSelection],
+    mode: str,
+    *,
+    canonicalize: Callable[[GenArtSelection], GenArtSelection] | None = None,
+    vehicle_catalog: "VehicleCatalog | None" = None,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] | None = None,
+) -> GenArtTransferPlan:
+    """Plant 'GenArten einfuegen…' fuer einen Zielartikel - mit genau dem Ergebnis, das dieselbe
+    Aenderung im Reiter GenArt der Maske haette:
+
+    - GenArten wie beim Laden in die Maske ueber den GenArt-Katalog vereinheitlicht
+      (canonicalize = ApolloImportApp._canonicalize_genart_selection); geschrieben werden dann
+      wie dort alle GenArt-Zeilen des Artikels mit diesen Bezeichnungen.
+    - Fahrzeuge wie beim Laden in die Maske mit den KTyp-Stammdaten vervollstaendigt
+      (resolve_vehicle_link_rows wie VehicleLinkTableFrame.set_rows).
+    - Entfernte GenArten (nur Ersetzen): vehicle_rows_after_genart_removal wie
+      forget_genart_ids beim Entfernen in der Maske - ihre Zeilen fallen weg, Fahrzeuge, die
+      nur an entfernten GenArten hingen, ebenso (Regel 3). Danach kommen die neuen GenArten
+      dazu und gelten fuer alle verbliebenen Fahrzeuge (Regel 4, build_vehicle_link_export_rows);
+      ein Artikel ohne GenArt verknuepft mit der ersten GenArt alle Fahrzeuge. Ersetzen
+      entspricht also: in der Maske erst die nicht uebertragenen GenArten entfernen, dann die
+      fehlenden hinzufuegen (sollen Fahrzeuge an den neuen GenArten haengen bleiben: erst
+      Ergaenzen, dann Ersetzen - wie der Tipp der Rueckfrage in der Maske).
+    """
+    canon = canonicalize or (lambda selection: selection)
+    old = normalize_genart_selections([canon(selection) for selection in snapshot.genart_selections])
+    source = normalize_genart_selections([canon(selection) for selection in source_selections])
+    new = genart_selections_after_transfer(old, source, mode)
+    old_ids = [selection.id for selection in old]
+    old_keys = {genart_id.casefold() for genart_id in old_ids}
+    new_ids = [selection.id for selection in new]
+    new_keys = {genart_id.casefold() for genart_id in new_ids}
+    plan = GenArtTransferPlan(
+        article_number=snapshot.article_number,
+        old_selections=old,
+        new_selections=new,
+        added_ids=[genart_id for genart_id in new_ids if genart_id.casefold() not in old_keys],
+        removed_ids=[genart_id for genart_id in old_ids if genart_id.casefold() not in new_keys],
+    )
+    catalog_ready = vehicle_catalog is not None and vehicle_catalog.count > 0
+    if not catalog_ready:
+        plan.waiting_for_catalog = vehicle_links_waiting_for_catalog(snapshot.vehicle_link_rows)
+    vehicle_rows = resolve_vehicle_link_rows(snapshot.vehicle_link_rows, vehicle_catalog)
+    plan.vehicles_before = len(vehicle_rows)
+    if not plan.added_ids and not plan.removed_ids:
+        return plan
+    if plan.removed_ids:
+        remaining = [genart_id for genart_id in old_ids if genart_id not in plan.removed_ids]
+        kept, dropped = vehicle_rows_after_genart_removal(vehicle_rows, plan.removed_ids, remaining)
+    else:
+        kept, dropped = vehicle_rows, []
+    stored = bundle_from_snapshot(snapshot, attribute_key_values_by_group or {})
+    # Stand der Maske nach dem Laden (Anker des Live-Speicherns): danach entscheidet sich wie
+    # dort, ob die Fahrzeugzeilen geschrieben werden muessen.
+    loaded = dataclass_replace(stored, genart_selections=old, genart_id="", genart_bezeichnung="", vehicle_link_rows=vehicle_rows)
+    plan.bundle = dataclass_replace(stored, genart_selections=new, genart_id="", genart_bezeichnung="", vehicle_link_rows=kept)
+    plan.vehicles_dropped = len(dropped)
+    plan.vehicle_rows_after = build_vehicle_link_export_rows(plan.bundle)
+    plan.vehicle_export_changed = plan.vehicle_rows_after != build_vehicle_link_export_rows(loaded)
+
+    def link_keys(rows: list[list[str]]) -> Counter[tuple[str, str, str]]:
+        return Counter((str(row[1]), str(row[2]), str(row[4])) for row in rows)
+
+    in_file = link_keys(build_vehicle_link_export_rows(stored))
+    after = link_keys(plan.vehicle_rows_after)
+    plan.rows_added = sum((after - in_file).values())
+    plan.rows_removed = sum((in_file - after).values())
+    return plan
+
+
+class GenArtTransferBlockedError(RuntimeError):
+    """'GenArten einfuegen…': eine Output-Datei ist gerade nicht ersetzbar (z. B. in Excel
+    geoeffnet) - es wurde nichts gesichert und nichts geschrieben."""
+
+
+class GenArtTransferWriteError(RuntimeError):
+    """'GenArten einfuegen…': Schreiben gescheitert. stuck_articles = Artikel, deren Zeilen
+    trotzdem geaendert in einer Datei stehen (nur wenn das Zurueckholen scheiterte)."""
+
+    def __init__(self, message: str, stuck_articles: set[str] | None = None) -> None:
+        super().__init__(message)
+        self.stuck_articles = set(stuck_articles or ())
+
+
+@dataclass
+class GenArtTransferWriteResult:
+    written_at: str
+    backup_dir: Path
+    backup_files: list[Path] = field(default_factory=list)
+    genart_changed: set[str] = field(default_factory=set)
+    vehicle_changed: set[str] = field(default_factory=set)
+    # Artikel, deren Fahrzeugzeilen geschrieben wurden (Export geaendert).
+    vehicle_written: set[str] = field(default_factory=set)
+    files_written: list[str] = field(default_factory=list)
+
+    @property
+    def changed_articles(self) -> set[str]:
+        return self.genart_changed | self.vehicle_changed
+
+
+def _restore_output_files_from_backup(output_root: Path, names: list[str], backup_dir: Path, stamp: str) -> list[str]:
+    """Holt geschriebene Output-Dateien aus der eben angelegten Sicherung zurueck (atomar).
+    Rueckgabe: Dateien, bei denen das scheiterte (mit Grund)."""
+    failed: list[str] = []
+    for name in names:
+        path = output_root / name
+        backup = backup_dir / backup_file_name(name, stamp)
+        key = _workbook_cache_key(path)
+        with _workbook_file_lock(key):
+            try:
+                if backup.is_file():
+                    _replace_file_atomically(path, backup.read_bytes())
+                else:
+                    # Die Datei gab es vorher nicht.
+                    path.unlink(missing_ok=True)
+            except OSError as exc:
+                failed.append(f"{name} ({exc})")
+            finally:
+                _forget_workbook_rows(key)
+    return failed
+
+
+def write_genart_transfer(
+    output_root: Path, plans: list[GenArtTransferPlan], backup_dir: Path, written_at: str | None = None
+) -> GenArtTransferWriteResult:
+    """Schreibt 'GenArten einfuegen…' fuer alle geaenderten Zielartikel: GenArt_Artikel.xlsx und
+    - wenn sich Fahrzeugzeilen aendern - Fahrzeugverknuepfungen.xlsx je EINMAL fuer alle Ziele.
+    Unveraenderte Zeilen behalten ihr 'Zuletzt geschrieben am'
+    (replace_articles_rows_preserving_timestamps).
+
+    Vorher muessen die zu schreibenden Dateien ersetzbar sein (output_file_write_blocker; sonst
+    GenArtTransferBlockedError - nichts gesichert, nichts geschrieben); dann werden sie als
+    <Name>_Sicherung_<Stempel>.xlsx nach backup_dir kopiert (wie bei der IMS-Uebernahme).
+    Scheitert die Fahrzeugdatei, nachdem die GenArt-Datei geschrieben ist, wird diese aus der
+    Sicherung zurueckgeholt - beide Dateien bleiben auf dem alten Stand. GenArtTransferWriteError
+    beschreibt den Stand. Der Aufrufer haelt WORKBOOK_WRITE_LOCK."""
+    changed_plans = [plan for plan in plans if plan.changed and plan.bundle is not None]
+    written_at = written_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    genart_rows = {plan.article_number: build_genart_export_rows(plan.bundle) for plan in changed_plans if plan.bundle}
+    vehicle_rows = {plan.article_number: plan.vehicle_rows_after for plan in changed_plans if plan.vehicle_export_changed}
+    result = GenArtTransferWriteResult(written_at=written_at, backup_dir=backup_dir)
+    if not genart_rows:
+        return result
+    targets: list[tuple[tuple[str, str], list[str], dict[str, list[list[str]]]]] = [(GENART_FILE, GENART_HEADERS, genart_rows)]
+    if vehicle_rows:
+        targets.append((VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS, vehicle_rows))
+    names = [file_spec[0] for file_spec, _headers, _rows in targets]
+    blocked = [(name, output_file_write_blocker(output_root / name)) for name in names]
+    blocked = [(name, reason) for name, reason in blocked if reason]
+    if blocked:
+        raise GenArtTransferBlockedError("\n".join(f"{name}: {reason}" for name, reason in blocked))
+    articles = sorted(genart_rows)
+    listing = ", ".join(articles[:20]) + (f" … und {len(articles) - 20} weitere" if len(articles) > 20 else "")
+    try:
+        stamp = unique_backup_stamp(backup_dir, names, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        result.backup_files = backup_output_files(output_root, backup_dir, stamp, names=names)
+    except OSError as exc:
+        raise GenArtTransferWriteError(
+            f"Die Sicherung nach {backup_dir} ist gescheitert: {exc}\n\n"
+            f"Es wurde nichts geändert (Zielartikel: {listing})."
+        ) from exc
+    for file_spec, headers, rows_by_article in targets:
+        path = output_root / file_spec[0]
+        signature_before = _workbook_signature(path)
+        try:
+            changed = replace_articles_rows_preserving_timestamps(
+                path, file_spec[1], headers, rows_by_article, written_at=written_at
+            )
+        except Exception as exc:
+            if not result.files_written:
+                raise GenArtTransferWriteError(
+                    f"{file_spec[0]} konnte nicht geschrieben werden: {exc}\n\n"
+                    f"Es wurde nichts geändert (Zielartikel: {listing})."
+                ) from exc
+            failed = _restore_output_files_from_backup(output_root, result.files_written, backup_dir, stamp)
+            written_names = ", ".join(result.files_written)
+            if not failed:
+                raise GenArtTransferWriteError(
+                    f"{file_spec[0]} konnte nicht geschrieben werden: {exc}\n\n"
+                    f"{written_names} wurde aus der Sicherung zurückgeholt – beide Dateien sind auf dem alten "
+                    f"Stand, es wurde nichts übertragen (Zielartikel: {listing})."
+                ) from exc
+            raise GenArtTransferWriteError(
+                f"{file_spec[0]} konnte nicht geschrieben werden: {exc}\n\n"
+                f"ACHTUNG: {written_names} ist schon geschrieben (neue GenArten), {file_spec[0]} hat noch die alten "
+                f"Zeilen, und das Zurückholen aus der Sicherung ist gescheitert: {'; '.join(failed)}.\n"
+                f"Betroffene Artikel: {listing}\n\n"
+                f"Bitte {', '.join(backup_file_name(name, stamp) for name in result.files_written)} aus {backup_dir} "
+                f"zurück in den Ausgabeordner kopieren (wieder als {written_names}) und danach in der Übersicht "
+                "'Liste aktualisieren' klicken.",
+                stuck_articles=set(result.genart_changed),
+            ) from exc
+        if _workbook_signature(path) != signature_before:
+            result.files_written.append(file_spec[0])
+        if file_spec is GENART_FILE:
+            result.genart_changed = changed
+        else:
+            result.vehicle_changed = changed
+            result.vehicle_written = set(rows_by_article)
+    return result
 
 
 class SingleLineTranslationFrame(ttk.LabelFrame):
@@ -12216,10 +12912,24 @@ class ArticleListTableFrame(ttk.LabelFrame):
 
 
 class VehicleLinkTableFrame(ttk.LabelFrame):
-    def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_change: Callable[[], None] | None = None,
+        genart_provider: Callable[[], list[GenArtSelection]] | None = None,
+    ) -> None:
         super().__init__(master, text="Fahrzeugverknüpfungen", padding=14)
         self.on_change = on_change
+        # Liefert die GenArts des Artikels (Reiter GenArt) fuer die Spalte 'GenArt'.
+        self.genart_provider = genart_provider
         self.catalog: VehicleCatalog | None = None
+        # Je Tree-Eintrag die bereinigte Zeile (get_rows liefert sie von hier, statt die Tk-Werte
+        # neu zu parsen) und die angezeigte GenArt-Beschriftung. Gepflegt in _insert_row,
+        # set_rows, remove_selected, clear_rows, forget_genart_ids.
+        self._rows: dict[str, VehicleLinkRow] = {}
+        self._labels: dict[str, str] = {}
+        # Hinweis des zuletzt geladenen Artikels (Zeilen der Datei, die nicht zu den GenArts passen).
+        self._load_note = ""
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="Zeilen kopieren", command=self.copy_selected_rows)
         self.context_menu.add_command(label="Zeilen löschen", command=self.remove_selected)
@@ -12240,7 +12950,10 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             text=(
                 "Motorcode(s) eingeben - die passenden KTyp-Nummern (TopMotive und TecDoc) werden automatisch "
                 "aus den KTyp-Stammdaten ergänzt. Für den Apollo-Import: Fahrzeugtyp -> TecDoc Verknuepfungstyp ID "
-                "(PKW = 2), KTypNr -> TecDoc Verknuepfungs ID. Mehrere Motorcodes mit ; trennen."
+                "(PKW = 2), KTypNr -> TecDoc Verknuepfungs ID. In die Importdatei kommt nur die TecDoc-Nummer, "
+                "je Fahrzeug und GenArt eine Zeile; die TopMotive-Nummer ist nur zur Anzeige. Spalte GenArt: mit "
+                "welchen GenArts das Fahrzeug verknüpft ist - eine neue GenArt gilt für alle Fahrzeuge, eine "
+                "gelöschte entfernt ihre Verknüpfungen. Mehrere Motorcodes mit ; trennen."
             ),
             foreground="#5E6472",
             wraplength=980,
@@ -12287,6 +13000,11 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             "power",
             "ktyp_topmotive",
             "ktyp_tecdoc",
+            "genarts",
+            # Unsichtbar: GenArts des Fahrzeugs aus der Datei bzw. beim Laden ausgeschlossene
+            # (siehe VehicleLinkRow) - muessen den Weg Maske -> Bundle unveraendert ueberstehen.
+            "genart_ids",
+            "excluded_genart_ids",
         )
         display_columns = (
             "vehicle_type",
@@ -12298,7 +13016,9 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             "power",
             "ktyp_topmotive",
             "ktyp_tecdoc",
+            "genarts",
         )
+        self.display_columns = display_columns
         self.tree = ttk.Treeview(
             self,
             columns=columns,
@@ -12318,6 +13038,7 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             "power": "Leistung",
             "ktyp_topmotive": "KTyp TopMotive",
             "ktyp_tecdoc": "KTyp TecDoc",
+            "genarts": "GenArt",
         }
         widths = {
             "vehicle_type": 90,
@@ -12329,6 +13050,7 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             "power": 120,
             "ktyp_topmotive": 120,
             "ktyp_tecdoc": 110,
+            "genarts": 130,
         }
         for column, text in headings.items():
             self.tree.heading(column, text=text)
@@ -12399,8 +13121,11 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             return
         codes = split_code_list_input(raw)
         type_id, type_label = self._current_vehicle_type()
-        existing = {(row.vehicle_type_id, row.ktyp_topmotive, row.ktyp_tecdoc) for row in self.get_rows()}
+        # Ein Fahrzeug ist ueber seine TecDoc-Nummer eindeutig (ohne: ueber die TopMotive-
+        # Nummer) - so zaehlt auch ein geladenes Fahrzeug ohne TopMotive-Nr. als vorhanden.
+        existing = {self._vehicle_key(row.vehicle_type_id, row.ktyp_topmotive, row.ktyp_tecdoc) for row in self.get_rows()}
         added = 0
+        added_without_tecdoc = 0
         matched_codes = 0
         not_found: list[str] = []
         for code in codes:
@@ -12410,52 +13135,249 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
                 continue
             matched_codes += 1
             for match in matches:
-                key = (type_id, match.ktyp_topmotive, match.ktyp_tecdoc)
+                key = self._vehicle_key(type_id, match.ktyp_topmotive, match.ktyp_tecdoc)
                 if key in existing:
                     continue
                 existing.add(key)
-                self.tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        type_id,
-                        format_vehicle_type_choice(type_id, type_label),
-                        match.motorcode or normalize_motorcode(code),
-                        match.manufacturer,
-                        match.model,
-                        match.description,
-                        format_year_range(match.year_from, match.year_to),
-                        match.power,
-                        match.ktyp_topmotive,
-                        match.ktyp_tecdoc,
+                self._insert_row(
+                    VehicleLinkRow(
+                        vehicle_type_id=type_id,
+                        vehicle_type_label=type_label,
+                        motorcode=match.motorcode or normalize_motorcode(code),
+                        ktyp_topmotive=match.ktyp_topmotive,
+                        ktyp_tecdoc=match.ktyp_tecdoc,
+                        manufacturer=match.manufacturer,
+                        model=match.model,
+                        description=match.description,
+                        year_from=match.year_from,
+                        year_to=match.year_to,
+                        power=match.power,
                     ),
+                    type_display=format_vehicle_type_choice(type_id, type_label),
                 )
                 added += 1
+                if not match.ktyp_tecdoc:
+                    added_without_tecdoc += 1
         summary = f"{added} Fahrzeug(e) aus {matched_codes} Motorcode(s) hinzugefügt."
+        if added_without_tecdoc:
+            # Die Datei fuehrt nur TecDoc-Nummern: solche Fahrzeuge stehen nur bis zum Verlassen
+            # des Artikels in der Maske (nach dem Neuladen sind sie weg).
+            summary += (
+                f" {added_without_tecdoc} davon ohne TecDoc-Nummer – werden nicht gespeichert und nicht "
+                "nach Apollo exportiert."
+            )
         if not_found:
             shown = ", ".join(not_found[:8]) + (" ..." if len(not_found) > 8 else "")
             summary += f" Ohne Treffer: {shown}"
         if added == 0 and not not_found:
             summary = "Alle gefundenen Fahrzeuge sind bereits vorhanden."
+        # Auch frueher hinzugefuegte Fahrzeuge ohne TecDoc-Nummer sichtbar halten.
+        total_without = count_vehicle_links_without_tecdoc(self.get_rows())
+        if total_without > added_without_tecdoc:
+            summary += f" Insgesamt {total_without} Fahrzeug(e) ohne TecDoc-Nummer, nicht exportiert."
         self.result_var.set(summary)
         if added:
             self.motorcode_var.set("")
             self._select_last_row()
             self._emit_change()
 
+    @staticmethod
+    def _vehicle_key(vehicle_type_id: str, ktyp_topmotive: str, ktyp_tecdoc: str) -> tuple[str, str]:
+        ktyp_tecdoc = str(ktyp_tecdoc).strip()
+        return (str(vehicle_type_id).strip() or DEFAULT_VEHICLE_TYPE_ID, ktyp_tecdoc or f"TM:{str(ktyp_topmotive).strip()}")
+
+    def _article_genart_ids(self) -> tuple[str, ...]:
+        if self.genart_provider is None:
+            return ()
+        try:
+            selections = self.genart_provider() or []
+        except Exception:
+            return ()
+        return _unique_ids(selection.id for selection in normalize_genart_selections(list(selections)))
+
+    def _catalog_ready(self) -> bool:
+        return self.catalog is not None and self.catalog.count > 0
+
+    def _label_context(self) -> tuple[tuple[str, ...], set[str], bool]:
+        current = self._article_genart_ids()
+        return current, set(current), self._catalog_ready()
+
+    @staticmethod
+    def _canonical_row(row: VehicleLinkRow) -> VehicleLinkRow:
+        """Die Zeile so, wie sie aus den Spalten zurueckgelesen wuerde (bis v0.1.52 parste
+        get_rows die Tk-Werte): Fahrzeugtyp-Bezeichnung aus der ID, Bauzeit 'von - bis'."""
+        label = vehicle_type_label_for_id(row.vehicle_type_id)
+        year_from, year_to = row.year_from, row.year_to
+        if year_to and not year_from:
+            year_from, year_to = year_to, ""
+        if label == row.vehicle_type_label and year_from == row.year_from and year_to == row.year_to:
+            return row
+        return _mark_vehicle_row_normalized(
+            dataclass_replace(row, vehicle_type_label=label, year_from=year_from, year_to=year_to)
+        )
+
+    def _item_row(self, item_id: str) -> VehicleLinkRow:
+        row = self._rows.get(item_id)
+        if row is None:
+            # Rueckfall (Eintrag nicht ueber _insert_row entstanden): aus den Spalten lesen.
+            raw = self._row_from_item(item_id)
+            normalized = normalize_vehicle_link_rows([raw])
+            row = self._canonical_row(normalized[0]) if normalized else raw
+            self._rows[item_id] = row
+        return row
+
+    def _insert_row(
+        self,
+        row: VehicleLinkRow,
+        type_display: str | None = None,
+        context: tuple[tuple[str, ...], set[str], bool] | None = None,
+    ) -> str:
+        normalized = normalize_vehicle_link_rows([row])
+        if not normalized:
+            return ""
+        shown = normalized[0]
+        current, current_set, catalog_ready = context if context is not None else self._label_context()
+        label = _vehicle_genart_label(shown, current, current_set, catalog_ready)
+        item_id = self.tree.insert(
+            "",
+            "end",
+            values=(
+                shown.vehicle_type_id,
+                type_display or format_vehicle_type_choice(shown.vehicle_type_id, shown.vehicle_type_label),
+                shown.motorcode,
+                shown.manufacturer,
+                shown.model,
+                shown.description,
+                format_year_range(shown.year_from, shown.year_to),
+                shown.power,
+                shown.ktyp_topmotive,
+                shown.ktyp_tecdoc,
+                label,
+                ";".join(shown.genart_ids),
+                ";".join(shown.excluded_genart_ids),
+            ),
+        )
+        self._rows[item_id] = self._canonical_row(shown)
+        self._labels[item_id] = label
+        return item_id
+
+    def refresh_genart_column(self) -> None:
+        """Spalte 'GenArt' nach einer GenArt-Aenderung des Artikels neu beschriften."""
+        current, current_set, catalog_ready = self._label_context()
+        for item_id in self.tree.get_children():
+            label = _vehicle_genart_label(self._item_row(item_id), current, current_set, catalog_ready)
+            if self._labels.get(item_id) != label:
+                self.tree.set(item_id, "genarts", label)
+                self._labels[item_id] = label
+
+    def count_vehicles_dropped_by_genart_removal(
+        self, removed_genart_ids: list[str] | tuple[str, ...], remaining_genart_ids: list[str] | tuple[str, ...]
+    ) -> int:
+        """Wie viele Fahrzeuge an keiner GenArt mehr haengen, wenn diese GenArts entfernt
+        werden (fuer die Rueckfrage vor dem Entfernen, siehe forget_genart_ids)."""
+        removed = set(_unique_ids(removed_genart_ids))
+        if not removed:
+            return 0
+        current = _unique_ids(remaining_genart_ids)
+        current_set = set(current)
+        return sum(
+            1
+            for item_id in self.tree.get_children()
+            if _vehicle_row_after_genart_removal(self._item_row(item_id), removed, current, current_set) is None
+        )
+
+    def forget_genart_ids(self, removed_genart_ids: list[str]) -> int:
+        """Vom Nutzer entfernte GenArts (der Reiter GenArt zeigt schon die verbliebenen) bei
+        allen Fahrzeugen vergessen: wird eine davon spaeter wieder hinzugefuegt, gilt sie wie
+        jede neue GenArt fuer alle Fahrzeuge. Fahrzeuge, die danach an keiner GenArt mehr
+        haengen, fallen weg - wie nach dem Neuladen aus der Datei, aus der ihre Zeilen mit der
+        GenArt verschwinden (vehicle_rows_after_genart_removal). Rueckgabe: Anzahl weggefallener
+        Fahrzeuge. Schreibt nichts selbst: der GenArt-Auftrag zieht die Fahrzeugzeilen nach."""
+        removed = set(_unique_ids(removed_genart_ids))
+        if not removed:
+            return 0
+        current, current_set, catalog_ready = self._label_context()
+        dropped: list[str] = []
+        for item_id in self.tree.get_children():
+            row = self._item_row(item_id)
+            after = _vehicle_row_after_genart_removal(row, removed, current, current_set)
+            if after is None:
+                dropped.append(item_id)
+                continue
+            if after is not row:
+                self._rows[item_id] = after
+                self.tree.set(item_id, "genart_ids", ";".join(after.genart_ids))
+                self.tree.set(item_id, "excluded_genart_ids", ";".join(after.excluded_genart_ids))
+            label = _vehicle_genart_label(after, current, current_set, catalog_ready)
+            if self._labels.get(item_id) != label:
+                self.tree.set(item_id, "genarts", label)
+                self._labels[item_id] = label
+        if dropped:
+            self.tree.delete(*dropped)
+            for item_id in dropped:
+                self._rows.pop(item_id, None)
+                self._labels.pop(item_id, None)
+        self.update_result_hint()
+        return len(dropped)
+
+    def resolve_with_catalog(self, catalog: VehicleCatalog | None) -> bool:
+        """KTyp-Stammdaten sind (spaeter) da: Fahrzeuge, die ohne Katalog geladen wurden, wie
+        beim Laden mit Katalog vervollstaendigen (TecDoc-Nr. alter Topmotive-Zeilen, Fahrzeug-
+        daten) und gleiche Fahrzeuge zusammenfassen. Rueckgabe True, wenn sich etwas geaendert
+        hat; die Beschriftung (wartet/nicht exportiert) wird in jedem Fall aufgefrischt."""
+        rows = self.get_rows()
+        resolved = resolve_vehicle_link_rows(rows, catalog)
+        if resolved == rows:
+            self.refresh_genart_column()
+            self.update_result_hint()
+            return False
+        self.set_rows(resolved, note=self._load_note)
+        return True
+
+    def update_result_hint(self, note: str | None = None) -> None:
+        """Ergebniszeile: Fahrzeuge ohne TecDoc-Nummer (nicht exportiert) bzw. noch ohne
+        KTyp-Stammdaten, dazu der Hinweis des Ladens (note=None: bisherigen behalten)."""
+        if note is not None:
+            self._load_note = note
+        parts: list[str] = []
+        hint = vehicle_link_tecdoc_hint(self.get_rows(), self._catalog_ready())
+        if hint:
+            parts.append(f"Fahrzeuge: {hint}.")
+        if self._load_note:
+            parts.append(self._load_note)
+        self.result_var.set(" ".join(parts))
+
     def remove_selected(self) -> None:
         selection = self.tree.selection()
         if not selection:
             return
+        if not self._catalog_ready() and any(
+            self._item_row(item_id).ktyp_topmotive and not self._item_row(item_id).ktyp_tecdoc for item_id in self.tree.get_children()
+        ):
+            # Ohne KTyp-Katalog steht ein Fahrzeug aus alten Topmotive-Zeilen doppelt da (einmal
+            # nur mit TopMotive-, einmal nur mit TecDoc-Nummer); entfernt man eine Haelfte, kaeme
+            # das Fahrzeug mit der anderen zurueck, sobald der Katalog die Nummern zusammenfuehrt.
+            messagebox.showwarning(
+                APP_TITLE,
+                "Die KTyp-Stammdaten werden noch geladen: Fahrzeuge mit nur einer TopMotive-Nummer "
+                "bekommen ihre TecDoc-Nummer erst danach.\n\nBitte kurz warten und dann entfernen.",
+            )
+            return
+        self.tree.delete(*selection)
         for item_id in selection:
-            self.tree.delete(item_id)
+            self._rows.pop(item_id, None)
+            self._labels.pop(item_id, None)
+        # Ergebniszeile nachziehen (z. B. 'n ohne TecDoc-Nummer', wenn genau das Fahrzeug weg ist).
+        self.update_result_hint()
         self._emit_change()
 
     def clear_rows(self) -> None:
-        if not self.tree.get_children():
+        children = self.tree.get_children()
+        if not children:
             return
-        for item_id in self.tree.get_children():
-            self.tree.delete(item_id)
+        self.tree.delete(*children)
+        self._rows.clear()
+        self._labels.clear()
         self.result_var.set("")
         self._emit_change()
 
@@ -12465,7 +13387,7 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             return
         rows = []
         for item_id in selected:
-            values = [str(value).strip() for value in self.tree.item(item_id, "values")[1:]]
+            values = [str(self.tree.set(item_id, column)).strip() for column in self.display_columns]
             rows.append("\t".join(values))
         self.clipboard_clear()
         self.clipboard_append("\n".join(rows))
@@ -12476,55 +13398,64 @@ class VehicleLinkTableFrame(ttk.LabelFrame):
             self.tree.selection_set(children[-1])
             self.tree.see(children[-1])
 
-    def get_rows(self) -> list[VehicleLinkRow]:
-        rows: list[VehicleLinkRow] = []
-        for item_id in self.tree.get_children():
-            values = list(self.tree.item(item_id, "values"))
-            values += [""] * (10 - len(values))
-            vehicle_type_id, _display, motorcode, manufacturer, model, description, year, power, ktyp_tm, ktyp_td = values[:10]
-            year_text = str(year).strip()
-            if " - " in year_text:
-                year_from, year_to = [part.strip() for part in year_text.split(" - ", 1)]
-            else:
-                year_from, year_to = year_text, ""
-            type_id = str(vehicle_type_id).strip() or DEFAULT_VEHICLE_TYPE_ID
-            rows.append(
-                VehicleLinkRow(
-                    vehicle_type_id=type_id,
-                    vehicle_type_label=vehicle_type_label_for_id(type_id),
-                    motorcode=str(motorcode).strip(),
-                    ktyp_topmotive=str(ktyp_tm).strip(),
-                    ktyp_tecdoc=str(ktyp_td).strip(),
-                    manufacturer=str(manufacturer).strip(),
-                    model=str(model).strip(),
-                    description=str(description).strip(),
-                    year_from=year_from,
-                    year_to=year_to,
-                    power=str(power).strip(),
-                )
-            )
-        return normalize_vehicle_link_rows(rows)
+    def _row_from_item(self, item_id: str) -> VehicleLinkRow:
+        # Spalten wie in __init__; Tk liefert Zahlen-Texte als int zurueck - deshalb str().
+        values = list(self.tree.item(item_id, "values"))
+        values += [""] * (13 - len(values))
+        (
+            vehicle_type_id,
+            _display,
+            motorcode,
+            manufacturer,
+            model,
+            description,
+            year,
+            power,
+            ktyp_tm,
+            ktyp_td,
+            _genart_label,
+            genart_ids,
+            excluded_genart_ids,
+        ) = values[:13]
+        year_text = str(year).strip()
+        if " - " in year_text:
+            year_from, year_to = [part.strip() for part in year_text.split(" - ", 1)]
+        else:
+            year_from, year_to = year_text, ""
+        type_id = str(vehicle_type_id).strip() or DEFAULT_VEHICLE_TYPE_ID
+        return VehicleLinkRow(
+            vehicle_type_id=type_id,
+            vehicle_type_label=vehicle_type_label_for_id(type_id),
+            motorcode=str(motorcode).strip(),
+            ktyp_topmotive=str(ktyp_tm).strip(),
+            ktyp_tecdoc=str(ktyp_td).strip(),
+            manufacturer=str(manufacturer).strip(),
+            model=str(model).strip(),
+            description=str(description).strip(),
+            year_from=year_from,
+            year_to=year_to,
+            power=str(power).strip(),
+            genart_ids=_unique_ids(str(genart_ids).split(";")),
+            excluded_genart_ids=_unique_ids(str(excluded_genart_ids).split(";")),
+        )
 
-    def set_rows(self, rows: list[VehicleLinkRow]) -> None:
-        for item_id in self.tree.get_children():
-            self.tree.delete(item_id)
-        for row in normalize_vehicle_link_rows(rows):
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    row.vehicle_type_id,
-                    format_vehicle_type_choice(row.vehicle_type_id, row.vehicle_type_label),
-                    row.motorcode,
-                    row.manufacturer,
-                    row.model,
-                    row.description,
-                    format_year_range(row.year_from, row.year_to),
-                    row.power,
-                    row.ktyp_topmotive,
-                    row.ktyp_tecdoc,
-                ),
-            )
+    def get_rows(self) -> list[VehicleLinkRow]:
+        return normalize_vehicle_link_rows([self._item_row(item_id) for item_id in self.tree.get_children()])
+
+    def set_rows(self, rows: list[VehicleLinkRow], note: str = "") -> None:
+        """Maske fuellen; note = Hinweis des Ladens fuer die Ergebniszeile (siehe update_result_hint).
+        Ist der KTyp-Katalog geladen, werden ohne Katalog eingelesene Fahrzeuge dabei
+        vervollstaendigt (resolve_vehicle_link_rows) - die Maske zeigt dann denselben Stand
+        wie nach einem Laden mit Katalog, und ihr Fingerabdruck ist der gespeicherte Stand."""
+        children = self.tree.get_children()
+        if children:
+            self.tree.delete(*children)
+        self._rows.clear()
+        self._labels.clear()
+        context = self._label_context()
+        for row in resolve_vehicle_link_rows(rows, self.catalog):
+            self._insert_row(row, context=context)
+        self.update_result_hint(note)
 
     def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
         item_id = self.tree.identify_row(event.y)
@@ -12752,6 +13683,170 @@ class SearchTermImportDialog:
 
     def _choose(self, mode: str) -> None:
         self.result = mode
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+    def show(self) -> str | None:
+        try:
+            self.window.grab_set()
+        except tk.TclError:  # pragma: no cover - z. B. verstecktes Hauptfenster
+            pass
+        self.window.wait_window()
+        return self.result
+
+
+class OverviewGenArtTransferDialog:
+    """Vorschau und Modus-Wahl fuer 'GenArten einfuegen…' im Reiter Uebersicht.
+
+    plans_by_mode: je Modus ("append", "replace") die Plaene aller Zielartikel
+    (plan_genart_transfer). show() blockiert und liefert den gewaehlten Modus oder None
+    (Abbrechen/Fenster geschlossen)."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        source_article: str,
+        source_selections: list[GenArtSelection],
+        plans_by_mode: dict[str, list[GenArtTransferPlan]],
+        *,
+        skipped_source: bool = False,
+        missing_articles: list[str] | None = None,
+        backup_dir: Path | None = None,
+    ) -> None:
+        self.result: str | None = None
+        self.plans_by_mode = plans_by_mode
+        self.window = tk.Toplevel(master)
+        self.window.title(f"{APP_TITLE} – GenArten übertragen")
+        self.window.transient(master)
+        self.window.resizable(True, True)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.window.bind("<Escape>", lambda _event: self._cancel())
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(0, weight=1)
+        self.mode_var = tk.StringVar(value="append")
+        self.summary_var = tk.StringVar()
+        self.warning_var = tk.StringVar()
+
+        frame = ttk.Frame(self.window, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(4, weight=1)
+        ttk.Label(frame, text="GenArten übertragen", font=("Segoe UI Semibold", 11)).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        targets = len(next(iter(plans_by_mode.values()), []))
+        info = [f"Quelle: {source_article} – {format_genart_id_labels(source_selections)}", f"Ziele: {targets} Artikel"]
+        if skipped_source:
+            info[-1] += f" ({source_article} selbst wird übersprungen)"
+        if missing_articles:
+            info.append(
+                f"Nicht mehr im Ausgabeordner (übersprungen): {', '.join(missing_articles[:10])}"
+                + (" …" if len(missing_articles) > 10 else "")
+            )
+        self.info_text = "\n".join(info)
+        ttk.Label(frame, text=self.info_text, wraplength=760, justify="left").grid(row=1, column=0, sticky="w")
+
+        modes = ttk.Frame(frame)
+        modes.grid(row=2, column=0, sticky="w", pady=(10, 6))
+        ttk.Radiobutton(
+            modes,
+            text="Ergänzen – fehlende GenArten hinzufügen, vorhandene bleiben",
+            variable=self.mode_var,
+            value="append",
+            command=self._refresh_preview,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            modes,
+            text="Ersetzen – die Zielartikel bekommen genau diese GenArten, andere werden entfernt",
+            variable=self.mode_var,
+            value="replace",
+            command=self._refresh_preview,
+        ).grid(row=1, column=0, sticky="w")
+        ttk.Label(
+            frame,
+            text=(
+                "Wie im Reiter GenArt: eine neue GenArt wird mit allen Fahrzeugen des Artikels verknüpft, mit einer "
+                "entfernten GenArt fallen ihre Fahrzeugzeilen weg – und Fahrzeuge, die nur an entfernten GenArten "
+                "hängen. Unveränderte Zeilen behalten ihr Datum."
+            ),
+            foreground=UI_TEXT_MUTED,
+            wraplength=760,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(0, 8))
+
+        table = ttk.Frame(frame)
+        table.grid(row=4, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        columns = ("article", "before", "after", "vehicles")
+        self.tree = ttk.Treeview(table, columns=columns, show="headings", height=min(max(targets, 4), 14), selectmode="browse")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        for column, heading, width in (
+            ("article", "Artikel", 140),
+            ("before", "bisher", 170),
+            ("after", "danach", 170),
+            ("vehicles", "Fahrzeuge", 330),
+        ):
+            self.tree.heading(column, text=heading)
+            self.tree.column(column, width=width, anchor="w", stretch=(column == "vehicles"))
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        ttk.Label(frame, textvariable=self.summary_var, wraplength=760, justify="left").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frame, textvariable=self.warning_var, foreground="#B3261E", wraplength=760, justify="left").grid(
+            row=6, column=0, sticky="w", pady=(4, 0)
+        )
+        if backup_dir is not None:
+            ttk.Label(
+                frame,
+                text=(
+                    f"Vor dem Schreiben werden {GENART_FILE[0]} und – wenn sich Fahrzeugzeilen ändern – "
+                    f"{VEHICLE_LINK_FILE[0]} gesichert nach: {backup_dir}"
+                ),
+                foreground=UI_TEXT_MUTED,
+                wraplength=760,
+                justify="left",
+            ).grid(row=7, column=0, sticky="w", pady=(4, 0))
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=8, column=0, sticky="e", pady=(14, 0))
+        transfer_button = ttk.Button(button_row, text="Übertragen", style="Accent.TButton", command=self._transfer)
+        transfer_button.grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(button_row, text="Abbrechen", command=self._cancel).grid(row=0, column=1)
+        transfer_button.focus_set()
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        plans = self.plans_by_mode.get(self.mode_var.get(), [])
+        self.tree.delete(*self.tree.get_children())
+        for plan in plans:
+            self.tree.insert("", "end", values=(plan.article_number, plan.before_label(), plan.after_label(), plan.vehicle_label()))
+        changed = [plan for plan in plans if plan.changed]
+        rows_added = sum(plan.rows_added for plan in changed)
+        rows_removed = sum(plan.rows_removed for plan in changed)
+        self.summary_var.set(
+            f"{len(changed)} Artikel werden geändert, {len(plans) - len(changed)} {GENART_TRANSFER_UNCHANGED_LABEL} – "
+            f"Fahrzeugzeilen: +{format_count_de(rows_added)} / −{format_count_de(rows_removed)}"
+        )
+        dropped = [plan for plan in changed if plan.vehicles_dropped]
+        if dropped:
+            total = sum(plan.vehicles_dropped for plan in dropped)
+            self.warning_var.set(
+                f"Achtung: {format_count_de(total)} Fahrzeug(e) in {len(dropped)} Artikel(n) fallen weg – sie hängen nur an "
+                f"GenArten, die entfernt werden (ihre Zeilen in {VEHICLE_LINK_FILE[0]} werden gelöscht). Tipp: Sollen sie mit "
+                "den neuen GenArten verknüpft bleiben, zuerst 'Ergänzen' übertragen und danach 'Ersetzen'."
+            )
+        else:
+            self.warning_var.set("")
+
+    def preview_rows(self) -> list[tuple[str, ...]]:
+        """Zeilen der Vorschau (Artikel, bisher, danach, Fahrzeuge) - fuer Tests."""
+        return [tuple(str(value) for value in self.tree.item(item, "values")) for item in self.tree.get_children()]
+
+    def _transfer(self) -> None:
+        self.result = self.mode_var.get()
         self.window.destroy()
 
     def _cancel(self) -> None:
@@ -14472,6 +15567,13 @@ def bundle_from_snapshot(
     )
 
 
+class VehicleCatalogPendingError(RuntimeError):
+    """Fahrzeugverknuepfungen nicht geschrieben: ein Fahrzeug traegt nur die TopMotive-Nummer
+    (alte Zeile, ohne KTyp-Katalog geladen), exportiert wird aber nur die TecDoc-Nummer, und
+    die liefert erst der Katalog. Statt das Fahrzeug still wegzulassen, wartet der Bereich wie
+    ein gescheiterter und wird nachgeholt, sobald der Katalog geladen ist."""
+
+
 @dataclass
 class LiveWriteJob:
     """Ein Schreibauftrag fuer den Hintergrund-Schreiber: ein Artikel, ein oder
@@ -14581,11 +15683,15 @@ class LiveWriter:
 
     def _superseded_locked(self, job: LiveWriteJob) -> bool:
         """Folgeauftrag: alle seine Bereiche wurden nach seinem Bundle schon mit einem
-        juengeren Bundle eingereicht (nur unter self._condition aufrufen)."""
+        juengeren Bundle eingereicht - oder ein juengerer GenArt-Auftrag desselben Artikels
+        (seine Fahrzeugzeilen gehoeren zu einem alten GenArt-Stand; der juengere Auftrag
+        bringt seinen eigenen Folgeauftrag mit). Nur unter self._condition aufrufen."""
         root = str(job.output_root)
-        return bool(job.sections) and all(
-            self._section_seq.get((job.article_number, root, section), 0) > job.bundle_seq for section in job.sections
-        )
+        if not job.sections:
+            return False
+        if self._section_seq.get((job.article_number, root, "genart"), 0) > job.bundle_seq:
+            return True
+        return all(self._section_seq.get((job.article_number, root, section), 0) > job.bundle_seq for section in job.sections)
 
     def submit(self, job: LiveWriteJob) -> bool:
         """Auftrag einreihen; Rueckgabe False, wenn er entfaellt (Schreiber beendet oder
@@ -14921,6 +16027,11 @@ class ApolloImportApp:
         self._overview_render_after_id: str | None = None
         self._overview_sort_column = "article"
         self._overview_sort_desc = False
+        # 'GenArten kopieren' / 'GenArten einfuegen…' in der Uebersicht: kopierter Artikel und
+        # seine GenArten (Reihenfolge wie gespeichert), Kontextmenue, laufende Uebertragung.
+        self._overview_genart_clipboard: tuple[str, list[GenArtSelection]] | None = None
+        self._overview_genart_transfer_running = False
+        self.overview_context_menu: tk.Menu | None = None
         # Ein Neuladen des Artikelverzeichnisses ist angefordert (Katalog neu geladen,
         # KTyp-Parse fertig, Guard hat einen Reload uebersprungen), konnte aber wegen
         # eines laufenden Live-Schreibens noch nicht ausgefuehrt werden. Der Wunsch
@@ -14962,6 +16073,10 @@ class ApolloImportApp:
         # Schliessen versucht sie noch einmal. Faellt mit dem Marker weg
         # (_drop_live_failed_sections).
         self._live_failed_bundles: dict[str, tuple[ExportBundle, Path, dict[str, str]]] = {}
+        # Artikel, deren Fahrzeugverknuepfungen auf den KTyp-Katalog warten (Fahrzeug nur mit
+        # TopMotive-Nummer, Katalog noch nicht geladen - VehicleCatalogPendingError): wie ein
+        # gescheiterter Bereich gemerkt und nachgeholt, sobald der Katalog da ist.
+        self._vehicle_links_waiting_for_catalog: set[str] = set()
         self._live_retry_running = False
         # Solange ein Artikelwechsel bzw. das Laufende des Massenimports auf das Schreiben
         # wartet (die Ereignisschleife laeuft dabei), darf kein zweiter Wechsel dazwischen
@@ -15444,6 +16559,8 @@ class ApolloImportApp:
 
     def _wizard_summary_text(self) -> str:
         article = normalize_article_number(self.article_number_var.get()) or "-"
+        vehicle_rows = self.vehicle_link_frame.get_rows()
+        vehicle_hint = vehicle_link_tecdoc_hint(vehicle_rows, self.vehicle_catalog.count > 0)
         counts = [
             f"Artikel: {article}",
             f"GenArts: {len(self._get_selected_genart_selections())}",
@@ -15451,7 +16568,7 @@ class ApolloImportApp:
             f"Suchwörter: {len(self.search_term_frame.get_terms())}",
             f"OE-Nummern: {len(self.oe_frame.get_rows())}",
             f"Vergleichsnummern: {len(self.comparison_frame.get_rows())}",
-            f"Fahrzeuge: {len(self.vehicle_link_frame.get_rows())}",
+            f"Fahrzeuge: {len(vehicle_rows)}" + (f" ({vehicle_hint})" if vehicle_hint else ""),
             f"Stückliste/Zubehör: {len(self.article_list_frame.get_rows())}",
             f"Bilder: {len(self.image_frame.get_rows())}",
             f"Dokumente: {len(self.document_frame.get_rows())}",
@@ -15691,6 +16808,8 @@ class ApolloImportApp:
                 "year_from": row.year_from,
                 "year_to": row.year_to,
                 "power": row.power,
+                "genart_ids": list(row.genart_ids),
+                "excluded_genart_ids": list(row.excluded_genart_ids),
             }
             for row in normalize_vehicle_link_rows(rows)
         ]
@@ -15703,6 +16822,9 @@ class ApolloImportApp:
             if not isinstance(item, dict):
                 continue
             type_id = str(item.get("vehicle_type_id", DEFAULT_VEHICLE_TYPE_ID)) or DEFAULT_VEHICLE_TYPE_ID
+            # Fehlen beide (aeltere Sitzungsdatei): Fahrzeug mit allen GenArts, wie damals.
+            genart_ids = item.get("genart_ids")
+            excluded_genart_ids = item.get("excluded_genart_ids")
             rows.append(
                 VehicleLinkRow(
                     vehicle_type_id=type_id,
@@ -15716,6 +16838,8 @@ class ApolloImportApp:
                     year_from=str(item.get("year_from", "")),
                     year_to=str(item.get("year_to", "")),
                     power=str(item.get("power", "")),
+                    genart_ids=_unique_ids(genart_ids) if isinstance(genart_ids, list) else (),
+                    excluded_genart_ids=_unique_ids(excluded_genart_ids) if isinstance(excluded_genart_ids, list) else (),
                 )
             )
         return normalize_vehicle_link_rows(rows)
@@ -17562,6 +18686,7 @@ if ($copied) {{
         self.vehicle_link_frame = VehicleLinkTableFrame(
             self.vehicle_tab,
             on_change=lambda: self._write_live_section("vehicle_links"),
+            genart_provider=lambda: list(getattr(self, "selected_genart_selections", [])),
         )
         self.vehicle_link_frame.grid(row=0, column=0, sticky="nsew")
 
@@ -18778,7 +19903,80 @@ if ($copied) {{
         self.vehicle_catalog = catalog
         if hasattr(self, "vehicle_link_frame"):
             self.vehicle_link_frame.set_vehicle_catalog(catalog)
+            self._resolve_mask_vehicles_with_catalog(catalog)
         self.vehicle_count_var.set(f"{catalog.count} KTyp-Datensätze geladen")
+        if catalog.count:
+            self._retry_vehicle_writes_waiting_for_catalog()
+
+    def _resolve_mask_vehicles_with_catalog(self, catalog: VehicleCatalog) -> None:
+        """Der KTyp-Katalog ist da (oder neu geladen): die Fahrzeuge der Maske wie beim Laden mit
+        Katalog vervollstaendigen - alte Topmotive-Zeilen bekommen ihre TecDoc-Nummer, statt beim
+        naechsten Schreiben verloren zu gehen. War der Fahrzeugbereich unveraendert (Maske ==
+        gespeicherter Stand), wird neu verankert: wie nach einem Laden mit warmem Katalog, ohne
+        Eingabe wird nichts geschrieben (F11). Sonst schreibt die naechste Eingabe den
+        vervollstaendigten Stand."""
+        frame = self.vehicle_link_frame
+        article = normalize_article_number(self.article_number_var.get())
+        before_fp: str | None = None
+        if catalog.count and article and article == normalize_article_number(self._mask_article_number):
+            try:
+                before_fp = live_section_fingerprint(self.collect_bundle(ensure_ids=False), "vehicle_links")[0]
+            except ValueError:
+                before_fp = None
+        if not catalog.count:
+            frame.refresh_genart_column()
+            frame.update_result_hint()
+            return
+        if not frame.resolve_with_catalog(catalog) or before_fp is None:
+            return
+        entry = self._live_fingerprints.get(article)
+        unchanged = (
+            entry is not None
+            and entry[1].get("vehicle_links") == before_fp
+            and "vehicle_links" not in self.live_writer.expected_fingerprints(article)
+            and "vehicle_links" not in self.live_writer.completed_fingerprints(article)
+            and "vehicle_links" not in self._live_failed_sections.get(article, set())
+        )
+        if unchanged:
+            try:
+                entry[1]["vehicle_links"] = live_section_fingerprint(self.collect_bundle(ensure_ids=False), "vehicle_links")[0]
+            except ValueError:
+                pass
+
+    def _retry_vehicle_writes_waiting_for_catalog(self) -> None:
+        """Fahrzeugverknuepfungen, die auf den KTyp-Katalog gewartet haben, jetzt schreiben:
+        der Artikel in der Maske aus der (schon vervollstaendigten) Maske, verlassene Artikel
+        mit der gemerkten Eingabe - der Schreiber ergaenzt dort die TecDoc-Nummern."""
+        if not self._vehicle_links_waiting_for_catalog:
+            return
+        if self.live_write_suspended or self._batch_owns_output:
+            # Maske wird gerade gefuellt bzw. Massenimport: gleich noch einmal versuchen.
+            self.root.after(LIVE_WRITE_POLL_INTERVAL_MS, self._retry_vehicle_writes_waiting_for_catalog)
+            return
+        waiting = sorted(self._vehicle_links_waiting_for_catalog)
+        self._vehicle_links_waiting_for_catalog.clear()
+        mask_article = normalize_article_number(self.article_number_var.get())
+        for article in waiting:
+            if "vehicle_links" not in self._live_failed_sections.get(article, set()):
+                continue
+            if article == mask_article:
+                self._write_live_section("vehicle_links")
+                continue
+            entry = self._failed_live_write_entry(article)
+            if entry is None or self.live_writer.latest_bundle(article) is not None:
+                continue
+            bundle, output_root, fingerprints = entry
+            self.live_writer.submit(
+                LiveWriteJob(
+                    article_number=article,
+                    sections=set(self._live_failed_sections.get(article, set())),
+                    bundle=bundle,
+                    output_root=output_root,
+                    fingerprints=dict(fingerprints),
+                    stored_input=True,
+                )
+            )
+        self._schedule_live_write_poll()
 
     def _load_vehicle_catalog(self, initial: bool = False) -> None:
         source_text = self.vehicle_source_path_var.get().strip()
@@ -19089,11 +20287,20 @@ if ($copied) {{
                 self.selected_genart_tree.selection_set(existing)
                 self.selected_genart_tree.focus(existing[0])
 
-    def _set_selected_genart_selections(self, selections: list[GenArtSelection], focus_last: bool = False) -> None:
+    def _set_selected_genart_selections(
+        self, selections: list[GenArtSelection], focus_last: bool = False, refresh_vehicle_column: bool = True
+    ) -> None:
+        """refresh_vehicle_column=False: die Fahrzeuge werden gleich danach ohnehin neu gesetzt
+        (Laden eines Artikels) bzw. neu beschriftet (forget_genart_ids) - bei ~1.800 Fahrzeugen
+        spart das einen Durchlauf ueber die alten Zeilen."""
         canonicalized = [self._canonicalize_genart_selection(selection) for selection in selections]
         self.selected_genart_selections = normalize_genart_selections(canonicalized)
         selected_indices = {len(self.selected_genart_selections) - 1} if focus_last and self.selected_genart_selections else set()
         self._refresh_selected_genart_tree(selected_indices=selected_indices)
+        # Die Fahrzeuge zeigen, mit welchen GenArts sie verknuepft sind.
+        vehicle_link_frame = getattr(self, "vehicle_link_frame", None)
+        if vehicle_link_frame is not None and refresh_vehicle_column:
+            vehicle_link_frame.refresh_genart_column()
 
     def _get_selected_genart_selections(self) -> list[GenArtSelection]:
         return list(self.selected_genart_selections)
@@ -19190,17 +20397,71 @@ if ($copied) {{
             for index, genart_selection in enumerate(self.selected_genart_selections)
             if index not in set(remove_indices)
         ]
-        self._set_selected_genart_selections(remaining)
-        self.genart_suggestion_var.set(f"{len(remove_indices)} GenArt(en) entfernt.")
+        removed = [
+            genart_selection
+            for index, genart_selection in enumerate(self.selected_genart_selections)
+            if index in set(remove_indices)
+        ]
+        if not self._confirm_genart_removal(removed, remaining):
+            self.genart_suggestion_var.set("GenArt nicht entfernt.")
+            return
+        # Mit der GenArt fallen ihre Fahrzeugzeilen weg (build_vehicle_link_export_rows), und
+        # Fahrzeuge, die nur an ihr hingen, verschwinden aus der Maske (forget_genart_ids).
+        self._set_selected_genart_selections(remaining, refresh_vehicle_column=False)
+        dropped = self.vehicle_link_frame.forget_genart_ids([selection.id for selection in removed])
+        message = f"{len(remove_indices)} GenArt(en) entfernt."
+        if dropped:
+            message += f" {dropped} Fahrzeug(e), die nur an dieser GenArt hingen, wurden mit entfernt."
+        self.genart_suggestion_var.set(message)
         self._write_live_section("genart")
+        if dropped:
+            # Bleibt auch nach 'Live gespeichert ...' in der Statuszeile stehen.
+            self._set_status_after_live_writes(message)
 
     def clear_selected_genarts(self) -> None:
         if not self.selected_genart_selections:
             return
-        self._set_selected_genart_selections([])
+        removed = list(self.selected_genart_selections)
+        if not self._confirm_genart_removal(removed, []):
+            self.genart_suggestion_var.set("GenArten nicht entfernt.")
+            return
+        self._set_selected_genart_selections([], refresh_vehicle_column=False)
+        dropped = self.vehicle_link_frame.forget_genart_ids([selection.id for selection in removed])
         self.genart_display_var.set("")
-        self.genart_suggestion_var.set("Keine GenArt für diesen Artikel gesetzt.")
+        message = "Keine GenArt für diesen Artikel gesetzt."
+        if dropped:
+            message += f" {dropped} Fahrzeug(e) wurden mit den GenArten entfernt."
+        self.genart_suggestion_var.set(message)
         self._write_live_section("genart")
+        if dropped:
+            self._set_status_after_live_writes(message)
+
+    def _confirm_genart_removal(self, removed: list[GenArtSelection], remaining: list[GenArtSelection]) -> bool:
+        """Rueckfrage, wenn mit den GenArts Fahrzeuge ganz wegfallen (sie hingen nur an diesen
+        GenArts, ihre Zeilen verschwinden aus Fahrzeugverknuepfungen.xlsx). Standard ist 'Nein';
+        'Nein' laesst alles unveraendert. Ohne solche Fahrzeuge keine Frage."""
+        count = self.vehicle_link_frame.count_vehicles_dropped_by_genart_removal(
+            [selection.id for selection in removed], [selection.id for selection in remaining]
+        )
+        if not count:
+            return True
+        names = ", ".join(selection.display_label() for selection in removed[:3]) + (" …" if len(removed) > 3 else "")
+        if len(removed) == 1:
+            subject = f"Mit GenArt {names}"
+            hanging = "die nur an dieser GenArt hängen"
+        else:
+            subject = f"Mit den GenArten {names}"
+            hanging = "die nur an diesen GenArten hängen"
+        if not remaining:
+            hanging = hanging.replace("die nur an", "die an") + " – ohne GenArt bleibt kein Fahrzeug verknüpft"
+        message = (
+            f"{subject} fallen {count} Fahrzeug(e) weg, {hanging} "
+            f"(ihre Zeilen in {VEHICLE_LINK_FILE[0]} werden gelöscht).\n\n"
+            "Tipp: Soll die GenArt ersetzt werden, zuerst die neue GenArt hinzufügen, dann die alte "
+            "entfernen – dann behalten die Fahrzeuge ihre Verknüpfung.\n\n"
+            "Trotzdem entfernen?"
+        )
+        return bool(messagebox.askyesno(APP_TITLE, message, icon="warning", default="no"))
 
     def _open_genart_search_dialog_event(self, _event: tk.Event[tk.Misc]) -> str:
         self._open_genart_search_dialog()
@@ -19370,22 +20631,9 @@ if ($copied) {{
                 for row in snapshot.comparison_number_rows
             ],
             article_list_rows=list(snapshot.article_list_rows),
-            vehicle_link_rows=[
-                VehicleLinkRow(
-                    vehicle_type_id=row.vehicle_type_id,
-                    vehicle_type_label=row.vehicle_type_label,
-                    motorcode=row.motorcode,
-                    ktyp_topmotive=row.ktyp_topmotive,
-                    ktyp_tecdoc=row.ktyp_tecdoc,
-                    manufacturer=row.manufacturer,
-                    model=row.model,
-                    description=row.description,
-                    year_from=row.year_from,
-                    year_to=row.year_to,
-                    power=row.power,
-                )
-                for row in snapshot.vehicle_link_rows
-            ],
+            # VehicleLinkRow ist unveraenderlich (frozen) - teilen genuegt und behaelt die GenArts je Fahrzeug.
+            vehicle_link_rows=list(snapshot.vehicle_link_rows),
+            vehicle_link_note=snapshot.vehicle_link_note,
             attribute_rows=[
                 AttributeRow(
                     criteria_id=row.criteria_id,
@@ -19707,9 +20955,36 @@ if ($copied) {{
         self.article_browser_cache_signature = None
         self._render_article_browser(bundle.article_number)
 
+    def _sync_record_vehicle_assignment(self, article_number: str, bundle: ExportBundle, output_root: Path) -> None:
+        """Nach einem GenArt-Schreiben ohne Fahrzeug-Folgeauftrag (Export der Fahrzeuge gleich):
+        die Fahrzeuge des Bundles - gleicher Export, aber aktuelle GenArt-Zuordnung, ohne die
+        mit der GenArt weggefallenen - in den Verzeichnis-Eintrag uebernehmen. Die Datei
+        bleibt unberuehrt; der gemerkte Stand (Anker) zieht mit."""
+        record = self.article_browser_records.get(article_number)
+        if record is None or record.vehicle_link_rows == normalize_vehicle_link_rows(bundle.vehicle_link_rows):
+            return
+        note = record.vehicle_link_note
+        self._upsert_article_browser_section("vehicle_links", bundle, output_root)
+        updated = self.article_browser_records.get(article_number)
+        if updated is None:
+            return
+        # Nichts geschrieben: ein Hinweis zu Zeilen der Datei gilt weiter.
+        updated.vehicle_link_note = note
+        entry = self._live_fingerprints.get(article_number)
+        if entry is not None and entry[0] is record:
+            self._live_fingerprints[article_number] = (updated, entry[1])
+        self._mark_article_browser_in_sync(output_root)
+
     def _upsert_article_browser_section(
-        self, section: str, bundle: ExportBundle, output_root: Path, stamp: dict[str, str] | None = None
+        self,
+        section: str,
+        bundle: ExportBundle,
+        output_root: Path,
+        stamp: dict[str, str] | None = None,
+        keep_genart: bool = False,
     ) -> None:
+        """keep_genart: GenArt-Liste des Eintrags nicht aus dem Bundle uebernehmen (Fahrzeug-
+        Folgeauftrag eines GenArt-Auftrags, dessen GenArt-Stand schon ueberholt sein kann)."""
         existing_snapshot = self.article_browser_records.get(bundle.article_number)
         snapshot = self._copy_snapshot(existing_snapshot) if existing_snapshot is not None else StoredArticleSnapshot(
             article_number=bundle.article_number,
@@ -19725,10 +21000,13 @@ if ($copied) {{
             snapshot.short_module_id = bundle.short_module_id
         if bundle.long_module_id:
             snapshot.long_module_id = bundle.long_module_id
-        snapshot.genart_selections = [GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in bundle.genart_selections]
-        snapshot.genart_id = bundle.genart_id
-        snapshot.genart_bezeichnung = bundle.genart_bezeichnung
-        snapshot.sync_genart_fields()
+        if not keep_genart:
+            snapshot.genart_selections = [
+                GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in bundle.genart_selections
+            ]
+            snapshot.genart_id = bundle.genart_id
+            snapshot.genart_bezeichnung = bundle.genart_bezeichnung
+            snapshot.sync_genart_fields()
 
         if section in {"short_text", "all"}:
             snapshot.short_texts = bundle.short_texts
@@ -19774,22 +21052,9 @@ if ($copied) {{
         if section in {"article_lists", "all"}:
             snapshot.article_list_rows = list(bundle.article_list_rows)
         if section in {"vehicle_links", "all"}:
-            snapshot.vehicle_link_rows = [
-                VehicleLinkRow(
-                    vehicle_type_id=row.vehicle_type_id,
-                    vehicle_type_label=row.vehicle_type_label,
-                    motorcode=row.motorcode,
-                    ktyp_topmotive=row.ktyp_topmotive,
-                    ktyp_tecdoc=row.ktyp_tecdoc,
-                    manufacturer=row.manufacturer,
-                    model=row.model,
-                    description=row.description,
-                    year_from=row.year_from,
-                    year_to=row.year_to,
-                    power=row.power,
-                )
-                for row in bundle.vehicle_link_rows
-            ]
+            snapshot.vehicle_link_rows = list(bundle.vehicle_link_rows)
+            # Die Datei enthaelt jetzt genau die Zeilen der Spalte GenArt.
+            snapshot.vehicle_link_note = ""
         if section in {"attributes", "all"}:
             snapshot.attribute_rows = [
                 AttributeRow(
@@ -19921,6 +21186,32 @@ if ($copied) {{
             rows,
         )
 
+    def _prepare_vehicle_rows_for_write(self, job: LiveWriteJob) -> Exception | None:
+        """Laeuft im LiveWriter-Thread (liest den Katalog nur): Fahrzeuge ohne TecDoc-Nummer
+        vor dem Schreiben ueber den KTyp-Katalog vervollstaendigen (alte Topmotive-Zeilen, ohne
+        Katalog geladen). Ist der Katalog noch nicht da, Rueckgabe VehicleCatalogPendingError -
+        der Bereich wird dann nicht geschrieben (sonst fiele das Fahrzeug still weg), sondern
+        nachgeholt, sobald der Katalog geladen ist. Fahrzeuge, die auch mit Katalog keine
+        TecDoc-Nummer haben, werden nicht exportiert (Hinweis in der Maske)."""
+        rows = job.bundle.vehicle_link_rows
+        if all(row.ktyp_tecdoc for row in rows):
+            return None
+        catalog = getattr(self, "vehicle_catalog", None)
+        if catalog is not None and catalog.count:
+            resolved = resolve_vehicle_link_rows(rows, catalog)
+            if resolved != rows:
+                job.bundle.vehicle_link_rows = resolved
+                # Der gemerkte Stand (Fingerabdruck) soll dem entsprechen, was in der Datei steht.
+                job.fingerprints = {**job.fingerprints, "vehicle_links": live_section_fingerprint(job.bundle, "vehicle_links")[0]}
+            return None
+        waiting = vehicle_links_waiting_for_catalog(rows)
+        if waiting:
+            return VehicleCatalogPendingError(
+                f"{waiting} Fahrzeug(e) nur mit TopMotive-Nummer – die TecDoc-Nummer kommt aus den "
+                "KTyp-Stammdaten, die noch nicht geladen sind."
+            )
+        return None
+
     def _run_live_write_job(self, job: LiveWriteJob) -> None:
         """Laeuft im LiveWriter-Thread: schreibt die Bereiche des Auftrags.
 
@@ -19946,12 +21237,17 @@ if ($copied) {{
         # Bereiche, deren Zeilen sich auf der Platte wirklich geaendert haben (die
         # Schreiber liefern True) - nur sie zaehlen als 'geaendert seit Apollo-Import'.
         changed: set[str] = set()
+        if "vehicle_links" in sections:
+            vehicle_wait = self._prepare_vehicle_rows_for_write(job)
+            if vehicle_wait is not None:
+                # Wartet auf den KTyp-Katalog: nicht ohne die Fahrzeuge schreiben.
+                errors["vehicle_links"] = vehicle_wait
 
         def attempt(section: str, write: Callable[[], bool]) -> None:
             # Jeder Bereich schreibt fuer sich: eine gesperrte Datei (z. B. in Excel
             # geoeffnet) laesst nur ihren Bereich scheitern, die uebrigen Bereiche
             # desselben Auftrags werden weiter geschrieben.
-            if section not in sections:
+            if section not in sections or section in errors:
                 return
             try:
                 if write():
@@ -20120,6 +21416,24 @@ if ($copied) {{
                 dirty -= text_sections_with_only_new_module_id(bundle, dirty, expected) - self._live_failed_sections.get(
                     article_number, set()
                 )
+            else:
+                # Neuer Artikel (noch nicht in den Dateien): ein Textbereich ganz ohne Text (Shop
+                # ohne Langtext, 'Text' nicht angehakt, nur wegen Attributen angelegt) hat noch
+                # keine Zeile - keine leere Zeile mit frischer Modul-ID anlegen. Der verankerte
+                # Leerstand der Maske zaehlt dabei nicht; nur ein schon eingereihter oder
+                # geschriebener Auftrag des Bereichs (dann muss das Leeren geschrieben werden).
+                pending_text_sections = set(self.live_writer.completed_fingerprints(article_number)) | set(
+                    self.live_writer.expected_fingerprints(article_number)
+                )
+                empty_new_texts = {
+                    section
+                    for section, texts, auto_uni in (
+                        ("short_text", bundle.short_texts, bundle.short_auto_uni),
+                        ("long_text", bundle.long_texts, bundle.long_auto_uni),
+                    )
+                    if section in dirty and not texts.populated_count(auto_uni) and section not in pending_text_sections
+                }
+                dirty -= empty_new_texts - self._live_failed_sections.get(article_number, set())
 
             # Fachliche Fehler (z. B. OE-Nummer ohne Hersteller) sofort melden,
             # wie bisher - dafuer braucht es keinen Hintergrund-Auftrag.
@@ -20306,7 +21620,12 @@ if ($copied) {{
         elif succeeded:
             stamp = {section: written_at for section in succeeded & job.changed_sections}
             if len(succeeded) == 1:
-                self._upsert_article_browser_section(next(iter(succeeded)), job.bundle, job.output_root, stamp=stamp)
+                # Folgeauftrag: seine GenArt-Liste ist die des GenArt-Auftrags, der ihn
+                # ausgeloest hat - ein juengerer GenArt-Auftrag kann den Eintrag inzwischen
+                # weitergezogen haben; nur die Fahrzeugzeilen uebernehmen.
+                self._upsert_article_browser_section(
+                    next(iter(succeeded)), job.bundle, job.output_root, stamp=stamp, keep_genart=job.followup
+                )
             else:
                 self._upsert_article_browser_from_bundle(job.bundle, job.output_root, stamp=stamp)
             self._mark_article_browser_in_sync(job.output_root)
@@ -20369,17 +21688,37 @@ if ($copied) {{
                 # Dateien (Eintrag vor dem Schreiben), nicht aus dem alten Bundle - sonst
                 # kaeme eine inzwischen geaenderte Fahrzeugliste zurueck. Alter: die
                 # Einreichung des Nachholers (spaetere Fahrzeug-Auftraege ueberholen ihn).
+                # Wie beim Entfernen in der Maske: entfernte GenArts bei den Fahrzeugen
+                # vergessen, Fahrzeuge nur an ihnen fallen weg (vehicle_rows_after_genart_removal).
+                new_genart_ids = [selection.id for selection in job.bundle.genart_selections]
+                removed_genart_ids = [
+                    selection.id for selection in old_record.genart_selections if selection.id not in set(new_genart_ids)
+                ]
+                kept_vehicle_rows, _dropped = vehicle_rows_after_genart_removal(
+                    old_record.vehicle_link_rows, removed_genart_ids, new_genart_ids
+                )
                 followup_bundle = dataclass_replace(
                     bundle_from_snapshot(old_record, self.attribute_key_values_by_group),
                     genart_selections=list(job.bundle.genart_selections),
                     genart_id=job.bundle.genart_id,
                     genart_bezeichnung=job.bundle.genart_bezeichnung,
+                    vehicle_link_rows=kept_vehicle_rows,
                 )
                 followup_fingerprints = live_section_fingerprints(followup_bundle)
                 followup_seq = job.submit_seq
                 written_vehicle_fp = base_fingerprints.get("vehicle_links")
             else:
+                # Juengster bekannter Fahrzeugstand: Anker, dann fertige, noch nicht
+                # abgeholte Auftraege, dann laufende/wartende (ein aelterer Folgeauftrag
+                # kann gerade die alte Fahrzeugliste schreiben - dann muss dieser GenArt-
+                # Auftrag seinen eigenen Folgeauftrag einreihen, der danach laeuft).
                 written_vehicle_fp = cache.get("vehicle_links")
+                for known in (
+                    self.live_writer.completed_fingerprints(article_number),
+                    self.live_writer.expected_fingerprints(article_number),
+                ):
+                    if "vehicle_links" in known:
+                        written_vehicle_fp = known["vehicle_links"]
             vehicle_fp = followup_fingerprints.get("vehicle_links")
             if vehicle_fp is not None and written_vehicle_fp != vehicle_fp:
                 submitted = self.live_writer.submit(
@@ -20395,10 +21734,30 @@ if ($copied) {{
                 )
                 if submitted:
                     self._schedule_live_write_poll()
+            elif not job.stored_input:
+                # Fahrzeug-Export unveraendert (z. B. GenArt ohne Fahrzeugzeile entfernt), die
+                # GenArt-Zuordnung der Fahrzeuge (genart_ids/excluded_genart_ids) aber neu: in den
+                # Verzeichnis-Eintrag uebernehmen. Sonst laedt ein Artikelwechsel die alte
+                # Zuordnung zurueck, und eine wieder hinzugefuegte GenArt verknuepft kein Fahrzeug.
+                # (Ein Nachholer liest den Artikel ohnehin neu aus den Dateien.)
+                self._sync_record_vehicle_assignment(article_number, followup_bundle, job.output_root)
 
-        if section_errors:
-            representative = next(iter(section_errors.values()))
-            failed_labels = format_live_section_labels(section_errors)
+        catalog_wait = {section for section, error in section_errors.items() if isinstance(error, VehicleCatalogPendingError)}
+        if "vehicle_links" in succeeded:
+            self._vehicle_links_waiting_for_catalog.discard(article_number)
+            if article_number == normalize_article_number(self._mask_article_number):
+                # Der Ladehinweis der Ergebniszeile ('... beim naechsten Speichern der Fahrzeuge
+                # ...') ist mit diesem Schreiben erledigt - wie im Verzeichnis-Eintrag (Upsert).
+                self.vehicle_link_frame.update_result_hint(note="")
+        if catalog_wait:
+            self._vehicle_links_waiting_for_catalog.add(article_number)
+            if self.vehicle_catalog.count:
+                # Der Katalog kam, waehrend der Auftrag lief: gleich nachholen.
+                self.root.after(0, self._retry_vehicle_writes_waiting_for_catalog)
+        other_errors = {section: error for section, error in section_errors.items() if section not in catalog_wait}
+        if other_errors:
+            representative = next(iter(other_errors.values()))
+            failed_labels = format_live_section_labels(other_errors)
             self.status_var.set(f"Live-Speichern fehlgeschlagen ({article_number}, {failed_labels}): {representative}")
             # Eine Meldung je Fehlerart - weitere Fehler derselben Art nur in der Statuszeile.
             error_kind = type(representative).__name__
@@ -20412,6 +21771,11 @@ if ($copied) {{
                     "Der Bereich wird bei der nächsten Änderung erneut geschrieben. "
                     "Weitere Fehler dieser Art erscheinen nur noch in der Statuszeile.",
                 )
+        elif catalog_wait:
+            self.status_var.set(
+                f"{article_number}: Fahrzeugverknüpfungen warten auf die KTyp-Stammdaten (TecDoc-Nummern alter "
+                "TopMotive-Zeilen) – sie werden gespeichert, sobald die Stammdaten geladen sind."
+            )
         elif self.live_writer.is_idle():
             self.status_var.set(job.status_message or f"Live gespeichert: {article_number} ({format_live_section_labels(succeeded)})")
         else:
@@ -20702,7 +22066,15 @@ if ($copied) {{
                 self._flush_live_writes(reason=f"{previous}: gescheiterte Bereiche nachholen – ")
             self.article_number_var.set(previous)
         queued = self.live_writer.expected_fingerprints(previous)
-        return [section for section in self._unsaved_live_sections() if section not in queued]
+        # Fahrzeuge, die auf den KTyp-Katalog warten: die Eingabe ist gemerkt (wie ein
+        # gescheiterter Bereich) und wird geschrieben, sobald der Katalog da ist - der
+        # Wechsel muss darauf nicht warten.
+        waiting = (
+            {"vehicle_links"}
+            if previous in self._vehicle_links_waiting_for_catalog and self._failed_live_write_entry(previous) is not None
+            else set()
+        )
+        return [section for section in self._unsaved_live_sections() if section not in queued and section not in waiting]
 
     def _report_switch_aborted(self, previous: str, unsaved: list[str]) -> None:
         # Den Grund aus _submit_live_write (fachlicher Fehler / kein Ausgabeordner) mitnehmen.
@@ -20865,7 +22237,7 @@ if ($copied) {{
             self.current_id_article_number = ""
             self.short_module_id_var.set("")
             self.long_module_id_var.set("")
-            self._set_selected_genart_selections([])
+            self._set_selected_genart_selections([], refresh_vehicle_column=False)
             self.genart_display_var.set("")
             self.genart_suggestion_var.set("GenArt bitte über das Suchfeld oder 'Suchen...' auswählen.")
             self.short_text_frame.set_value(TranslationSet(), auto_uni=True)
@@ -20985,6 +22357,9 @@ if ($copied) {{
             "videos": True,
             "web_links": True,
         }
+        # Hat der Shop keinen Langtext, gilt 'Text' als nicht abgerufen: ein vorhandener Text
+        # bleibt stehen, und ein neuer Artikel bekommt weder einen leeren Text noch eine Text-ID.
+        fetch_long_text = bool(scrape_options["long_text"] and str(result.long_text_de or "").strip())
         # Vorhandene IDs immer übernehmen, aber NEUE IDs nur vergeben, wenn die
         # jeweilige Textart im Abrufumfang angehakt ist – sonst bekämen Artikel
         # bei einer reinen Medien-Aktualisierung Text-IDs zugewiesen.
@@ -20992,12 +22367,12 @@ if ($copied) {{
         if article_number:
             if scrape_options["short_text"] and not short_module_id:
                 short_module_id = self.id_registry.generate_unique()
-            if scrape_options["long_text"] and not long_module_id:
+            if fetch_long_text and not long_module_id:
                 long_module_id = self.id_registry.generate_unique()
             if short_module_id or long_module_id:
                 self.id_registry.remember_article_ids(article_number, short_module_id, long_module_id)
         short_texts = self._build_translation_set(result.short_text_de, client, sanitize_short_text=True) if scrape_options["short_text"] else TranslationSet()
-        long_texts = self._build_translation_set(result.long_text_de, client) if scrape_options["long_text"] else TranslationSet()
+        long_texts = self._build_translation_set(result.long_text_de, client) if fetch_long_text else TranslationSet()
         image_rows = [MediaRow(link, art="5", sprache="255") for link in result.image_links] if scrape_options["images"] else []
         return ExportBundle(
             article_number=article_number,
@@ -21012,7 +22387,7 @@ if ($copied) {{
             video_rows=[MediaRow(link) for link in result.video_links] if scrape_options["videos"] else [],
             web_rows=[MediaRow(result.product_url)] if scrape_options["web_links"] else [],
             include_short_text=scrape_options["short_text"],
-            include_long_text=scrape_options["long_text"],
+            include_long_text=fetch_long_text,
             include_images=scrape_options["images"],
             include_documents=scrape_options["documents"],
             include_videos=scrape_options["videos"],
@@ -21146,7 +22521,9 @@ if ($copied) {{
                 self.short_text_frame.set_value(short_source.short_texts, auto_uni=short_source.short_auto_uni)
             else:
                 self.short_text_frame.set_value(TranslationSet(), auto_uni=True)
-            if scrape_options["long_text"]:
+            # Hat der Shop keinen Langtext, bleibt ein gespeicherter Text stehen (wie ohne Haken)
+            # - nicht leeren und nicht die Kurzbezeichnung als Text nehmen.
+            if scrape_options["long_text"] and str(result.long_text_de or "").strip():
                 self.long_text_frame.set_value(
                     TranslationSet(de=result.long_text_de, uni=result.long_text_de),
                     auto_uni=True,
@@ -21157,11 +22534,12 @@ if ($copied) {{
                 self.long_text_frame.set_value(TranslationSet(), auto_uni=True)
             genart_source = self._fetch_source("genart")
             stored_genarts = list(genart_source.genart_selections) if genart_source is not None else []
-            self._set_selected_genart_selections(stored_genarts)
+            # Fahrzeuge folgen unten mit set_rows (beschriftet mit diesen GenArts).
+            self._set_selected_genart_selections(stored_genarts, refresh_vehicle_column=False)
             self.genart_display_var.set("")
             if short_translations and scrape_options["short_text"]:
                 self.short_text_frame.apply_translations(short_translations)
-            if long_translations and scrape_options["long_text"]:
+            if long_translations and scrape_options["long_text"] and str(result.long_text_de or "").strip():
                 self.long_text_frame.apply_translations(long_translations)
 
             def stored_rows(section: str, field_name: str) -> list[MediaRow]:
@@ -21215,7 +22593,11 @@ if ($copied) {{
             self.comparison_frame.set_rows(
                 list(comparison_source.comparison_number_rows) if comparison_source is not None else []
             )
-            self.vehicle_link_frame.set_rows(list(vehicle_source.vehicle_link_rows) if vehicle_source is not None else [])
+            self.vehicle_link_frame.set_rows(
+                list(vehicle_source.vehicle_link_rows) if vehicle_source is not None else [],
+                # Quelle ist ein Verzeichnis-Eintrag oder ein Bundle (ohne Hinweis).
+                note=str(getattr(vehicle_source, "vehicle_link_note", "") or ""),
+            )
             if stored_genarts:
                 self.genart_suggestion_var.set(
                     f"Gespeicherte GenArten: {summarize_genart_selections(stored_genarts, empty_label='-', limit=3)}"
@@ -21227,7 +22609,16 @@ if ($copied) {{
         self.refresh_preview()
         if write_live:
             if scrape_options["short_text"] or scrape_options["long_text"]:
-                self._write_live_database(status_message=f"Live gespeichert: {normalize_article_number(result.article_number)}")
+                no_shop_text = ""
+                if scrape_options["long_text"] and not str(result.long_text_de or "").strip():
+                    no_shop_text = (
+                        " – kein Text im Shop, Text unverändert"
+                        if self.long_text_frame.get_german_text().strip()
+                        else " – kein Text im Shop, kein Text angelegt"
+                    )
+                self._write_live_database(
+                    status_message=f"Live gespeichert: {normalize_article_number(result.article_number)}{no_shop_text}"
+                )
             else:
                 # Ohne Text-Abruf keine Text-Dateien anfassen (keine leeren
                 # Textzeilen, keine neuen Text-IDs) - nur die abgerufenen
@@ -21305,7 +22696,11 @@ if ($copied) {{
             if deepl_client is None:
                 return result, None, None
             short_translations = deepl_client.translate_from_german(result.short_text_de) if options["short_text"] else None
-            long_translations = deepl_client.translate_from_german(result.long_text_de) if options["long_text"] else None
+            long_translations = (
+                deepl_client.translate_from_german(result.long_text_de)
+                if options["long_text"] and str(result.long_text_de or "").strip()
+                else None
+            )
             return result, short_translations, long_translations
 
         def on_success(payload: object) -> None:
@@ -23553,7 +24948,9 @@ if ($copied) {{
                 "Alle Artikel des Ausgabeordners auf einen Blick. Je Reiter steht 'Anzahl (TT.MM.)' = Zeilen in der "
                 "Output-Datei und Datum der letzten Änderung; Kurzbezeichnung und Text zeigen Text-Modul-ID und "
                 "Anzahl gefüllter Sprachen. Hellorange = seit dem Apollo-Importstand geändert. "
-                "Spaltenkopf anklicken sortiert (nochmal: umgekehrt), Doppelklick lädt den Artikel in die Maske."
+                "Spaltenkopf anklicken sortiert (nochmal: umgekehrt), Doppelklick lädt den Artikel in die Maske. "
+                "GenArten übertragen: Rechtsklick auf einen Artikel > 'GenArten kopieren' (Strg+C), dann die Zielartikel "
+                "markieren (Strg/Umschalt + Klick) > 'GenArten einfügen…' (Strg+V)."
             ),
             foreground=UI_TEXT_MUTED,
             wraplength=1100,
@@ -23577,7 +24974,8 @@ if ($copied) {{
         table.grid(row=2, column=0, sticky="nsew")
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
-        self.overview_tree = ttk.Treeview(table, columns=OVERVIEW_COLUMN_KEYS, show="headings", selectmode="browse")
+        # Mehrfachauswahl: Ziele fuer 'GenArten einfuegen…' (Doppelklick laedt weiter die angeklickte Zeile).
+        self.overview_tree = ttk.Treeview(table, columns=OVERVIEW_COLUMN_KEYS, show="headings", selectmode="extended")
         self.overview_tree.grid(row=0, column=0, sticky="nsew")
         for key, label, width, anchor, _kind in OVERVIEW_COLUMNS:
             self.overview_tree.heading(key, text=label, command=lambda column=key: self._overview_sort_by(column))
@@ -23589,6 +24987,14 @@ if ($copied) {{
         horizontal.grid(row=1, column=0, sticky="ew")
         self.overview_tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         self.overview_tree.bind("<Double-1>", self._on_overview_double_click)
+        self.overview_tree.bind("<Button-3>", self._open_overview_context_menu)
+        for sequence in ("<Control-c>", "<Control-C>"):
+            self.overview_tree.bind(sequence, self._on_overview_copy_key)
+        for sequence in ("<Control-v>", "<Control-V>"):
+            self.overview_tree.bind(sequence, self._on_overview_paste_key)
+        self.overview_context_menu = tk.Menu(self.overview_tree, tearoff=0)
+        self.overview_context_menu.add_command(label="GenArten kopieren", accelerator="Strg+C", command=self.copy_overview_genarts)
+        self.overview_context_menu.add_command(label="GenArten einfügen…", accelerator="Strg+V", command=self.paste_overview_genarts)
         self._update_overview_headings()
         self.main_notebook.bind("<<NotebookTabChanged>>", self._on_main_notebook_tab_changed)
 
@@ -23667,15 +25073,17 @@ if ($copied) {{
         visible.sort(key=lambda article: self._overview_rows_cache[article][3][column_index], reverse=self._overview_sort_desc)
         self._overview_visible = visible
 
-        selected = tree.selection()
-        selected_article = str(selected[0]) if selected else ""
+        # Mehrfachauswahl (Ziele fuer 'GenArten einfuegen…') ueber den Neuaufbau retten.
+        selected = [str(item) for item in tree.selection()]
+        focused = str(tree.focus() or "")
         tree.delete(*tree.get_children())
         for article_number in visible:
             entry = self._overview_rows_cache[article_number]
             tree.insert("", "end", iid=article_number, values=entry[2], tags=(ARTICLE_CHANGED_ROW_TAG,) if entry[1] else ())
-        if selected_article and tree.exists(selected_article):
-            tree.selection_set(selected_article)
-            tree.focus(selected_article)
+        still_selected = [item for item in selected if tree.exists(item)]
+        if still_selected:
+            tree.selection_set(still_selected)
+            tree.focus(focused if focused in still_selected else still_selected[0])
 
         total = len(records)
         changed_total = len(changed_map)
@@ -23788,6 +25196,426 @@ if ($copied) {{
             return None
         self.status_var.set(f"Übersicht gespeichert: {len(rows)} Artikel – {target_path}")
         return target_path
+
+    # ------------------------------------------------------------------
+    # Uebersicht: GenArten kopieren und auf markierte Artikel uebertragen
+
+    def _overview_genart_transfer_blocked(self) -> str:
+        """Grund (Statuszeile), warum gerade nicht uebertragen werden darf, sonst ''."""
+        if self.batch_import_running or self._batch_owns_output:
+            return "Massenimport läuft – GenArten bitte danach übertragen."
+        if self._ims_sync_running:
+            return "IMS-Übernahme läuft – GenArten bitte danach übertragen."
+        if self.background_task_running:
+            return "Es läuft noch ein Hintergrundvorgang – GenArten bitte danach übertragen."
+        if self._mask_switch_blocked or self._live_retry_running or self._overview_genart_transfer_running:
+            return "Bitte warten – das Speichern läuft noch, GenArten danach übertragen."
+        return ""
+
+    def _overview_paste_targets(self) -> tuple[list[str], bool]:
+        """(markierte Zielartikel ohne den Quellartikel, Quellartikel war markiert)."""
+        clipboard = self._overview_genart_clipboard
+        source = clipboard[0] if clipboard is not None else ""
+        selected = list(dict.fromkeys(normalize_article_number(str(item)) for item in self.overview_tree.selection()))
+        return [article for article in selected if article and article != source], bool(source) and source in selected
+
+    def _update_overview_context_menu(self) -> None:
+        """Kontextmenue der Uebersicht: Kopieren bei genau einer markierten Zeile, Einfuegen bei
+        vorhandener Kopie und mindestens einem anderen markierten Artikel (nicht waehrend
+        Massenimport, IMS-Uebernahme oder Hintergrundvorgang)."""
+        menu = self.overview_context_menu
+        if menu is None:
+            return
+        targets, _skipped = self._overview_paste_targets()
+        copy_ok = len(self.overview_tree.selection()) == 1
+        paste_ok = self._overview_genart_clipboard is not None and bool(targets) and not self._overview_genart_transfer_blocked()
+        menu.entryconfigure(0, state="normal" if copy_ok else "disabled")
+        menu.entryconfigure(1, state="normal" if paste_ok else "disabled")
+
+    def _open_overview_context_menu(self, event: tk.Event[tk.Misc]) -> None:
+        tree = self.overview_tree
+        item_id = tree.identify_row(event.y)
+        if item_id:
+            if item_id not in tree.selection():
+                tree.selection_set(item_id)
+            tree.focus(item_id)
+        tree.focus_set()
+        if self.overview_context_menu is None:
+            return
+        self._update_overview_context_menu()
+        self.overview_context_menu.tk_popup(event.x_root, event.y_root)
+        self.overview_context_menu.grab_release()
+
+    def _on_overview_copy_key(self, _event: tk.Event[tk.Misc]) -> str:
+        self.copy_overview_genarts()
+        return "break"
+
+    def _on_overview_paste_key(self, _event: tk.Event[tk.Misc]) -> str:
+        self.paste_overview_genarts()
+        return "break"
+
+    def copy_overview_genarts(self) -> bool:
+        """'GenArten kopieren' (Kontextmenue bzw. Strg+C in der Uebersicht): merkt die GenArten genau
+        eines markierten Artikels in ihrer Reihenfolge fuer 'GenArten einfuegen…'. Ein Artikel ohne
+        GenArt kopiert nichts (eine fruehere Kopie bleibt)."""
+        if not hasattr(self, "overview_tree"):
+            return False
+        selection = [normalize_article_number(str(item)) for item in self.overview_tree.selection()]
+        if len(selection) != 1:
+            self.status_var.set("Zum Kopieren der GenArten genau einen Artikel markieren.")
+            return False
+        article = selection[0]
+        if self.live_writer.is_idle():
+            self._poll_live_write_results()
+        else:
+            # Eine gerade gespeicherte GenArt-Aenderung des Artikels soll mitkommen.
+            self._flush_live_writes(reason="GenArten kopieren: ")
+        record = self.article_browser_records.get(article)
+        if record is None:
+            self.status_var.set(f"{article} ist nicht mehr im Ausgabeordner – nichts kopiert.")
+            return False
+        if "genart" in self._live_failed_sections.get(article, set()):
+            # Der Eintrag zeigt den Dateistand, die Maske bzw. gemerkte Eingabe eine noch nicht
+            # geschriebene GenArt-Aenderung (z. B. Datei in Excel geoeffnet): nicht raten.
+            self.status_var.set(
+                f"Die GenArt-Änderung von {article} ist noch nicht gespeichert (Datei gesperrt?) – nichts kopiert."
+            )
+            return False
+        selections = normalize_genart_selections([self._canonicalize_genart_selection(selection) for selection in record.genart_selections])
+        if not selections:
+            self.status_var.set(f"{article} hat keine GenArt – nichts kopiert.")
+            return False
+        self._overview_genart_clipboard = (article, selections)
+        self.status_var.set(f"GenArten von {article} kopiert: {format_genart_id_labels(selections)}")
+        return True
+
+    def paste_overview_genarts(self) -> bool:
+        """'GenArten einfuegen…' (Kontextmenue bzw. Strg+V in der Uebersicht): die kopierten GenArten
+        auf die markierten Artikel uebertragen; der Quellartikel selbst wird uebersprungen.
+
+        Ablauf wie beim Suchwort-Import: Live-Auftraege abschliessen, Verzeichnis gegen die Dateien
+        abgleichen; zeigt die Maske ein Ziel, dessen offene Eingaben sichern (bleibt etwas offen:
+        Abbruch); gemerkte Eingaben der Ziele nachholen. Dann Vorschau mit Wahl Ergaenzen/Ersetzen
+        (plan_genart_transfer - Regeln wie im Reiter GenArt), bei wegfallenden Fahrzeugen
+        Rueckfrage, unter der Datei-Sperre pruefen, sichern und jede Datei EINMAL schreiben
+        (write_genart_transfer). Danach Journal des Importstands, Verzeichnis-Eintraege und
+        gemerkte Staende (kein spaeteres Live-Speichern dreht etwas zurueck), Maske (zeigt sie ein
+        Ziel: neu aus dem Dateistand), Uebersicht und Verzeichnis. Rueckgabe True, wenn die
+        Uebertragung durchlief (auch ohne Aenderung)."""
+        if not hasattr(self, "overview_tree"):
+            return False
+        clipboard = self._overview_genart_clipboard
+        if clipboard is None:
+            self.status_var.set("Zuerst die GenArten eines Artikels kopieren (Rechtsklick > 'GenArten kopieren' bzw. Strg+C).")
+            return False
+        source_article, source_selections = clipboard
+        targets, skipped_source = self._overview_paste_targets()
+        if not targets:
+            self.status_var.set(f"Bitte die Zielartikel markieren – die GenArten von {source_article} gehen nur auf andere Artikel.")
+            return False
+        blocked = self._overview_genart_transfer_blocked()
+        if blocked:
+            self.status_var.set(blocked)
+            return False
+        try:
+            output_root = self._resolve_output_root()
+            backup_dir = ims_sync_backup_dir(output_root)
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return False
+        self._overview_genart_transfer_running = True
+        try:
+            # Waehrend des Wartens laeuft die Ereignisschleife: kein Artikelwechsel dazwischen.
+            with self._block_mask_switch():
+                return self._transfer_overview_genarts(
+                    source_article, list(source_selections), targets, skipped_source, output_root, backup_dir
+                )
+        finally:
+            self._overview_genart_transfer_running = False
+
+    def _plan_overview_genart_transfer(
+        self, targets: list[str], source_selections: list[GenArtSelection], mode: str
+    ) -> list[GenArtTransferPlan]:
+        return [
+            plan_genart_transfer(
+                self.article_browser_records[article],
+                source_selections,
+                mode,
+                canonicalize=self._canonicalize_genart_selection,
+                vehicle_catalog=self.vehicle_catalog,
+                attribute_key_values_by_group=self.attribute_key_values_by_group,
+            )
+            for article in targets
+            if article in self.article_browser_records
+        ]
+
+    def _transfer_overview_genarts(
+        self,
+        source_article: str,
+        source_selections: list[GenArtSelection],
+        targets: list[str],
+        skipped_source: bool,
+        output_root: Path,
+        backup_dir: Path,
+    ) -> bool:
+        reason = "GenArten übertragen: "
+        started = time.perf_counter()
+        if not self._flush_live_writes(reason=reason):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Noch nicht gespeicherte Änderungen konnten nicht geschrieben werden.\n\n"
+                "Bitte kurz warten und die GenArten erneut einfügen.",
+            )
+            self.status_var.set("GenArten nicht übertragen: das Speichern läuft noch.")
+            return False
+        # Verzeichnis auf den Plattenstand bringen (Signaturpruefung; ohne Aenderung kostet das nichts).
+        self._refresh_article_browser()
+        mask_article = normalize_article_number(self._mask_article_number)
+        if mask_article and mask_article in targets:
+            # Die Maske zeigt ein Ziel: offene Eingaben erst sichern - sie wird danach aus den
+            # Dateien neu gefuellt und wuerde nicht Gespeichertes sonst verwerfen.
+            self._save_mask_article_before_leaving(mask_article)
+            flushed = self._flush_live_writes(reason=reason)
+            unsaved = self._unsaved_live_sections() if flushed else list(LIVE_SECTIONS)
+            if unsaved:
+                labels = format_live_section_labels(set(unsaved))
+                messagebox.showwarning(
+                    APP_TITLE,
+                    f"Die Maske zeigt {mask_article} mit noch nicht gespeicherten Bereichen: {labels}.\n\n"
+                    "Bitte zuerst korrigieren bzw. speichern (siehe Statuszeile) und die GenArten dann erneut "
+                    "einfügen – sonst würde das Neuladen der Maske diese Eingaben verwerfen.\n\n"
+                    "Es wurde nichts übertragen.",
+                )
+                self.status_var.set(f"GenArten nicht übertragen: {labels} von {mask_article} nicht gespeichert.")
+                return False
+        # Gemerkte Eingaben der Ziele (Schreiben nach dem Verlassen gescheitert) zuerst nachholen -
+        # ihr Nachholer schriebe sonst spaeter den alten GenArt- bzw. Fahrzeugstand zurueck.
+        for article in targets:
+            if article != mask_article and self._failed_live_write_entry(article) is not None:
+                self._retry_failed_live_write(article)
+        pending = [
+            article for article in targets if self._live_failed_sections.get(article, set()) & {"genart", "vehicle_links"}
+        ]
+        if pending:
+            sections = {
+                section for article in pending for section in self._live_failed_sections.get(article, set())
+            } & {"genart", "vehicle_links"}
+            messagebox.showwarning(
+                APP_TITLE,
+                "Für diese Zielartikel stehen noch GenArt- bzw. Fahrzeug-Eingaben aus, die nicht gespeichert "
+                f"werden konnten:\n{', '.join(pending[:20])}{' …' if len(pending) > 20 else ''}\n\n"
+                f"{self._live_failed_files_hint(sections)}\n\nEs wurde nichts übertragen.",
+            )
+            self.status_var.set(f"GenArten nicht übertragen: offene Eingaben bei {', '.join(pending[:5])}.")
+            return False
+        self._refresh_article_browser()
+        records = self.article_browser_records
+        present = [article for article in targets if article in records]
+        missing = [article for article in targets if article not in records]
+        if not present:
+            self.status_var.set("GenArten nicht übertragen: die markierten Artikel sind nicht mehr im Ausgabeordner.")
+            return False
+        if not self.vehicle_catalog.count:
+            # Alte Fahrzeugzeilen nur mit TopMotive-Nummer: ihre TecDoc-Nummer kommt erst aus den
+            # KTyp-Stammdaten (wie im Reiter Fahrzeuge wird nicht ohne sie geschrieben).
+            waiting = [article for article in present if vehicle_links_waiting_for_catalog(records[article].vehicle_link_rows)]
+            if waiting:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Die KTyp-Stammdaten werden noch geladen: diese Zielartikel haben Fahrzeuge nur mit "
+                    f"TopMotive-Nummer, deren TecDoc-Nummer erst die Stammdaten liefern:\n{', '.join(waiting[:20])}\n\n"
+                    "Bitte warten, bis die KTyp-Stammdaten geladen sind, und die GenArten dann erneut einfügen.",
+                )
+                self.status_var.set("GenArten nicht übertragen: KTyp-Stammdaten werden noch geladen.")
+                return False
+        plans_by_mode = {
+            mode: self._plan_overview_genart_transfer(present, source_selections, mode) for mode in GENART_TRANSFER_MODE_LABELS
+        }
+        mode = OverviewGenArtTransferDialog(
+            self.root,
+            source_article,
+            source_selections,
+            plans_by_mode,
+            skipped_source=skipped_source,
+            missing_articles=missing,
+            backup_dir=backup_dir,
+        ).show()
+        if mode is None:
+            self.status_var.set("GenArten übertragen abgebrochen.")
+            return False
+        mode_label = GENART_TRANSFER_MODE_LABELS[mode]
+        # Der Dialog hat die Ereignisschleife bedient: inzwischen Geschriebenes abholen und mit
+        # dem aktuellen Stand neu planen (ohne Aenderung ergibt das dieselbe Vorschau).
+        if not self._flush_live_writes(reason=reason):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Noch nicht gespeicherte Änderungen konnten nicht geschrieben werden.\n\n"
+                "Bitte kurz warten und die GenArten erneut einfügen. Es wurde nichts übertragen.",
+            )
+            self.status_var.set("GenArten nicht übertragen: das Speichern läuft noch.")
+            return False
+        self._refresh_article_browser()
+        plans = self._plan_overview_genart_transfer(present, source_selections, mode)
+        changed = [plan for plan in plans if plan.changed]
+        unchanged = len(plans) - len(changed)
+        if not changed:
+            self.status_var.set(
+                f"GenArten übertragen ({mode_label}): keine Änderung – alle {len(plans)} Zielartikel haben diese GenArten bereits."
+            )
+            return True
+        dropped = [plan for plan in changed if plan.vehicles_dropped]
+        if dropped and not self._confirm_genart_transfer_drops(dropped):
+            self.status_var.set("GenArten nicht übertragen.")
+            return False
+        self.status_var.set(f"{reason}{len(changed)} Artikel werden geschrieben …")
+        try:
+            # Das Schreiben laeuft im UI-Thread (einmal je Datei): die Statuszeile vorher zeichnen.
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+        if not self._acquire_workbook_lock_pumping(reason):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Die GenArten können gerade nicht übertragen werden, weil die Output-Dateien von einem "
+                "Hintergrundvorgang geschrieben werden.\n\nBitte kurz warten und erneut einfügen.",
+            )
+            self.status_var.set("GenArten nicht übertragen: Output-Dateien sind gerade belegt.")
+            return False
+        failure: Exception | None = None
+        locked: GenArtTransferBlockedError | None = None
+        result: GenArtTransferWriteResult | None = None
+        try:
+            result = write_genart_transfer(output_root, plans, backup_dir)
+        except GenArtTransferBlockedError as exc:
+            locked = exc
+        except Exception as exc:  # GenArtTransferWriteError oder unerwartet
+            failure = exc
+        finally:
+            WORKBOOK_WRITE_LOCK.release()
+        if locked is not None:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Die GenArten wurden nicht übertragen – diese Datei kann gerade nicht geschrieben werden:\n\n{locked}\n\n"
+                "Bitte die Datei schließen (z. B. in Excel) und die GenArten erneut einfügen. Es wurde nichts geändert.",
+            )
+            self.status_var.set(f"GenArten nicht übertragen: Datei gesperrt – {str(locked).splitlines()[0]}")
+            return False
+        if failure is not None or result is None:
+            self._report_genart_transfer_failure(failure, output_root, targets, mask_article)
+            return False
+        note_failure = self._note_changed_since_import(
+            output_root, {article: result.written_at for article in sorted(result.changed_articles)}
+        )
+        self._apply_genart_transfer_to_memory(changed, result, output_root, mask_article)
+        rows_added = sum(plan.rows_added for plan in changed)
+        rows_removed = sum(plan.rows_removed for plan in changed)
+        status = (
+            f"GenArten auf {len(changed)} Artikel übertragen ({unchanged} {GENART_TRANSFER_UNCHANGED_LABEL}) – "
+            f"Fahrzeugzeilen: +{format_count_de(rows_added)} / −{format_count_de(rows_removed)}"
+        )
+        if note_failure:
+            status += f" – {note_failure}"
+        self.status_var.set(status)
+        log_perf(
+            "GenArten übertragen (Übersicht)",
+            time.perf_counter() - started,
+            detail=f"{mode_label}, {len(changed)} geändert, {unchanged} unverändert, Dateien: {', '.join(result.files_written) or '-'}",
+        )
+        return True
+
+    def _confirm_genart_transfer_drops(self, dropped: list[GenArtTransferPlan]) -> bool:
+        """Rueckfrage wie beim Entfernen im Reiter GenArt, wenn Fahrzeuge ganz wegfallen.
+        Standard 'Nein'; 'Nein' schreibt nichts."""
+        total = sum(plan.vehicles_dropped for plan in dropped)
+        listing = "\n".join(
+            f"{plan.article_number}: {format_count_de(plan.vehicles_dropped)} Fahrzeug(e) (entfernte GenArten: "
+            f"{', '.join(plan.removed_ids)})"
+            for plan in dropped[:15]
+        )
+        if len(dropped) > 15:
+            listing += f"\n… und {len(dropped) - 15} weitere Artikel"
+        message = (
+            f"Beim Ersetzen fallen {format_count_de(total)} Fahrzeug(e) weg – sie hängen nur an GenArten, die entfernt "
+            f"werden (ihre Zeilen in {VEHICLE_LINK_FILE[0]} werden gelöscht):\n\n{listing}\n\n"
+            "Tipp: Sollen die Fahrzeuge mit den neuen GenArten verknüpft bleiben, zuerst 'Ergänzen' übertragen und "
+            "danach 'Ersetzen'.\n\nTrotzdem übertragen?"
+        )
+        return bool(messagebox.askyesno(APP_TITLE, message, icon="warning", default="no"))
+
+    def _apply_genart_transfer_to_memory(
+        self, plans: list[GenArtTransferPlan], result: GenArtTransferWriteResult, output_root: Path, mask_article: str
+    ) -> None:
+        """Nach write_genart_transfer: Verzeichnis-Eintraege der geaenderten Artikel (neue GenArten,
+        Fahrzeuge mit der neuen Zuordnung, Zeitstempel nur geaenderter Bereiche) und ihre gemerkten
+        Staende (Fingerabdruck GenArt/Fahrzeuge = Dateistand) nachziehen - sonst hielte der Dirty-Check
+        die Maske fuer geaendert bzw. ein spaeteres Live-Speichern schriebe den alten Stand zurueck.
+        Zeigt die Maske ein Ziel, wird sie aus dem neuen Stand gefuellt. Dann Importstand (Journal)
+        neu lesen, Verzeichnis und Uebersicht zeichnen."""
+        tree = self.article_browser_tree
+        prev_selection = tuple(tree.selection())
+        prev_focus = tree.focus()
+        written_at = result.written_at
+        mask_reload = False
+        for plan in plans:
+            article = plan.article_number
+            existing = self.article_browser_records.get(article)
+            if existing is None or plan.bundle is None:
+                continue
+            snapshot = self._copy_snapshot(existing)
+            snapshot.genart_selections = [GenArtSelection(id=selection.id, bezeichnung=selection.bezeichnung) for selection in plan.new_selections]
+            snapshot.genart_id = ""
+            snapshot.genart_bezeichnung = ""
+            snapshot.sync_genart_fields()
+            # Fahrzeuge mit der neuen GenArt-Zuordnung (wie nach dem Live-Speichern); ohne Fahrzeug-
+            # Schreiben gilt ein Hinweis zu Zeilen der Datei weiter (_sync_record_vehicle_assignment).
+            snapshot.vehicle_link_rows = list(plan.bundle.vehicle_link_rows)
+            if article in result.vehicle_written:
+                snapshot.vehicle_link_note = ""
+            if article in result.genart_changed:
+                snapshot.note_written_at("genart", written_at)
+            if article in result.vehicle_changed:
+                snapshot.note_written_at("vehicle_links", written_at)
+            self.article_browser_records[article] = snapshot
+            self._article_search_blob_cache.pop(article, None)
+            prev_entry = self._live_fingerprints.get(article)
+            # Gemerkten Stand behalten, solange er zum Eintrag passt (wie _apply_search_term_import_to_memory).
+            keep = prev_entry is not None and (
+                prev_entry[0] is existing or (prev_entry[0] is not None and article == mask_article)
+            )
+            cache = dict(prev_entry[1]) if keep else {}
+            for section in ("genart", "vehicle_links"):
+                cache[section] = live_section_fingerprint(plan.bundle, section)[0]
+            self._live_fingerprints[article] = (snapshot, cache)
+            if article == mask_article:
+                mask_reload = True
+        self._mark_article_browser_in_sync(output_root)
+        if mask_reload:
+            with self._suspend_live_write():
+                self._apply_article_snapshot(self.article_browser_records[mask_article])
+        # Liest den eben geschriebenen Importstand (orange Markierung) und zeichnet das Verzeichnis.
+        self._refresh_article_browser()
+        self._restore_article_browser_selection(prev_selection, prev_focus)
+        self._render_overview()
+
+    def _report_genart_transfer_failure(
+        self, failure: Exception | None, output_root: Path, targets: list[str], mask_article: str
+    ) -> None:
+        """Schreiben gescheitert: Meldung mit Datei und Stand, Verzeichnis (und eine Ziel-Maske) neu
+        aus den Dateien lesen. Stehen Zeilen trotzdem geaendert in einer Datei (Zurueckholen aus
+        der Sicherung gescheitert), kommen diese Artikel ins Journal des Importstands."""
+        stuck = getattr(failure, "stuck_articles", set()) or set()
+        if stuck:
+            written_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._note_changed_since_import(output_root, {article: written_at for article in sorted(stuck)})
+        self._request_article_browser_reload()
+        self._refresh_article_browser()
+        if mask_article and mask_article in targets and mask_article in self.article_browser_records:
+            with self._suspend_live_write():
+                self._apply_article_snapshot(self.article_browser_records[mask_article])
+        self._render_overview()
+        text = str(failure) if failure is not None else "unbekannter Fehler"
+        messagebox.showerror(APP_TITLE, f"GenArten übertragen fehlgeschlagen:\n\n{text}")
+        self.status_var.set(f"GenArten übertragen fehlgeschlagen: {text.splitlines()[0]}")
 
     def _set_batch_ui_running(self, running: bool, total: int = 0) -> None:
         self.batch_import_running = running
@@ -24457,7 +26285,8 @@ if ($copied) {{
         self.short_module_id_var.set(snapshot.short_module_id)
         self.long_module_id_var.set(snapshot.long_module_id)
         self.id_registry.remember_article_ids(snapshot.article_number, snapshot.short_module_id, snapshot.long_module_id)
-        self._set_selected_genart_selections(snapshot.genart_selections)
+        # Die Fahrzeuge kommen gleich mit set_rows (beschriftet mit diesen GenArts).
+        self._set_selected_genart_selections(snapshot.genart_selections, refresh_vehicle_column=False)
         self.genart_display_var.set("")
         if snapshot.genart_selections:
             self.genart_suggestion_var.set(
@@ -24472,7 +26301,7 @@ if ($copied) {{
         self.oe_frame.set_rows(snapshot.oe_number_rows)
         self.comparison_frame.set_rows(snapshot.comparison_number_rows)
         self.article_list_frame.set_rows(snapshot.article_list_rows)
-        self.vehicle_link_frame.set_rows(snapshot.vehicle_link_rows)
+        self.vehicle_link_frame.set_rows(snapshot.vehicle_link_rows, note=snapshot.vehicle_link_note)
         self.image_frame.set_rows(snapshot.image_rows)
         self.document_frame.set_rows(snapshot.document_rows)
         self.video_frame.set_rows(snapshot.video_rows)
@@ -25049,6 +26878,8 @@ if ($copied) {{
         if failed is None or sections is None or not failed:
             self._live_failed_sections.pop(article_number, None)
             self._live_failed_bundles.pop(article_number, None)
+        if "vehicle_links" not in self._live_failed_sections.get(article_number, set()):
+            self._vehicle_links_waiting_for_catalog.discard(article_number)
 
     def _failed_live_write_entry(self, article_number: str) -> tuple[ExportBundle, Path, dict[str, str]] | None:
         """Gemerkte Eingabe des Artikels zu seinen gescheiterten Bereichen - nur fuer den
@@ -25171,7 +27002,14 @@ if ($copied) {{
                 self.long_module_id_var.set(bundle.long_module_id or self.long_module_id_var.get())
                 self.long_text_frame.set_value(bundle.long_texts, auto_uni=bundle.long_auto_uni)
             elif section == "genart":
+                restored_ids = {selection.id for selection in normalize_genart_selections(list(bundle.genart_selections))}
+                removed_ids = [selection.id for selection in self.selected_genart_selections if selection.id not in restored_ids]
                 self._set_selected_genart_selections(bundle.genart_selections)
+                if "vehicle_links" not in failed:
+                    # Die Maske zeigt die Fahrzeuge der Datei: GenArts, die die Eingabe entfernt
+                    # hatte, wie beim Entfernen vergessen (Fahrzeuge nur an ihnen fallen weg, die
+                    # Rueckfrage kam schon beim Entfernen) - sonst stuenden sie mit 'keine' da.
+                    self.vehicle_link_frame.forget_genart_ids(removed_ids)
             elif section == "oe_numbers":
                 self.oe_frame.set_rows(bundle.oe_number_rows)
             elif section == "comparison_numbers":
@@ -25367,6 +27205,19 @@ if ($copied) {{
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
             return False
+        # Fahrzeuge nur mit TopMotive-Nummer (alte Zeilen, ohne KTyp-Katalog geladen): exportiert
+        # wird nur die TecDoc-Nummer - ohne Katalog fielen sie still weg, also warten.
+        if not self.vehicle_catalog.count and vehicle_links_waiting_for_catalog(bundle.vehicle_link_rows):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Die KTyp-Stammdaten sind noch nicht geladen: "
+                f"{vehicle_links_waiting_for_catalog(bundle.vehicle_link_rows)} Fahrzeug(e) haben nur eine "
+                "TopMotive-Nummer, exportiert wird aber die TecDoc-Nummer.\n\n"
+                "Bitte warten, bis die KTyp-Stammdaten geladen sind, und dann erneut exportieren.",
+            )
+            self.status_var.set("Export abgebrochen: KTyp-Stammdaten werden noch geladen.")
+            return False
+        bundle.vehicle_link_rows = resolve_vehicle_link_rows(bundle.vehicle_link_rows, self.vehicle_catalog)
         # Maskenstand vor dem Export (export_bundle ersetzt Medien-Links durch lokale Pfade):
         # nach dem Export in den festen Pfad der gespeicherte Stand fuer das Live-Speichern.
         mask_fingerprints = live_section_fingerprints(bundle)
@@ -25526,22 +27377,89 @@ def is_ims_export_dir(folder: Path | str) -> bool:
     return (folder / IMS_SYNC_DATA_SUPPLIER / "200.dat").is_file() or (folder / "200.dat").is_file()
 
 
-def backup_output_files(output_dir: Path | str, backup_dir: Path | str, stamp: str) -> list[Path]:
-    """Kopiert alle Excel-Dateien des Ausgabeordners als <Name>_Sicherung_<Stempel>.xlsx in den Sicherungsordner."""
+def backup_file_name(name: str, stamp: str) -> str:
+    """Name der Sicherungskopie einer Output-Datei: <Name>_Sicherung_<Stempel>.xlsx."""
+    path = Path(name)
+    return f"{path.stem}_Sicherung_{stamp}{path.suffix}"
+
+
+def unique_backup_stamp(backup_dir: Path | str, names: Iterable[str], stamp: str) -> str:
+    """Haengt -2, -3 ... an, wenn es fuer eine der Dateien schon eine Sicherung mit diesem Stempel gibt."""
+    names = list(names)
+    candidate = stamp
+    counter = 1
+    while any((Path(backup_dir) / backup_file_name(name, candidate)).exists() for name in names):
+        counter += 1
+        candidate = f"{stamp}-{counter}"
+    return candidate
+
+
+def backup_output_files(
+    output_dir: Path | str, backup_dir: Path | str, stamp: str, names: Iterable[str] | None = None
+) -> list[Path]:
+    """Kopiert alle Excel-Dateien des Ausgabeordners (names: nur diese, soweit vorhanden) als
+    <Name>_Sicherung_<Stempel>.xlsx in den Sicherungsordner."""
     import shutil
 
     output_dir = Path(output_dir)
     backup_dir = Path(backup_dir)
     backup_dir.mkdir(parents=True, exist_ok=True)
+    if names is None:
+        sources = sorted(output_dir.glob("*.xlsx"))
+    else:
+        sources = [output_dir / name for name in names if (output_dir / name).is_file()]
     copied: list[Path] = []
-    for source in sorted(output_dir.glob("*.xlsx")):
+    for source in sources:
         if source.name.startswith("~$"):
             # Excel-Sperrdatei einer gerade geoeffneten Mappe
             continue
-        target = backup_dir / f"{source.stem}_Sicherung_{stamp}{source.suffix}"
+        target = backup_dir / backup_file_name(source.name, stamp)
         shutil.copy2(source, target)
         copied.append(target)
     return copied
+
+
+def output_file_write_blocker(path: Path) -> str:
+    """'' wenn write_workbook die Datei jetzt ersetzen koennte, sonst der Grund.
+
+    write_workbook tauscht eine Output-Datei atomar aus (Temp-Datei + os.replace). Unter
+    Windows scheitert das, solange ein anderes Programm sie ohne Loeschfreigabe offen haelt
+    (Excel, auch ueber das Netzlaufwerk von einem anderen Rechner) oder sie schreibgeschuetzt
+    ist. Geprueft wird mit genau diesem Zugriff (Lesen, Schreiben, Loeschen bei voller Freigabe
+    fuer andere); die Datei selbst wird dabei nicht veraendert. Fehlt die Datei, wird sie neu
+    angelegt - kein Hindernis."""
+    try:
+        if not path.exists():
+            return ""
+    except OSError as exc:
+        return str(exc)
+    if os.name != "nt":
+        return "" if os.access(path, os.W_OK) else "keine Schreibrechte"
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.restype = wintypes.HANDLE
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    generic_read, generic_write, delete_access = 0x80000000, 0x40000000, 0x00010000
+    share_all = 0x1 | 0x2 | 0x4
+    open_existing, normal_attributes = 3, 0x80
+    handle = create_file(
+        str(path), generic_read | generic_write | delete_access, share_all, None, open_existing, normal_attributes, None
+    )
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        code = ctypes.get_last_error()
+        if code in (32, 33):
+            return "Datei ist geöffnet (z. B. in Excel)"
+        if code == 5:
+            return "Zugriff verweigert (Datei geöffnet oder schreibgeschützt)"
+        return f"{ctypes.FormatError(code).strip()} (WinError {code})"
+    kernel32.CloseHandle(handle)
+    return ""
 
 
 @dataclass
