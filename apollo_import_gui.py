@@ -128,7 +128,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.53"
+APP_VERSION = "0.1.54"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -9981,6 +9981,26 @@ OVERVIEW_COLUMN_KEYS = tuple(column[0] for column in OVERVIEW_COLUMNS)
 OVERVIEW_HEADERS = [column[1] for column in OVERVIEW_COLUMNS]
 OVERVIEW_EMPTY_CELL = "–"
 OVERVIEW_SHORT_TEXT_MAX = 60
+# Zellen-Logik wie in Excel: die zuletzt angeklickte Spalte ist die aktive Spalte und bestimmt,
+# was Strg+C kopiert, Strg+V einfuegt und was das Kontextmenue anbietet. Standard GenArten -
+# so verhalten sich Strg+C/Strg+V wie in v0.1.53, bis eine andere Spalte angeklickt wird.
+OVERVIEW_DEFAULT_ACTIVE_COLUMN = "genarts"
+
+
+@dataclass
+class OverviewClipboard:
+    """Zwischenablage der Uebersicht (Strg+C): genau EIN Inhalt mit Art - 'genarts' (GenArten des
+    Quellartikels in gespeicherter Reihenfolge) oder 'brand' (Marke, Attribut 8988). Kopieren
+    ersetzt den bisherigen Inhalt, auch den der anderen Art."""
+
+    kind: str
+    source_article: str
+    genart_selections: list[GenArtSelection] = field(default_factory=list)
+    brand: str = ""
+
+    def content_label(self) -> str:
+        """'GenArten' bzw. 'eine Marke' fuer den Hinweis 'Zwischenablage enthaelt …'."""
+        return "GenArten" if self.kind == "genarts" else "eine Marke"
 
 
 def _overview_count_cell(count: int, written_at: str) -> tuple[str, tuple[int, str]]:
@@ -10062,7 +10082,23 @@ def overview_row_for_snapshot(snapshot: StoredArticleSnapshot, changed_at: str) 
 # der Maske - mit denselben Hilfsfunktionen (vehicle_rows_after_genart_removal,
 # build_genart_export_rows, build_vehicle_link_export_rows), keine zweite Umsetzung.
 GENART_TRANSFER_MODE_LABELS = {"append": "Ergänzen", "replace": "Ersetzen"}
-GENART_TRANSFER_UNCHANGED_LABEL = "unverändert"
+OVERVIEW_TRANSFER_UNCHANGED_LABEL = "unverändert"
+GENART_TRANSFER_UNCHANGED_LABEL = OVERVIEW_TRANSFER_UNCHANGED_LABEL
+# Wortformen fuer die Meldungen der Uebertragungen in der Uebersicht (GenArten bzw. Marke).
+OVERVIEW_TRANSFER_WORDS: dict[str, dict[str, str]] = {
+    "GenArten": {
+        "the": "die GenArten",
+        "can": "Die GenArten können",
+        "not_done": "Die GenArten wurden nicht übertragen",
+        "pending": "GenArt- bzw. Fahrzeug-Eingaben",
+    },
+    "Marke": {
+        "the": "die Marke",
+        "can": "Die Marke kann",
+        "not_done": "Die Marke wurde nicht übertragen",
+        "pending": "Attribut- bzw. Suchwort-Eingaben",
+    },
+}
 
 
 def format_count_de(value: int) -> str:
@@ -10238,18 +10274,42 @@ def plan_genart_transfer(
     return plan
 
 
-class GenArtTransferBlockedError(RuntimeError):
-    """'GenArten einfuegen…': eine Output-Datei ist gerade nicht ersetzbar (z. B. in Excel
-    geoeffnet) - es wurde nichts gesichert und nichts geschrieben."""
+class OutputTransferBlockedError(RuntimeError):
+    """Uebertragung in der Uebersicht ('GenArten einfuegen…', 'Marke einfuegen…/setzen…'): eine
+    Output-Datei ist gerade nicht ersetzbar (z. B. in Excel geoeffnet) - es wurde nichts
+    gesichert und nichts geschrieben."""
 
 
-class GenArtTransferWriteError(RuntimeError):
-    """'GenArten einfuegen…': Schreiben gescheitert. stuck_articles = Artikel, deren Zeilen
-    trotzdem geaendert in einer Datei stehen (nur wenn das Zurueckholen scheiterte)."""
+class OutputTransferWriteError(RuntimeError):
+    """Uebertragung in der Uebersicht: Schreiben gescheitert. stuck_articles = Artikel, deren
+    Zeilen trotzdem geaendert in einer Datei stehen (nur wenn das Zurueckholen scheiterte)."""
 
     def __init__(self, message: str, stuck_articles: set[str] | None = None) -> None:
         super().__init__(message)
         self.stuck_articles = set(stuck_articles or ())
+
+
+# Namen aus v0.1.53 (nur GenArten) - dieselben Klassen.
+GenArtTransferBlockedError = OutputTransferBlockedError
+GenArtTransferWriteError = OutputTransferWriteError
+
+
+@dataclass
+class OutputTransferWriteResult:
+    """Ergebnis von write_output_files_transfer: je geschriebener Datei die (normalisierten)
+    Artikel, deren Zeilen sich geaendert haben (changed_by_file), und die Artikel, deren Zeilen
+    uebergeben wurden (written_by_file)."""
+
+    written_at: str
+    backup_dir: Path
+    backup_files: list[Path] = field(default_factory=list)
+    files_written: list[str] = field(default_factory=list)
+    changed_by_file: dict[str, set[str]] = field(default_factory=dict)
+    written_by_file: dict[str, set[str]] = field(default_factory=dict)
+
+    @property
+    def changed_articles(self) -> set[str]:
+        return set().union(*self.changed_by_file.values()) if self.changed_by_file else set()
 
 
 @dataclass
@@ -10302,8 +10362,9 @@ def write_genart_transfer(
     GenArtTransferBlockedError - nichts gesichert, nichts geschrieben); dann werden sie als
     <Name>_Sicherung_<Stempel>.xlsx nach backup_dir kopiert (wie bei der IMS-Uebernahme).
     Scheitert die Fahrzeugdatei, nachdem die GenArt-Datei geschrieben ist, wird diese aus der
-    Sicherung zurueckgeholt - beide Dateien bleiben auf dem alten Stand. GenArtTransferWriteError
-    beschreibt den Stand. Der Aufrufer haelt WORKBOOK_WRITE_LOCK."""
+    Sicherung zurueckgeholt - beide Dateien bleiben auf dem alten Stand. OutputTransferWriteError
+    beschreibt den Stand. Der Aufrufer haelt WORKBOOK_WRITE_LOCK. Das Schreiben selbst macht
+    write_output_files_transfer (gemeinsam mit 'Marke einfuegen…')."""
     changed_plans = [plan for plan in plans if plan.changed and plan.bundle is not None]
     written_at = written_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     genart_rows = {plan.article_number: build_genart_export_rows(plan.bundle) for plan in changed_plans if plan.bundle}
@@ -10314,18 +10375,52 @@ def write_genart_transfer(
     targets: list[tuple[tuple[str, str], list[str], dict[str, list[list[str]]]]] = [(GENART_FILE, GENART_HEADERS, genart_rows)]
     if vehicle_rows:
         targets.append((VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS, vehicle_rows))
+    written = write_output_files_transfer(output_root, targets, backup_dir, written_at, written_hint="neue GenArten")
+    result.backup_files = written.backup_files
+    result.files_written = written.files_written
+    result.genart_changed = written.changed_by_file.get(GENART_FILE[0], set())
+    result.vehicle_changed = written.changed_by_file.get(VEHICLE_LINK_FILE[0], set())
+    result.vehicle_written = written.written_by_file.get(VEHICLE_LINK_FILE[0], set())
+    return result
+
+
+def write_output_files_transfer(
+    output_root: Path,
+    targets: list[tuple[tuple[str, str], list[str], dict[str, list[list[str]]]]],
+    backup_dir: Path,
+    written_at: str | None = None,
+    *,
+    written_hint: str = "neue Zeilen",
+) -> OutputTransferWriteResult:
+    """Schreibt eine Uebertragung der Uebersicht fuer alle geaenderten Zielartikel: je Ziel-Datei
+    in `targets` (Dateibeschreibung, Kopfzeile, Zeilen je Artikel) EIN Schreibvorgang fuer alle
+    Artikel (replace_articles_rows_preserving_timestamps; unveraenderte Zeilen behalten ihr
+    'Zuletzt geschrieben am'). Dateien ohne Eintrag (oder ohne Artikel) werden nicht angefasst.
+
+    Vorher muessen alle Ziel-Dateien ersetzbar sein (output_file_write_blocker; sonst
+    OutputTransferBlockedError - nichts gesichert, nichts geschrieben); dann werden sie als
+    <Name>_Sicherung_<Stempel>.xlsx nach backup_dir kopiert (wie bei der IMS-Uebernahme).
+    Scheitert eine spaetere Datei, nachdem eine fruehere geschrieben ist, wird diese aus der
+    Sicherung zurueckgeholt - alle Dateien bleiben auf dem alten Stand. OutputTransferWriteError
+    beschreibt den Stand; written_hint sagt in der ACHTUNG-Meldung, was die schon geschriebene
+    Datei traegt (z. B. 'neue GenArten'). Der Aufrufer haelt WORKBOOK_WRITE_LOCK."""
+    written_at = written_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    result = OutputTransferWriteResult(written_at=written_at, backup_dir=backup_dir)
+    targets = [(file_spec, headers, rows) for file_spec, headers, rows in targets if rows]
+    if not targets:
+        return result
     names = [file_spec[0] for file_spec, _headers, _rows in targets]
     blocked = [(name, output_file_write_blocker(output_root / name)) for name in names]
     blocked = [(name, reason) for name, reason in blocked if reason]
     if blocked:
-        raise GenArtTransferBlockedError("\n".join(f"{name}: {reason}" for name, reason in blocked))
-    articles = sorted(genart_rows)
+        raise OutputTransferBlockedError("\n".join(f"{name}: {reason}" for name, reason in blocked))
+    articles = sorted({article for _file_spec, _headers, rows in targets for article in rows})
     listing = ", ".join(articles[:20]) + (f" … und {len(articles) - 20} weitere" if len(articles) > 20 else "")
     try:
         stamp = unique_backup_stamp(backup_dir, names, datetime.now().strftime("%Y%m%d-%H%M%S"))
         result.backup_files = backup_output_files(output_root, backup_dir, stamp, names=names)
     except OSError as exc:
-        raise GenArtTransferWriteError(
+        raise OutputTransferWriteError(
             f"Die Sicherung nach {backup_dir} ist gescheitert: {exc}\n\n"
             f"Es wurde nichts geändert (Zielartikel: {listing})."
         ) from exc
@@ -10338,35 +10433,285 @@ def write_genart_transfer(
             )
         except Exception as exc:
             if not result.files_written:
-                raise GenArtTransferWriteError(
+                raise OutputTransferWriteError(
                     f"{file_spec[0]} konnte nicht geschrieben werden: {exc}\n\n"
                     f"Es wurde nichts geändert (Zielartikel: {listing})."
                 ) from exc
             failed = _restore_output_files_from_backup(output_root, result.files_written, backup_dir, stamp)
             written_names = ", ".join(result.files_written)
             if not failed:
-                raise GenArtTransferWriteError(
+                raise OutputTransferWriteError(
                     f"{file_spec[0]} konnte nicht geschrieben werden: {exc}\n\n"
-                    f"{written_names} wurde aus der Sicherung zurückgeholt – beide Dateien sind auf dem alten "
+                    f"{written_names} wurde aus der Sicherung zurückgeholt – alle Dateien sind auf dem alten "
                     f"Stand, es wurde nichts übertragen (Zielartikel: {listing})."
                 ) from exc
-            raise GenArtTransferWriteError(
+            raise OutputTransferWriteError(
                 f"{file_spec[0]} konnte nicht geschrieben werden: {exc}\n\n"
-                f"ACHTUNG: {written_names} ist schon geschrieben (neue GenArten), {file_spec[0]} hat noch die alten "
+                f"ACHTUNG: {written_names} ist schon geschrieben ({written_hint}), {file_spec[0]} hat noch die alten "
                 f"Zeilen, und das Zurückholen aus der Sicherung ist gescheitert: {'; '.join(failed)}.\n"
                 f"Betroffene Artikel: {listing}\n\n"
                 f"Bitte {', '.join(backup_file_name(name, stamp) for name in result.files_written)} aus {backup_dir} "
                 f"zurück in den Ausgabeordner kopieren (wieder als {written_names}) und danach in der Übersicht "
                 "'Liste aktualisieren' klicken.",
-                stuck_articles=set(result.genart_changed),
+                stuck_articles=result.changed_articles,
             ) from exc
         if _workbook_signature(path) != signature_before:
             result.files_written.append(file_spec[0])
-        if file_spec is GENART_FILE:
-            result.genart_changed = changed
-        else:
-            result.vehicle_changed = changed
-            result.vehicle_written = set(rows_by_article)
+        result.changed_by_file[file_spec[0]] = changed
+        result.written_by_file[file_spec[0]] = set(rows_by_article)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Reiter 'Uebersicht': Marke (Attribut 8988) eines Artikels kopieren bzw. frei setzen und auf
+# markierte Artikel uebertragen ('Marke einfuegen…', 'Marke setzen…'). Attribute wie im Reiter
+# Attribute der Maske (8988-Zeile an Ort und Stelle, fehlende Zeile vorn), Suchwoerter wie
+# 'Suchwoerter automatisch' (Marke als erstes Suchwort) - alte Marke samt Schreibweisen raus.
+BRAND_TRANSFER_IMPOSSIBLE_LABEL = "nicht möglich"
+
+
+def _brand_list_entries(brand_list: str | list[tuple[str, list[str]]] | None) -> list[tuple[str, list[str]]]:
+    if isinstance(brand_list, str) or brand_list is None:
+        return parse_brand_list(DEFAULT_BRAND_LIST if brand_list is None else brand_list)
+    return [(str(name), [str(alias) for alias in aliases]) for name, aliases in brand_list]
+
+
+def brand_search_term_keys(brand: str, brand_list: str | list[tuple[str, list[str]]] | None = None) -> set[str]:
+    """Vergleichsschluessel (search_term_dedupe_key) der Marke und - entspricht sie einer Marke
+    der Markenliste - aller ihrer Schreibweisen (Name und Aliasse): 'T D L' -> {'tdl'},
+    'WEBER' -> {'weber', 'weberhydraulik'}, 'Fremdmarke' -> {'fremdmarke'}. Leer fuer leer."""
+    value = " ".join(str(brand or "").split())
+    if not value:
+        return set()
+    keys = {search_term_dedupe_key(value)}
+    canonical = canonical_brand_spelling(value, brand_list)
+    if canonical:
+        for name, aliases in _brand_list_entries(brand_list):
+            if name[:BRAND_ATTRIBUTE_MAX_LENGTH].strip() == canonical:
+                keys.add(search_term_dedupe_key(name))
+                keys.update(search_term_dedupe_key(alias) for alias in aliases)
+    return {key for key in keys if key}
+
+
+def search_terms_after_brand_change(
+    terms: list[str], old_brand: str, new_brand: str, brand_list: str | list[tuple[str, list[str]]] | None = None
+) -> tuple[list[str], list[str], list[str]]:
+    """Suchwoerter eines Artikels nach dem Markenwechsel old_brand -> new_brand ('Suchwoerter
+    mitziehen'): Suchwoerter, die der alten Marke oder einer ihrer Schreibweisen entsprechen
+    (brand_search_term_keys, Vergleich wie bei Dubletten), fallen weg; fehlt die neue Marke,
+    kommt sie als ERSTES Suchwort dazu (wie 'Suchwoerter automatisch' die Marke zuerst nennt);
+    alle anderen behalten ihre Reihenfolge. Die neue Marke selbst wird nie entfernt - bei
+    gleicher Marke (auch in anderer Schreibweise) bleibt ein vorhandenes Suchwort stehen.
+    Rueckgabe: (Suchwoerter danach, ergaenzt, entfernt)."""
+    current = normalize_search_terms(list(terms))
+    new_value = " ".join(str(new_brand or "").split())
+    new_key = search_term_dedupe_key(new_value)
+    # Keine Schreibweise der NEUEN Marke entfernen (gleiche Marke, z. B. WEBER mit dem Suchwort
+    # 'Weber Hydraulik': bleibt unveraendert) - nur Schreibweisen der alten, anderen Marke.
+    new_keys = brand_search_term_keys(new_value, brand_list) | ({new_key} if new_key else set())
+    old_keys = brand_search_term_keys(old_brand, brand_list) - new_keys
+    removed = [term for term in current if search_term_dedupe_key(term) in old_keys]
+    kept = [term for term in current if search_term_dedupe_key(term) not in old_keys]
+    added: list[str] = []
+    if new_key and not new_keys & {search_term_dedupe_key(term) for term in kept}:
+        kept = [new_value] + kept
+        added = [new_value]
+    return kept, added, removed
+
+
+def attribute_rows_after_brand_change(rows: list[AttributeRow], brand_row: AttributeRow) -> list[AttributeRow]:
+    """Attributzeilen nach 'Marke einfuegen…/setzen…' - wie dieselbe Aenderung im Reiter Attribute
+    der Maske: die erste 8988-Zeile bekommt den neuen Wert an Ort und Stelle ('Auswahl
+    aktualisieren': Bezeichnung, Format und Position bleiben); ohne 8988-Zeile kommt die Marke
+    als erste Zeile dazu (Marke vorn wie beim Referenzartikel und bei den meisten Artikeln; per
+    'Hinzufuegen' in der Maske kaeme sie ans Ende - nur die Reihenfolge unterscheidet sich).
+    Keine andere Zeile wird angefasst."""
+    result = list(rows)
+    for index, row in enumerate(result):
+        if row.criteria_id.strip() == BRAND_CRITERIA_ID:
+            result[index] = dataclass_replace(row, value=brand_row.value)
+            return result
+    return [brand_row] + result
+
+
+def resolve_brand_input(
+    text: str, brand_list: str | list[tuple[str, list[str]]] | None = None, max_length: int = BRAND_ATTRIBUTE_MAX_LENGTH
+) -> tuple[str, str]:
+    """Eingabe von 'Marke setzen…' pruefen: (Marke, Fehlertext). Entspricht die Eingabe einer
+    Marke der Markenliste (Name oder Alias), gilt deren Schreibweise ('tdl' -> 'T D L'), sonst
+    die Eingabe wie getippt (Leerzeichen zusammengefasst). Leer oder laenger als max_length
+    (Katalog 8988, sonst 20) -> Fehlertext, Marke ''."""
+    value = " ".join(str(text or "").split())
+    if not value:
+        return "", "Bitte eine Marke eingeben."
+    brand = canonical_brand_spelling(value, brand_list) or value
+    if len(brand) > max_length:
+        return "", f"Die Marke ist länger als erlaubt ({len(brand)} von {max_length} Zeichen)."
+    return brand, ""
+
+
+@dataclass
+class BrandTransferPlan:
+    """Was 'Marke einfuegen…/setzen…' an einem Zielartikel aendert (plan_brand_transfer).
+
+    bundle = neuer Stand des Artikels (Attribute und ggf. Suchwoerter, sonst wie gespeichert),
+    None = der Artikel bleibt unveraendert - oder error: die Attribute des Artikels lassen sich
+    nicht schreiben (ungueltige Zeile; wie in der Maske wird dann auch die Marke nicht
+    gespeichert)."""
+
+    article_number: str
+    old_brand: str
+    new_brand: str
+    with_search_terms: bool
+    attribute_rows: list[AttributeRow] = field(default_factory=list)
+    search_terms: list[str] = field(default_factory=list)
+    terms_added: list[str] = field(default_factory=list)
+    terms_removed: list[str] = field(default_factory=list)
+    attributes_changed: bool = False
+    search_terms_changed: bool = False
+    bundle: ExportBundle | None = None
+    error: str = ""
+
+    @property
+    def changed(self) -> bool:
+        return self.bundle is not None
+
+    def before_label(self) -> str:
+        return self.old_brand or OVERVIEW_EMPTY_CELL
+
+    def after_label(self) -> str:
+        if self.error:
+            return BRAND_TRANSFER_IMPOSSIBLE_LABEL
+        return self.new_brand if self.attributes_changed else OVERVIEW_TRANSFER_UNCHANGED_LABEL
+
+    def terms_label(self) -> str:
+        """Spalte 'Suchwoerter' der Vorschau: '+ OETIKER, − KUNZER', 'unveraendert', '–' (Suchwoerter
+        nicht mitziehen) oder bei einem Fehler der Grund."""
+        if self.error:
+            return self.error
+        if not self.with_search_terms:
+            return OVERVIEW_EMPTY_CELL
+        parts = [f"+ {term}" for term in self.terms_added] + [f"− {term}" for term in self.terms_removed]
+        return ", ".join(parts) if parts else OVERVIEW_TRANSFER_UNCHANGED_LABEL
+
+
+def plan_brand_transfer(
+    snapshot: StoredArticleSnapshot,
+    brand: str,
+    with_search_terms: bool,
+    *,
+    brand_list: str | list[tuple[str, list[str]]] | None = None,
+    option: AttributeOption | None = None,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] | None = None,
+) -> BrandTransferPlan:
+    """Plant 'Marke einfuegen…/setzen…' fuer einen Zielartikel - mit genau dem Ergebnis, das
+    dieselbe Aenderung in der Maske haette: Reiter Attribute (attribute_rows_after_brand_change)
+    und - mit with_search_terms - Reiter Suchwoerter (search_terms_after_brand_change).
+    Geschrieben wuerden wie dort alle Attribut- bzw. Suchwortzeilen des Artikels
+    (build_attribute_export_rows, build_usage_number_export_rows); Ziele, deren Zeilen sich
+    dadurch nicht aendern (Marke schon so gepflegt, Suchwoerter passen), bleiben unveraendert."""
+    stored = bundle_from_snapshot(snapshot, attribute_key_values_by_group or {})
+    old_brand = find_brand_attribute_value(stored.attribute_rows)
+    new_value = " ".join(str(brand or "").split())
+    plan = BrandTransferPlan(
+        article_number=snapshot.article_number,
+        old_brand=old_brand,
+        new_brand=new_value,
+        with_search_terms=with_search_terms,
+        attribute_rows=list(stored.attribute_rows),
+        search_terms=list(stored.search_terms),
+    )
+    brand_row = build_brand_attribute_row(new_value, option)
+    if brand_row is None:
+        plan.error = f"Marke '{new_value}' ist leer oder länger als erlaubt."
+        return plan
+    rows_after = attribute_rows_after_brand_change(stored.attribute_rows, brand_row)
+    if with_search_terms:
+        terms_after, added, removed = search_terms_after_brand_change(stored.search_terms, old_brand, new_value, brand_list)
+    else:
+        terms_after, added, removed = list(stored.search_terms), [], []
+    candidate = dataclass_replace(stored, attribute_rows=rows_after, search_terms=terms_after)
+    try:
+        candidate_rows = build_attribute_export_rows(candidate)
+    except ValueError as exc:
+        # Eine ungueltige Attributzeile des Artikels (z. B. Text in numerischem Attribut): wie in
+        # der Maske laesst sich dann kein Attribut des Artikels speichern - auch die Marke nicht.
+        plan.error = str(exc)
+        return plan
+    try:
+        stored_rows: list[list[str]] | None = build_attribute_export_rows(stored)
+    except ValueError:
+        # Nur die eigene 8988-Zeile war ungueltig (z. B. zu lang) und wird durch die neue Marke
+        # ersetzt: der Kandidat ist gueltig - wie die Korrektur in der Maske.
+        stored_rows = None
+    plan.attributes_changed = candidate_rows != stored_rows
+    plan.search_terms_changed = build_usage_number_export_rows(candidate) != build_usage_number_export_rows(stored)
+    plan.attribute_rows = list(candidate.attribute_rows)
+    plan.search_terms = list(candidate.search_terms)
+    plan.terms_added = list(added)
+    plan.terms_removed = list(removed)
+    if plan.attributes_changed or plan.search_terms_changed:
+        plan.bundle = candidate
+    return plan
+
+
+@dataclass
+class BrandTransferWriteResult:
+    written_at: str
+    backup_dir: Path
+    backup_files: list[Path] = field(default_factory=list)
+    attributes_changed: set[str] = field(default_factory=set)
+    search_terms_changed: set[str] = field(default_factory=set)
+    files_written: list[str] = field(default_factory=list)
+
+    @property
+    def changed_articles(self) -> set[str]:
+        return self.attributes_changed | self.search_terms_changed
+
+
+def write_brand_transfer(
+    output_root: Path, plans: list[BrandTransferPlan], backup_dir: Path, written_at: str | None = None
+) -> BrandTransferWriteResult:
+    """Schreibt 'Marke einfuegen…/setzen…' fuer alle geaenderten Zielartikel: Attribute.xlsx (Ziele
+    mit geaenderter 8988-Zeile) und Gebrauchsnummern.xlsx (Ziele mit geaenderten Suchwoertern) je
+    EINMAL fuer alle Ziele - ueber write_output_files_transfer (Ersetzbarkeit pruefen, nur die
+    betroffenen Dateien sichern, Zeitstempel unveraenderter Zeilen behalten, Rueckholung der
+    ersten Datei, wenn die zweite scheitert). Der Aufrufer haelt WORKBOOK_WRITE_LOCK."""
+    changed_plans = [plan for plan in plans if plan.changed and plan.bundle is not None]
+    written_at = written_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Ziele, bei denen sich nur die Suchwoerter aendern, aber noch Alt-Suchwortzeilen (9595) in der
+    # Attribute.xlsx stehen: wie beim Speichern der Suchwoerter in der Maske dort mit raeumen (die
+    # Alt-Suchwoerter stehen danach in der Gebrauchsnummern.xlsx) - im selben einen Schreibvorgang.
+    terms_only = {
+        normalize_article_number(plan.article_number)
+        for plan in changed_plans
+        if plan.search_terms_changed and not plan.attributes_changed
+    }
+    _legacy_terms, legacy_articles = read_legacy_search_terms(output_root, terms_only)
+    attribute_rows = {
+        plan.article_number: build_attribute_export_rows(plan.bundle)
+        for plan in changed_plans
+        if plan.bundle is not None
+        and (plan.attributes_changed or normalize_article_number(plan.article_number) in legacy_articles)
+    }
+    term_rows = {
+        plan.article_number: build_usage_number_export_rows(plan.bundle)
+        for plan in changed_plans
+        if plan.bundle is not None and plan.search_terms_changed
+    }
+    result = BrandTransferWriteResult(written_at=written_at, backup_dir=backup_dir)
+    targets: list[tuple[tuple[str, str], list[str], dict[str, list[list[str]]]]] = []
+    if attribute_rows:
+        targets.append((ATTRIBUTE_FILE, ATTRIBUTE_HEADERS, attribute_rows))
+    if term_rows:
+        targets.append((USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS, term_rows))
+    if not targets:
+        return result
+    written = write_output_files_transfer(output_root, targets, backup_dir, written_at, written_hint="neue Marke")
+    result.backup_files = written.backup_files
+    result.files_written = written.files_written
+    result.attributes_changed = written.changed_by_file.get(ATTRIBUTE_FILE[0], set())
+    result.search_terms_changed = written.changed_by_file.get(USAGE_NUMBER_FILE[0], set())
     return result
 
 
@@ -13862,6 +14207,253 @@ class OverviewGenArtTransferDialog:
         return self.result
 
 
+class OverviewBrandTransferDialog:
+    """Vorschau fuer 'Marke einfuegen…' / 'Marke setzen…' im Reiter Uebersicht.
+
+    plans_by_mode: je Modus (True = Suchwoerter mitziehen, False = nur Attribute) die Plaene
+    aller Zielartikel (plan_brand_transfer). show() blockiert und liefert den gewaehlten Modus
+    (True/False) oder None (Abbrechen/Fenster geschlossen)."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        brand: str,
+        plans_by_mode: dict[bool, list[BrandTransferPlan]],
+        *,
+        source_article: str = "",
+        skipped_source: bool = False,
+        missing_articles: list[str] | None = None,
+        backup_dir: Path | None = None,
+    ) -> None:
+        self.result: bool | None = None
+        self.plans_by_mode = plans_by_mode
+        self.window = tk.Toplevel(master)
+        self.window.title(f"{APP_TITLE} – Marke übertragen")
+        self.window.transient(master)
+        self.window.resizable(True, True)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.window.bind("<Escape>", lambda _event: self._cancel())
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(0, weight=1)
+        self.with_terms_var = tk.BooleanVar(value=True)
+        self.summary_var = tk.StringVar()
+        self.warning_var = tk.StringVar()
+
+        frame = ttk.Frame(self.window, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(4, weight=1)
+        ttk.Label(frame, text="Marke übertragen", font=("Segoe UI Semibold", 11)).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        targets = len(next(iter(plans_by_mode.values()), []))
+        info = [f"Marke: {brand}" + (f" (kopiert von {source_article})" if source_article else ""), f"Ziele: {targets} Artikel"]
+        if skipped_source and source_article:
+            info[-1] += f" ({source_article} selbst wird übersprungen)"
+        if missing_articles:
+            info.append(
+                f"Nicht mehr im Ausgabeordner (übersprungen): {', '.join(missing_articles[:10])}"
+                + (" …" if len(missing_articles) > 10 else "")
+            )
+        self.info_text = "\n".join(info)
+        ttk.Label(frame, text=self.info_text, wraplength=760, justify="left").grid(row=1, column=0, sticky="w")
+
+        ttk.Checkbutton(
+            frame,
+            text="Suchwörter mitziehen: alte Marke entfernen, neue Marke ergänzen",
+            variable=self.with_terms_var,
+            command=self._refresh_preview,
+        ).grid(row=2, column=0, sticky="w", pady=(10, 6))
+        ttk.Label(
+            frame,
+            text=(
+                "Wie in der Maske: die Attributzeile 8988 'Marke' bekommt den neuen Wert (fehlt sie, kommt sie als erste "
+                "Attributzeile dazu); mit 'Suchwörter mitziehen' fallen Suchwörter weg, die der bisherigen Marke oder einer "
+                "ihrer Schreibweisen entsprechen, und die neue Marke wird das erste Suchwort. Andere Zeilen bleiben "
+                "unberührt, unveränderte Zeilen behalten ihr Datum."
+            ),
+            foreground=UI_TEXT_MUTED,
+            wraplength=760,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(0, 8))
+
+        table = ttk.Frame(frame)
+        table.grid(row=4, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        columns = ("article", "before", "after", "terms")
+        self.tree = ttk.Treeview(table, columns=columns, show="headings", height=min(max(targets, 4), 14), selectmode="browse")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        for column, heading, width in (
+            ("article", "Artikel", 140),
+            ("before", "Marke bisher", 150),
+            ("after", "Marke danach", 150),
+            ("terms", "Suchwörter", 340),
+        ):
+            self.tree.heading(column, text=heading)
+            self.tree.column(column, width=width, anchor="w", stretch=(column == "terms"))
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        ttk.Label(frame, textvariable=self.summary_var, wraplength=760, justify="left").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frame, textvariable=self.warning_var, foreground="#B3261E", wraplength=760, justify="left").grid(
+            row=6, column=0, sticky="w", pady=(4, 0)
+        )
+        if backup_dir is not None:
+            ttk.Label(
+                frame,
+                text=(
+                    f"Vor dem Schreiben werden die Dateien gesichert, die sich ändern ({ATTRIBUTE_FILE[0]} bei "
+                    f"geänderter Markenzeile, {USAGE_NUMBER_FILE[0]} bei geänderten Suchwörtern), nach: {backup_dir}"
+                ),
+                foreground=UI_TEXT_MUTED,
+                wraplength=760,
+                justify="left",
+            ).grid(row=7, column=0, sticky="w", pady=(4, 0))
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=8, column=0, sticky="e", pady=(14, 0))
+        transfer_button = ttk.Button(button_row, text="Übertragen", style="Accent.TButton", command=self._transfer)
+        transfer_button.grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(button_row, text="Abbrechen", command=self._cancel).grid(row=0, column=1)
+        transfer_button.focus_set()
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        plans = self.plans_by_mode.get(bool(self.with_terms_var.get()), [])
+        self.tree.delete(*self.tree.get_children())
+        for plan in plans:
+            self.tree.insert("", "end", values=(plan.article_number, plan.before_label(), plan.after_label(), plan.terms_label()))
+        changed = [plan for plan in plans if plan.changed]
+        impossible = [plan for plan in plans if plan.error]
+        added = sum(len(plan.terms_added) for plan in changed)
+        removed = sum(len(plan.terms_removed) for plan in changed)
+        summary = (
+            f"{len(changed)} Artikel werden geändert, {len(plans) - len(changed) - len(impossible)} "
+            f"{OVERVIEW_TRANSFER_UNCHANGED_LABEL} – Suchwörter: +{format_count_de(added)} / −{format_count_de(removed)}"
+        )
+        if impossible:
+            summary += f" – {len(impossible)} {BRAND_TRANSFER_IMPOSSIBLE_LABEL}"
+        self.summary_var.set(summary)
+        if impossible:
+            brand_errors = [plan for plan in impossible if plan.error.startswith("Marke '")]
+            if len(brand_errors) == len(impossible):
+                # Die Marke selbst ist ungueltig (leer oder zu lang) - nicht die Zielartikel.
+                self.warning_var.set(f"Achtung: {impossible[0].error} Es wird nichts geschrieben.")
+            else:
+                self.warning_var.set(
+                    f"Achtung: {len(impossible)} Artikel können nicht geschrieben werden (ungültige Attributzeile, "
+                    f"siehe Spalte Suchwörter) und bleiben unverändert: "
+                    f"{', '.join(plan.article_number for plan in impossible[:10])}"
+                    + (" …" if len(impossible) > 10 else "")
+                    + " – bitte im Reiter Attribute korrigieren."
+                )
+        else:
+            self.warning_var.set("")
+
+    def preview_rows(self) -> list[tuple[str, ...]]:
+        """Zeilen der Vorschau (Artikel, Marke bisher, Marke danach, Suchwoerter) - fuer Tests."""
+        return [tuple(str(value) for value in self.tree.item(item, "values")) for item in self.tree.get_children()]
+
+    def _transfer(self) -> None:
+        self.result = bool(self.with_terms_var.get())
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+    def show(self) -> bool | None:
+        try:
+            self.window.grab_set()
+        except tk.TclError:  # pragma: no cover - z. B. verstecktes Hauptfenster
+            pass
+        self.window.wait_window()
+        return self.result
+
+
+class OverviewBrandInputDialog:
+    """'Marke setzen…' im Reiter Uebersicht: Marke fuer die markierten Artikel waehlen oder tippen.
+
+    values = Markennamen der Markenliste plus die in den Artikeln gepflegten Marken (editierbare
+    Auswahlliste). Die Eingabe prueft resolve_brand_input: Schreibweise der Markenliste bei Name
+    oder Alias, sonst wie getippt; leer oder zu lang wird mit Hinweis abgewiesen (Dialog bleibt
+    offen). show() blockiert und liefert die Marke oder None (Abbrechen/Fenster geschlossen)."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        values: list[str],
+        *,
+        initial: str = "",
+        brand_list: str | list[tuple[str, list[str]]] | None = None,
+        max_length: int = BRAND_ATTRIBUTE_MAX_LENGTH,
+        target_count: int = 0,
+    ) -> None:
+        self.result: str | None = None
+        self.brand_list = brand_list
+        self.max_length = max_length
+        self.brand_var = tk.StringVar(value=initial)
+        self.error_var = tk.StringVar()
+        self.window = tk.Toplevel(master)
+        self.window.title(f"{APP_TITLE} – Marke setzen")
+        self.window.transient(master)
+        self.window.resizable(False, False)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.window.bind("<Escape>", lambda _event: self._cancel())
+        self.window.bind("<Return>", lambda _event: self._accept())
+
+        frame = ttk.Frame(self.window, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="Marke setzen", font=("Segoe UI Semibold", 11)).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        count_text = f"für {target_count} markierte Artikel" if target_count != 1 else "für den markierten Artikel"
+        ttk.Label(
+            frame,
+            text=(
+                f"Marke {count_text} wählen oder eintippen. Entspricht die Eingabe einer Marke der Markenliste "
+                f"(Name oder Schreibweise, z. B. 'tdl'), gilt deren Schreibweise ('T D L'); sonst wird sie wie getippt "
+                f"übernommen (max. {max_length} Zeichen, Attribut 8988). Ob die Suchwörter mitziehen, zeigt die Vorschau."
+            ),
+            foreground=UI_TEXT_MUTED,
+            wraplength=520,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="Marke").grid(row=2, column=0, sticky="w", padx=(0, 10))
+        self.combo = ttk.Combobox(frame, textvariable=self.brand_var, values=list(values), width=34)
+        self.combo.grid(row=2, column=1, sticky="ew")
+        ttk.Label(frame, textvariable=self.error_var, foreground="#B3261E", wraplength=520, justify="left").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(button_row, text="Weiter", style="Accent.TButton", command=self._accept).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(button_row, text="Abbrechen", command=self._cancel).grid(row=0, column=1)
+        self.combo.focus_set()
+        self.combo.icursor("end")
+
+    def _accept(self) -> bool:
+        """Eingabe pruefen und uebernehmen; False (Hinweis im Dialog) bei leerer oder zu langer Marke."""
+        brand, error = resolve_brand_input(self.brand_var.get(), self.brand_list, self.max_length)
+        if error:
+            self.error_var.set(error)
+            return False
+        self.result = brand
+        self.window.destroy()
+        return True
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+    def show(self) -> str | None:
+        try:
+            self.window.grab_set()
+        except tk.TclError:  # pragma: no cover - z. B. verstecktes Hauptfenster
+            pass
+        self.window.wait_window()
+        return self.result
+
+
 class SearchTermSuggestionDialog:
     """Vorschlagsliste fuer 'Suchwoerter automatisch' (Regel- und KI-Kandidaten).
 
@@ -16027,10 +16619,14 @@ class ApolloImportApp:
         self._overview_render_after_id: str | None = None
         self._overview_sort_column = "article"
         self._overview_sort_desc = False
-        # 'GenArten kopieren' / 'GenArten einfuegen…' in der Uebersicht: kopierter Artikel und
-        # seine GenArten (Reihenfolge wie gespeichert), Kontextmenue, laufende Uebertragung.
-        self._overview_genart_clipboard: tuple[str, list[GenArtSelection]] | None = None
-        self._overview_genart_transfer_running = False
+        # Zellen-Logik wie in Excel: die zuletzt angeklickte Spalte bestimmt, was Strg+C/Strg+V
+        # und das Kontextmenue tun (Standard GenArten wie v0.1.53); Hinweiszeile unter der Tabelle.
+        self._overview_active_column = OVERVIEW_DEFAULT_ACTIVE_COLUMN
+        self.overview_cell_hint_var = tk.StringVar()
+        # Zwischenablage der Uebersicht ('GenArten kopieren' bzw. 'Marke kopieren': Quellartikel
+        # und Inhalt), Kontextmenue (Eintraege je aktiver Spalte), laufende Uebertragung.
+        self._overview_clipboard: OverviewClipboard | None = None
+        self._overview_transfer_running = False
         self.overview_context_menu: tk.Menu | None = None
         # Ein Neuladen des Artikelverzeichnisses ist angefordert (Katalog neu geladen,
         # KTyp-Parse fertig, Guard hat einen Reload uebersprungen), konnte aber wegen
@@ -24949,8 +25545,10 @@ if ($copied) {{
                 "Output-Datei und Datum der letzten Änderung; Kurzbezeichnung und Text zeigen Text-Modul-ID und "
                 "Anzahl gefüllter Sprachen. Hellorange = seit dem Apollo-Importstand geändert. "
                 "Spaltenkopf anklicken sortiert (nochmal: umgekehrt), Doppelklick lädt den Artikel in die Maske. "
-                "GenArten übertragen: Rechtsklick auf einen Artikel > 'GenArten kopieren' (Strg+C), dann die Zielartikel "
-                "markieren (Strg/Umschalt + Klick) > 'GenArten einfügen…' (Strg+V)."
+                "Wie in Excel gilt die angeklickte Zelle: Strg+C kopiert den Wert dieser Spalte (GenArten oder Marke; "
+                "bei anderen Spalten den Zelltext in die Windows-Zwischenablage), Zielartikel markieren "
+                "(Strg/Umschalt + Klick) und Strg+V setzt GenArten bzw. Marke dort ein – das Kontextmenü "
+                "(Rechtsklick) zeigt die Befehle der Spalte, z. B. 'Marke setzen…'."
             ),
             foreground=UI_TEXT_MUTED,
             wraplength=1100,
@@ -24986,15 +25584,21 @@ if ($copied) {{
         horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.overview_tree.xview)
         horizontal.grid(row=1, column=0, sticky="ew")
         self.overview_tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        # Zellen-Logik: der Klick waehlt die Zeile (Standardbindung) UND die Spalte (aktive Spalte).
+        self.overview_tree.bind("<Button-1>", self._on_overview_click, add=True)
         self.overview_tree.bind("<Double-1>", self._on_overview_double_click)
         self.overview_tree.bind("<Button-3>", self._open_overview_context_menu)
         for sequence in ("<Control-c>", "<Control-C>"):
             self.overview_tree.bind(sequence, self._on_overview_copy_key)
         for sequence in ("<Control-v>", "<Control-V>"):
             self.overview_tree.bind(sequence, self._on_overview_paste_key)
+        # Eintraege je aktiver Spalte baut _update_overview_context_menu beim Oeffnen.
         self.overview_context_menu = tk.Menu(self.overview_tree, tearoff=0)
-        self.overview_context_menu.add_command(label="GenArten kopieren", accelerator="Strg+C", command=self.copy_overview_genarts)
-        self.overview_context_menu.add_command(label="GenArten einfügen…", accelerator="Strg+V", command=self.paste_overview_genarts)
+        self._update_overview_context_menu()
+        ttk.Label(tab, textvariable=self.overview_cell_hint_var, foreground=UI_TEXT_MUTED, wraplength=1100).grid(
+            row=3, column=0, sticky="w", pady=(6, 0)
+        )
+        self._update_overview_cell_hint()
         self._update_overview_headings()
         self.main_notebook.bind("<<NotebookTabChanged>>", self._on_main_notebook_tab_changed)
 
@@ -25098,9 +25702,11 @@ if ($copied) {{
     def _update_overview_headings(self) -> None:
         if not hasattr(self, "overview_tree"):
             return
+        # Sortierpfeil hinter dem Namen, Marke der aktiven Spalte (Zellen-Logik) davor.
         arrow = " ▼" if self._overview_sort_desc else " ▲"
         for key, label, _width, _anchor, _kind in OVERVIEW_COLUMNS:
-            self.overview_tree.heading(key, text=label + (arrow if key == self._overview_sort_column else ""))
+            marker = "▸ " if key == self._overview_active_column else ""
+            self.overview_tree.heading(key, text=marker + label + (arrow if key == self._overview_sort_column else ""))
 
     def _overview_sort_by(self, column: str) -> None:
         if column not in OVERVIEW_COLUMN_KEYS:
@@ -25156,6 +25762,7 @@ if ($copied) {{
         return "break"
 
     def _on_overview_double_click(self, event: tk.Event[tk.Misc]) -> None:
+        self._set_overview_active_column(self._overview_column_at(event.x, event.y))
         item_id = self.overview_tree.identify_row(event.y)
         if not item_id:
             return
@@ -25198,39 +25805,179 @@ if ($copied) {{
         return target_path
 
     # ------------------------------------------------------------------
-    # Uebersicht: GenArten kopieren und auf markierte Artikel uebertragen
+    # Uebersicht: Zellen-Logik wie in Excel - die aktive Spalte (zuletzt angeklickte Zelle)
+    # bestimmt, was Strg+C kopiert, Strg+V einfuegt und was das Kontextmenue anbietet
+    # (GenArten, Marke, sonst Zellwert in die System-Zwischenablage).
 
-    def _overview_genart_transfer_blocked(self) -> str:
+    def _overview_column_at(self, x: int, y: int) -> str:
+        """Spaltenschluessel der Zelle unter dem Zeiger; '' ueber Kopfzeile, Trenner oder Leere."""
+        tree = self.overview_tree
+        try:
+            if tree.identify_region(x, y) not in ("cell", "tree"):
+                return ""
+            column_id = tree.identify_column(x)
+            if not column_id:
+                return ""
+            key = str(tree.column(column_id, "id"))
+        except tk.TclError:
+            return ""
+        return key if key in OVERVIEW_COLUMN_KEYS else ""
+
+    def _set_overview_active_column(self, column: str) -> None:
+        """Aktive Spalte setzen (Kopfzeilen-Marke und Hinweiszeile nachziehen); '' aendert nichts."""
+        if column not in OVERVIEW_COLUMN_KEYS or column == self._overview_active_column:
+            return
+        self._overview_active_column = column
+        self._update_overview_headings()
+        self._update_overview_cell_hint()
+
+    def _on_overview_click(self, event: tk.Event[tk.Misc]) -> None:
+        """Linksklick: die Zeile waehlt die Standardbindung (Mehrfachauswahl mit Strg/Umschalt
+        bleibt), die Spalte unter dem Zeiger wird die aktive Spalte. Kopfzeile (Sortieren) und
+        Spaltentrenner aendern sie nicht."""
+        self._set_overview_active_column(self._overview_column_at(event.x, event.y))
+
+    def _overview_column_label(self, column: str | None = None) -> str:
+        key = column or self._overview_active_column
+        return next((label for col_key, label, _width, _anchor, _kind in OVERVIEW_COLUMNS if col_key == key), key)
+
+    def _update_overview_cell_hint(self) -> None:
+        """Hinweiszeile unter der Tabelle: was Strg+C/Strg+V in der aktiven Spalte tun."""
+        if not hasattr(self, "overview_cell_hint_var"):
+            return
+        column = self._overview_active_column
+        label = self._overview_column_label(column)
+        if column == "genarts":
+            text = (
+                f"Zelle: {label} – Strg+C kopiert die GenArten der markierten Zeile, Strg+V überträgt sie auf die "
+                "markierten Zeilen (Vorschau mit Ergänzen/Ersetzen)."
+            )
+        elif column == "brand":
+            text = (
+                f"Zelle: {label} – Strg+C kopiert die Marke der markierten Zeile, Strg+V setzt sie in die markierten "
+                "Zeilen (Attribut 8988 und Suchwörter, Vorschau); Rechtsklick > 'Marke setzen…' für eine beliebige Marke."
+            )
+        else:
+            text = (
+                f"Zelle: {label} – Strg+C kopiert den Zellwert der markierten Zeile in die Zwischenablage; "
+                "Einfügen ist in dieser Spalte nicht möglich (GenArten und Marke anklicken)."
+            )
+        self.overview_cell_hint_var.set(text)
+
+    def load_focused_overview_article(self) -> bool:
+        """'Artikel laden' im Kontextmenue: die eine markierte Zeile wie per Doppelklick in die Maske laden."""
+        selection = [str(item) for item in self.overview_tree.selection()]
+        item = str(self.overview_tree.focus() or "")
+        if item not in selection:
+            item = selection[0] if len(selection) == 1 else ""
+        if not item:
+            self.status_var.set("Zum Laden genau einen Artikel markieren.")
+            return False
+        return self.load_article_from_overview(item)
+
+    # ------------------------------------------------------------------
+    # Uebersicht: GenArten bzw. Marke kopieren und auf markierte Artikel uebertragen
+
+    @property
+    def _overview_genart_clipboard(self) -> tuple[str, list[GenArtSelection]] | None:
+        """Kopierte GenArten als (Quellartikel, GenArten) - None, wenn die Zwischenablage der
+        Uebersicht leer ist oder eine Marke enthaelt (Form von v0.1.53, auch fuer Tests)."""
+        clipboard = self._overview_clipboard
+        if clipboard is None or clipboard.kind != "genarts":
+            return None
+        return clipboard.source_article, list(clipboard.genart_selections)
+
+    @_overview_genart_clipboard.setter
+    def _overview_genart_clipboard(self, value: tuple[str, list[GenArtSelection]] | None) -> None:
+        """Form von v0.1.53: None leert die Zwischenablage der Uebersicht (auch eine kopierte
+        Marke), (Quellartikel, GenArten) legt GenArten hinein."""
+        if value is None:
+            self._overview_clipboard = None
+            return
+        source_article, selections = value
+        self._overview_clipboard = OverviewClipboard(
+            kind="genarts", source_article=str(source_article), genart_selections=list(selections)
+        )
+
+    def _overview_transfer_blocked(self, what: str = "GenArten") -> str:
         """Grund (Statuszeile), warum gerade nicht uebertragen werden darf, sonst ''."""
         if self.batch_import_running or self._batch_owns_output:
-            return "Massenimport läuft – GenArten bitte danach übertragen."
+            return f"Massenimport läuft – {what} bitte danach übertragen."
         if self._ims_sync_running:
-            return "IMS-Übernahme läuft – GenArten bitte danach übertragen."
+            return f"IMS-Übernahme läuft – {what} bitte danach übertragen."
         if self.background_task_running:
-            return "Es läuft noch ein Hintergrundvorgang – GenArten bitte danach übertragen."
-        if self._mask_switch_blocked or self._live_retry_running or self._overview_genart_transfer_running:
-            return "Bitte warten – das Speichern läuft noch, GenArten danach übertragen."
+            return f"Es läuft noch ein Hintergrundvorgang – {what} bitte danach übertragen."
+        if self._mask_switch_blocked or self._live_retry_running or self._overview_transfer_running:
+            return f"Bitte warten – das Speichern läuft noch, {what} danach übertragen."
         return ""
 
+    def _overview_genart_transfer_blocked(self) -> str:
+        return self._overview_transfer_blocked("GenArten")
+
     def _overview_paste_targets(self) -> tuple[list[str], bool]:
-        """(markierte Zielartikel ohne den Quellartikel, Quellartikel war markiert)."""
-        clipboard = self._overview_genart_clipboard
-        source = clipboard[0] if clipboard is not None else ""
+        """(markierte Zielartikel ohne den Quellartikel der Zwischenablage, Quellartikel war markiert)."""
+        clipboard = self._overview_clipboard
+        source = clipboard.source_article if clipboard is not None else ""
         selected = list(dict.fromkeys(normalize_article_number(str(item)) for item in self.overview_tree.selection()))
         return [article for article in selected if article and article != source], bool(source) and source in selected
 
+    def _overview_clipboard_for(self, kind: str) -> OverviewClipboard | None:
+        """Zwischenablage der Uebersicht, wenn sie Inhalt der Art kind ('genarts'/'brand') hat;
+        sonst None mit Hinweis in der Statuszeile (leer bzw. andere Art: andere Spalte anklicken)."""
+        clipboard = self._overview_clipboard
+        if clipboard is not None and clipboard.kind == kind:
+            return clipboard
+        if clipboard is None:
+            if kind == "brand":
+                self.status_var.set(
+                    "Zuerst die Marke eines Artikels kopieren (Rechtsklick > 'Marke kopieren' bzw. Strg+C) – "
+                    "oder Rechtsklick > 'Marke setzen…'."
+                )
+            else:
+                self.status_var.set("Zuerst die GenArten eines Artikels kopieren (Rechtsklick > 'GenArten kopieren' bzw. Strg+C).")
+            return None
+        self.status_var.set(
+            f"Zwischenablage enthält {clipboard.content_label()} – bitte eine Zelle der Spalte "
+            f"{self._overview_column_label(clipboard.kind)} anklicken."
+        )
+        return None
+
     def _update_overview_context_menu(self) -> None:
-        """Kontextmenue der Uebersicht: Kopieren bei genau einer markierten Zeile, Einfuegen bei
-        vorhandener Kopie und mindestens einem anderen markierten Artikel (nicht waehrend
-        Massenimport, IMS-Uebernahme oder Hintergrundvorgang)."""
+        """Kontextmenue der Uebersicht passend zur aktiven Spalte: GenArten (kopieren/einfuegen),
+        Marke (kopieren/einfuegen/setzen) oder 'Wert kopieren', immer 'Artikel laden' am Ende.
+        Kopieren bei genau einer markierten Zeile, Einfuegen bei passender Kopie und mindestens
+        einem anderen markierten Artikel (nicht waehrend Massenimport, IMS-Uebernahme oder
+        Hintergrundvorgang), 'Marke setzen…' bei mindestens einer markierten Zeile."""
         menu = self.overview_context_menu
         if menu is None:
             return
+        selection_count = len(self.overview_tree.selection())
         targets, _skipped = self._overview_paste_targets()
-        copy_ok = len(self.overview_tree.selection()) == 1
-        paste_ok = self._overview_genart_clipboard is not None and bool(targets) and not self._overview_genart_transfer_blocked()
-        menu.entryconfigure(0, state="normal" if copy_ok else "disabled")
-        menu.entryconfigure(1, state="normal" if paste_ok else "disabled")
+        clipboard = self._overview_clipboard
+        column = self._overview_active_column
+        copy_state = "normal" if selection_count == 1 else "disabled"
+        menu.delete(0, "end")
+        if column == "genarts":
+            blocked = self._overview_transfer_blocked("GenArten")
+            paste_ok = clipboard is not None and clipboard.kind == "genarts" and bool(targets) and not blocked
+            menu.add_command(label="GenArten kopieren", accelerator="Strg+C", command=self.copy_overview_genarts, state=copy_state)
+            menu.add_command(
+                label="GenArten einfügen…", accelerator="Strg+V", command=self.paste_overview_genarts, state="normal" if paste_ok else "disabled"
+            )
+        elif column == "brand":
+            blocked = self._overview_transfer_blocked("Marke")
+            paste_ok = clipboard is not None and clipboard.kind == "brand" and bool(targets) and not blocked
+            menu.add_command(label="Marke kopieren", accelerator="Strg+C", command=self.copy_overview_brand, state=copy_state)
+            menu.add_command(
+                label="Marke einfügen…", accelerator="Strg+V", command=self.paste_overview_brand, state="normal" if paste_ok else "disabled"
+            )
+            menu.add_command(
+                label="Marke setzen…", command=self.set_overview_brand, state="normal" if selection_count and not blocked else "disabled"
+            )
+        else:
+            menu.add_command(label="Wert kopieren", accelerator="Strg+C", command=self.copy_overview_cell_text, state=copy_state)
+        menu.add_separator()
+        menu.add_command(label="Artikel laden", command=self.load_focused_overview_article, state=copy_state)
 
     def _open_overview_context_menu(self, event: tk.Event[tk.Misc]) -> None:
         tree = self.overview_tree
@@ -25240,19 +25987,63 @@ if ($copied) {{
                 tree.selection_set(item_id)
             tree.focus(item_id)
         tree.focus_set()
+        # Rechtsklick waehlt wie der Linksklick die Spalte der angeklickten Zelle.
+        self._set_overview_active_column(self._overview_column_at(event.x, event.y))
         if self.overview_context_menu is None:
             return
         self._update_overview_context_menu()
         self.overview_context_menu.tk_popup(event.x_root, event.y_root)
         self.overview_context_menu.grab_release()
 
-    def _on_overview_copy_key(self, _event: tk.Event[tk.Misc]) -> str:
-        self.copy_overview_genarts()
+    def _on_overview_copy_key(self, _event: tk.Event[tk.Misc] | None) -> str:
+        self.copy_overview_cell()
         return "break"
 
-    def _on_overview_paste_key(self, _event: tk.Event[tk.Misc]) -> str:
-        self.paste_overview_genarts()
+    def _on_overview_paste_key(self, _event: tk.Event[tk.Misc] | None) -> str:
+        self.paste_overview_cell()
         return "break"
+
+    def copy_overview_cell(self) -> bool:
+        """Strg+C in der Uebersicht: kopiert den Wert der aktiven Spalte der markierten Zeile -
+        GenArten bzw. Marke in die Zwischenablage der Uebersicht, sonst den Zelltext in die
+        System-Zwischenablage."""
+        column = self._overview_active_column
+        if column == "genarts":
+            return self.copy_overview_genarts()
+        if column == "brand":
+            return self.copy_overview_brand()
+        return self.copy_overview_cell_text()
+
+    def paste_overview_cell(self) -> bool:
+        """Strg+V in der Uebersicht: fuegt die Zwischenablage der Uebersicht in die aktive Spalte
+        der markierten Zeilen ein (GenArten bzw. Marke); andere Spalten nehmen nichts an."""
+        column = self._overview_active_column
+        if column == "genarts":
+            return self.paste_overview_genarts()
+        if column == "brand":
+            return self.paste_overview_brand()
+        self.status_var.set(f"In die Spalte {self._overview_column_label(column)} kann nichts eingefügt werden.")
+        return False
+
+    def copy_overview_cell_text(self) -> bool:
+        """'Wert kopieren' (Kontextmenue bzw. Strg+C in einer Spalte ohne eigene Logik): der
+        angezeigte Zelltext der aktiven Spalte genau einer markierten Zeile in die System-Zwischenablage."""
+        if not hasattr(self, "overview_tree"):
+            return False
+        selection = [str(item) for item in self.overview_tree.selection()]
+        if len(selection) != 1:
+            self.status_var.set("Zum Kopieren genau einen Artikel markieren.")
+            return False
+        column = self._overview_active_column
+        text = str(self.overview_tree.set(selection[0], column))
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except tk.TclError as exc:
+            self.status_var.set(f"Zwischenablage nicht verfügbar: {exc}")
+            return False
+        self.status_var.set(f"{self._overview_column_label(column)} von {normalize_article_number(selection[0])} kopiert: {text}")
+        return True
 
     def copy_overview_genarts(self) -> bool:
         """'GenArten kopieren' (Kontextmenue bzw. Strg+C in der Uebersicht): merkt die GenArten genau
@@ -25285,7 +26076,7 @@ if ($copied) {{
         if not selections:
             self.status_var.set(f"{article} hat keine GenArt – nichts kopiert.")
             return False
-        self._overview_genart_clipboard = (article, selections)
+        self._overview_clipboard = OverviewClipboard(kind="genarts", source_article=article, genart_selections=selections)
         self.status_var.set(f"GenArten von {article} kopiert: {format_genart_id_labels(selections)}")
         return True
 
@@ -25304,16 +26095,15 @@ if ($copied) {{
         Uebertragung durchlief (auch ohne Aenderung)."""
         if not hasattr(self, "overview_tree"):
             return False
-        clipboard = self._overview_genart_clipboard
+        clipboard = self._overview_clipboard_for("genarts")
         if clipboard is None:
-            self.status_var.set("Zuerst die GenArten eines Artikels kopieren (Rechtsklick > 'GenArten kopieren' bzw. Strg+C).")
             return False
-        source_article, source_selections = clipboard
+        source_article, source_selections = clipboard.source_article, clipboard.genart_selections
         targets, skipped_source = self._overview_paste_targets()
         if not targets:
             self.status_var.set(f"Bitte die Zielartikel markieren – die GenArten von {source_article} gehen nur auf andere Artikel.")
             return False
-        blocked = self._overview_genart_transfer_blocked()
+        blocked = self._overview_transfer_blocked("GenArten")
         if blocked:
             self.status_var.set(blocked)
             return False
@@ -25323,7 +26113,7 @@ if ($copied) {{
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
             return False
-        self._overview_genart_transfer_running = True
+        self._overview_transfer_running = True
         try:
             # Waehrend des Wartens laeuft die Ereignisschleife: kein Artikelwechsel dazwischen.
             with self._block_mask_switch():
@@ -25331,7 +26121,7 @@ if ($copied) {{
                     source_article, list(source_selections), targets, skipped_source, output_root, backup_dir
                 )
         finally:
-            self._overview_genart_transfer_running = False
+            self._overview_transfer_running = False
 
     def _plan_overview_genart_transfer(
         self, targets: list[str], source_selections: list[GenArtSelection], mode: str
@@ -25360,61 +26150,11 @@ if ($copied) {{
     ) -> bool:
         reason = "GenArten übertragen: "
         started = time.perf_counter()
-        if not self._flush_live_writes(reason=reason):
-            messagebox.showwarning(
-                APP_TITLE,
-                "Noch nicht gespeicherte Änderungen konnten nicht geschrieben werden.\n\n"
-                "Bitte kurz warten und die GenArten erneut einfügen.",
-            )
-            self.status_var.set("GenArten nicht übertragen: das Speichern läuft noch.")
+        prepared = self._prepare_overview_transfer(targets, reason, "GenArten", {"genart", "vehicle_links"})
+        if prepared is None:
             return False
-        # Verzeichnis auf den Plattenstand bringen (Signaturpruefung; ohne Aenderung kostet das nichts).
-        self._refresh_article_browser()
-        mask_article = normalize_article_number(self._mask_article_number)
-        if mask_article and mask_article in targets:
-            # Die Maske zeigt ein Ziel: offene Eingaben erst sichern - sie wird danach aus den
-            # Dateien neu gefuellt und wuerde nicht Gespeichertes sonst verwerfen.
-            self._save_mask_article_before_leaving(mask_article)
-            flushed = self._flush_live_writes(reason=reason)
-            unsaved = self._unsaved_live_sections() if flushed else list(LIVE_SECTIONS)
-            if unsaved:
-                labels = format_live_section_labels(set(unsaved))
-                messagebox.showwarning(
-                    APP_TITLE,
-                    f"Die Maske zeigt {mask_article} mit noch nicht gespeicherten Bereichen: {labels}.\n\n"
-                    "Bitte zuerst korrigieren bzw. speichern (siehe Statuszeile) und die GenArten dann erneut "
-                    "einfügen – sonst würde das Neuladen der Maske diese Eingaben verwerfen.\n\n"
-                    "Es wurde nichts übertragen.",
-                )
-                self.status_var.set(f"GenArten nicht übertragen: {labels} von {mask_article} nicht gespeichert.")
-                return False
-        # Gemerkte Eingaben der Ziele (Schreiben nach dem Verlassen gescheitert) zuerst nachholen -
-        # ihr Nachholer schriebe sonst spaeter den alten GenArt- bzw. Fahrzeugstand zurueck.
-        for article in targets:
-            if article != mask_article and self._failed_live_write_entry(article) is not None:
-                self._retry_failed_live_write(article)
-        pending = [
-            article for article in targets if self._live_failed_sections.get(article, set()) & {"genart", "vehicle_links"}
-        ]
-        if pending:
-            sections = {
-                section for article in pending for section in self._live_failed_sections.get(article, set())
-            } & {"genart", "vehicle_links"}
-            messagebox.showwarning(
-                APP_TITLE,
-                "Für diese Zielartikel stehen noch GenArt- bzw. Fahrzeug-Eingaben aus, die nicht gespeichert "
-                f"werden konnten:\n{', '.join(pending[:20])}{' …' if len(pending) > 20 else ''}\n\n"
-                f"{self._live_failed_files_hint(sections)}\n\nEs wurde nichts übertragen.",
-            )
-            self.status_var.set(f"GenArten nicht übertragen: offene Eingaben bei {', '.join(pending[:5])}.")
-            return False
-        self._refresh_article_browser()
+        mask_article, present, missing = prepared
         records = self.article_browser_records
-        present = [article for article in targets if article in records]
-        missing = [article for article in targets if article not in records]
-        if not present:
-            self.status_var.set("GenArten nicht übertragen: die markierten Artikel sind nicht mehr im Ausgabeordner.")
-            return False
         if not self.vehicle_catalog.count:
             # Alte Fahrzeugzeilen nur mit TopMotive-Nummer: ihre TecDoc-Nummer kommt erst aus den
             # KTyp-Stammdaten (wie im Reiter Fahrzeuge wird nicht ohne sie geschrieben).
@@ -25467,41 +26207,10 @@ if ($copied) {{
         if dropped and not self._confirm_genart_transfer_drops(dropped):
             self.status_var.set("GenArten nicht übertragen.")
             return False
-        self.status_var.set(f"{reason}{len(changed)} Artikel werden geschrieben …")
-        try:
-            # Das Schreiben laeuft im UI-Thread (einmal je Datei): die Statuszeile vorher zeichnen.
-            self.root.update_idletasks()
-        except tk.TclError:
-            pass
-        if not self._acquire_workbook_lock_pumping(reason):
-            messagebox.showwarning(
-                APP_TITLE,
-                "Die GenArten können gerade nicht übertragen werden, weil die Output-Dateien von einem "
-                "Hintergrundvorgang geschrieben werden.\n\nBitte kurz warten und erneut einfügen.",
-            )
-            self.status_var.set("GenArten nicht übertragen: Output-Dateien sind gerade belegt.")
-            return False
-        failure: Exception | None = None
-        locked: GenArtTransferBlockedError | None = None
-        result: GenArtTransferWriteResult | None = None
-        try:
-            result = write_genart_transfer(output_root, plans, backup_dir)
-        except GenArtTransferBlockedError as exc:
-            locked = exc
-        except Exception as exc:  # GenArtTransferWriteError oder unerwartet
-            failure = exc
-        finally:
-            WORKBOOK_WRITE_LOCK.release()
-        if locked is not None:
-            messagebox.showwarning(
-                APP_TITLE,
-                f"Die GenArten wurden nicht übertragen – diese Datei kann gerade nicht geschrieben werden:\n\n{locked}\n\n"
-                "Bitte die Datei schließen (z. B. in Excel) und die GenArten erneut einfügen. Es wurde nichts geändert.",
-            )
-            self.status_var.set(f"GenArten nicht übertragen: Datei gesperrt – {str(locked).splitlines()[0]}")
-            return False
-        if failure is not None or result is None:
-            self._report_genart_transfer_failure(failure, output_root, targets, mask_article)
+        result = self._run_overview_transfer_write(
+            reason, "GenArten", lambda: write_genart_transfer(output_root, plans, backup_dir), output_root, targets, mask_article, len(changed)
+        )
+        if result is None:
             return False
         note_failure = self._note_changed_since_import(
             output_root, {article: result.written_at for article in sorted(result.changed_articles)}
@@ -25597,8 +26306,128 @@ if ($copied) {{
         self._restore_article_browser_selection(prev_selection, prev_focus)
         self._render_overview()
 
-    def _report_genart_transfer_failure(
-        self, failure: Exception | None, output_root: Path, targets: list[str], mask_article: str
+    # ------------------------------------------------------------------
+    # Uebersicht: gemeinsamer Ablauf der Uebertragungen (GenArten, Marke)
+
+    def _prepare_overview_transfer(
+        self, targets: list[str], reason: str, what: str, sections: set[str]
+    ) -> tuple[str, list[str], list[str]] | None:
+        """Gemeinsame Vorarbeit von 'GenArten einfuegen…' und 'Marke einfuegen…/setzen…' (Ablauf wie
+        beim Suchwort-Import): Live-Auftraege abschliessen, Verzeichnis gegen die Dateien
+        abgleichen; zeigt die Maske ein Ziel, dessen offene Eingaben sichern (bleibt etwas offen:
+        Abbruch); gemerkte Eingaben der Ziele nachholen (bleiben Bereiche aus `sections` offen:
+        Abbruch). what = 'GenArten' bzw. 'Marke' (Wortformen OVERVIEW_TRANSFER_WORDS). Rueckgabe
+        (Artikel der Maske, vorhandene Ziele, nicht mehr vorhandene Ziele) oder None nach Abbruch
+        mit Meldung."""
+        words = OVERVIEW_TRANSFER_WORDS[what]
+        if not self._flush_live_writes(reason=reason):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Noch nicht gespeicherte Änderungen konnten nicht geschrieben werden.\n\n"
+                f"Bitte kurz warten und {words['the']} erneut einfügen.",
+            )
+            self.status_var.set(f"{what} nicht übertragen: das Speichern läuft noch.")
+            return None
+        # Verzeichnis auf den Plattenstand bringen (Signaturpruefung; ohne Aenderung kostet das nichts).
+        self._refresh_article_browser()
+        mask_article = normalize_article_number(self._mask_article_number)
+        if mask_article and mask_article in targets:
+            # Die Maske zeigt ein Ziel: offene Eingaben erst sichern - sie wird danach aus den
+            # Dateien neu gefuellt und wuerde nicht Gespeichertes sonst verwerfen.
+            self._save_mask_article_before_leaving(mask_article)
+            flushed = self._flush_live_writes(reason=reason)
+            unsaved = self._unsaved_live_sections() if flushed else list(LIVE_SECTIONS)
+            if unsaved:
+                labels = format_live_section_labels(set(unsaved))
+                messagebox.showwarning(
+                    APP_TITLE,
+                    f"Die Maske zeigt {mask_article} mit noch nicht gespeicherten Bereichen: {labels}.\n\n"
+                    f"Bitte zuerst korrigieren bzw. speichern (siehe Statuszeile) und {words['the']} dann erneut "
+                    "einfügen – sonst würde das Neuladen der Maske diese Eingaben verwerfen.\n\n"
+                    "Es wurde nichts übertragen.",
+                )
+                self.status_var.set(f"{what} nicht übertragen: {labels} von {mask_article} nicht gespeichert.")
+                return None
+        # Gemerkte Eingaben der Ziele (Schreiben nach dem Verlassen gescheitert) zuerst nachholen -
+        # ihr Nachholer schriebe sonst spaeter den alten Stand der Bereiche zurueck.
+        for article in targets:
+            if article != mask_article and self._failed_live_write_entry(article) is not None:
+                self._retry_failed_live_write(article)
+        pending = [article for article in targets if self._live_failed_sections.get(article, set()) & sections]
+        if pending:
+            failed = {section for article in pending for section in self._live_failed_sections.get(article, set())} & sections
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Für diese Zielartikel stehen noch {words['pending']} aus, die nicht gespeichert "
+                f"werden konnten:\n{', '.join(pending[:20])}{' …' if len(pending) > 20 else ''}\n\n"
+                f"{self._live_failed_files_hint(failed)}\n\nEs wurde nichts übertragen.",
+            )
+            self.status_var.set(f"{what} nicht übertragen: offene Eingaben bei {', '.join(pending[:5])}.")
+            return None
+        self._refresh_article_browser()
+        records = self.article_browser_records
+        present = [article for article in targets if article in records]
+        missing = [article for article in targets if article not in records]
+        if not present:
+            self.status_var.set(f"{what} nicht übertragen: die markierten Artikel sind nicht mehr im Ausgabeordner.")
+            return None
+        return mask_article, present, missing
+
+    def _run_overview_transfer_write(
+        self,
+        reason: str,
+        what: str,
+        write: Callable[[], object],
+        output_root: Path,
+        targets: list[str],
+        mask_article: str,
+        changed_count: int,
+    ) -> object | None:
+        """Schreibt eine Uebertragung der Uebersicht im UI-Thread unter WORKBOOK_WRITE_LOCK (write =
+        write_genart_transfer bzw. write_brand_transfer, je Datei ein Schreibvorgang) und meldet
+        gesperrte Dateien (nichts geaendert) bzw. Fehler (_report_overview_transfer_failure).
+        Rueckgabe: das Ergebnis von write oder None."""
+        words = OVERVIEW_TRANSFER_WORDS[what]
+        self.status_var.set(f"{reason}{changed_count} Artikel werden geschrieben …")
+        try:
+            # Das Schreiben laeuft im UI-Thread (einmal je Datei): die Statuszeile vorher zeichnen.
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+        if not self._acquire_workbook_lock_pumping(reason):
+            messagebox.showwarning(
+                APP_TITLE,
+                f"{words['can']} gerade nicht übertragen werden, weil die Output-Dateien von einem "
+                "Hintergrundvorgang geschrieben werden.\n\nBitte kurz warten und erneut einfügen.",
+            )
+            self.status_var.set(f"{what} nicht übertragen: Output-Dateien sind gerade belegt.")
+            return None
+        failure: Exception | None = None
+        locked: OutputTransferBlockedError | None = None
+        result: object | None = None
+        try:
+            result = write()
+        except OutputTransferBlockedError as exc:
+            locked = exc
+        except Exception as exc:  # OutputTransferWriteError oder unerwartet
+            failure = exc
+        finally:
+            WORKBOOK_WRITE_LOCK.release()
+        if locked is not None:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"{words['not_done']} – diese Datei kann gerade nicht geschrieben werden:\n\n{locked}\n\n"
+                f"Bitte die Datei schließen (z. B. in Excel) und {words['the']} erneut einfügen. Es wurde nichts geändert.",
+            )
+            self.status_var.set(f"{what} nicht übertragen: Datei gesperrt – {str(locked).splitlines()[0]}")
+            return None
+        if failure is not None or result is None:
+            self._report_overview_transfer_failure(failure, output_root, targets, mask_article, what)
+            return None
+        return result
+
+    def _report_overview_transfer_failure(
+        self, failure: Exception | None, output_root: Path, targets: list[str], mask_article: str, what: str = "GenArten"
     ) -> None:
         """Schreiben gescheitert: Meldung mit Datei und Stand, Verzeichnis (und eine Ziel-Maske) neu
         aus den Dateien lesen. Stehen Zeilen trotzdem geaendert in einer Datei (Zurueckholen aus
@@ -25614,8 +26443,304 @@ if ($copied) {{
                 self._apply_article_snapshot(self.article_browser_records[mask_article])
         self._render_overview()
         text = str(failure) if failure is not None else "unbekannter Fehler"
-        messagebox.showerror(APP_TITLE, f"GenArten übertragen fehlgeschlagen:\n\n{text}")
-        self.status_var.set(f"GenArten übertragen fehlgeschlagen: {text.splitlines()[0]}")
+        messagebox.showerror(APP_TITLE, f"{what} übertragen fehlgeschlagen:\n\n{text}")
+        self.status_var.set(f"{what} übertragen fehlgeschlagen: {text.splitlines()[0]}")
+
+    # ------------------------------------------------------------------
+    # Uebersicht: Marke kopieren bzw. setzen und auf markierte Artikel uebertragen
+
+    def copy_overview_brand(self) -> bool:
+        """'Marke kopieren' (Kontextmenue bzw. Strg+C in der Spalte Marke): merkt die Marke
+        (Attribut 8988) genau eines markierten Artikels fuer 'Marke einfuegen…'. Ein Artikel ohne
+        Marke kopiert nichts (eine fruehere Kopie bleibt)."""
+        if not hasattr(self, "overview_tree"):
+            return False
+        selection = [normalize_article_number(str(item)) for item in self.overview_tree.selection()]
+        if len(selection) != 1:
+            self.status_var.set("Zum Kopieren der Marke genau einen Artikel markieren.")
+            return False
+        article = selection[0]
+        if self.live_writer.is_idle():
+            self._poll_live_write_results()
+        else:
+            # Eine gerade gespeicherte Attribut-Aenderung des Artikels soll mitkommen.
+            self._flush_live_writes(reason="Marke kopieren: ")
+        record = self.article_browser_records.get(article)
+        if record is None:
+            self.status_var.set(f"{article} ist nicht mehr im Ausgabeordner – nichts kopiert.")
+            return False
+        if "attributes" in self._live_failed_sections.get(article, set()):
+            # Der Eintrag zeigt den Dateistand, die Maske bzw. gemerkte Eingabe eine noch nicht
+            # geschriebene Attribut-Aenderung (z. B. Datei in Excel geoeffnet): nicht raten.
+            self.status_var.set(
+                f"Die Attribut-Änderung von {article} ist noch nicht gespeichert (Datei gesperrt?) – nichts kopiert."
+            )
+            return False
+        brand = find_brand_attribute_value(record.attribute_rows)
+        if not brand:
+            self.status_var.set(f"{article} hat keine Marke (Attribut 8988) – nichts kopiert.")
+            return False
+        max_length = self._brand_attribute_max_length()
+        if len(brand) > max_length:
+            # Eine von Hand zu lang gepflegte Marke liesse sich nirgends einfuegen.
+            self.status_var.set(
+                f"Die Marke von {article} ist länger als erlaubt ({len(brand)} von {max_length} Zeichen) – nichts kopiert."
+            )
+            return False
+        self._overview_clipboard = OverviewClipboard(kind="brand", source_article=article, brand=brand)
+        self.status_var.set(f"Marke von {article} kopiert: {brand}")
+        return True
+
+    def paste_overview_brand(self) -> bool:
+        """'Marke einfuegen…' (Kontextmenue bzw. Strg+V in der Spalte Marke): die kopierte Marke auf
+        die markierten Artikel uebertragen; der Quellartikel selbst wird uebersprungen. Ablauf wie
+        'GenArten einfuegen…' (_transfer_overview_brand). Rueckgabe True, wenn die Uebertragung
+        durchlief (auch ohne Aenderung)."""
+        if not hasattr(self, "overview_tree"):
+            return False
+        clipboard = self._overview_clipboard_for("brand")
+        if clipboard is None:
+            return False
+        targets, skipped_source = self._overview_paste_targets()
+        if not targets:
+            self.status_var.set(
+                f"Bitte die Zielartikel markieren – die Marke von {clipboard.source_article} geht nur auf andere Artikel."
+            )
+            return False
+        return self._start_overview_brand_transfer(clipboard.brand, targets, clipboard.source_article, skipped_source)
+
+    def set_overview_brand(self) -> bool:
+        """'Marke setzen…' (Kontextmenue der Spalte Marke): Marke waehlen oder tippen
+        (OverviewBrandInputDialog, Schreibweise der Markenliste) und auf ALLE markierten Artikel
+        uebertragen - sonst wie 'Marke einfuegen…'."""
+        if not hasattr(self, "overview_tree"):
+            return False
+        targets = [
+            article
+            for article in dict.fromkeys(normalize_article_number(str(item)) for item in self.overview_tree.selection())
+            if article
+        ]
+        if not targets:
+            self.status_var.set("Bitte die Artikel markieren, deren Marke gesetzt werden soll.")
+            return False
+        blocked = self._overview_transfer_blocked("Marke")
+        if blocked:
+            self.status_var.set(blocked)
+            return False
+        brand = OverviewBrandInputDialog(
+            self.root,
+            self._overview_brand_choices(),
+            initial=self._overview_brand_initial(targets),
+            brand_list=self.brand_list_var.get(),
+            max_length=self._brand_attribute_max_length(),
+            target_count=len(targets),
+        ).show()
+        if not brand:
+            self.status_var.set("Marke setzen abgebrochen.")
+            return False
+        return self._start_overview_brand_transfer(brand, targets, "", False)
+
+    def _brand_attribute_max_length(self) -> int:
+        option = brand_attribute_option(self.attribute_options_by_id)
+        return option.max_length if option.max_length is not None else BRAND_ATTRIBUTE_MAX_LENGTH
+
+    def _overview_brand_choices(self) -> list[str]:
+        """Auswahl fuer 'Marke setzen…': Namen der Markenliste, dann die in den Artikeln gepflegten Marken."""
+        names = [name for name, _aliases in parse_brand_list(self.brand_list_var.get())]
+        seen = {name.casefold() for name in names}
+        in_use = {find_brand_attribute_value(record.attribute_rows) for record in self.article_browser_records.values()}
+        for brand in sorted(in_use - {""}, key=str.casefold):
+            if brand.casefold() not in seen:
+                seen.add(brand.casefold())
+                names.append(brand)
+        return names
+
+    def _overview_brand_initial(self, targets: list[str]) -> str:
+        """Vorbelegung: die kopierte Marke, sonst die gemeinsame Marke der markierten Artikel, sonst leer."""
+        clipboard = self._overview_clipboard
+        if clipboard is not None and clipboard.kind == "brand":
+            return clipboard.brand
+        brands = {
+            find_brand_attribute_value(self.article_browser_records[article].attribute_rows)
+            for article in targets
+            if article in self.article_browser_records
+        } - {""}
+        return next(iter(brands)) if len(brands) == 1 else ""
+
+    def _start_overview_brand_transfer(self, brand: str, targets: list[str], source_article: str, skipped_source: bool) -> bool:
+        blocked = self._overview_transfer_blocked("Marke")
+        if blocked:
+            self.status_var.set(blocked)
+            return False
+        try:
+            output_root = self._resolve_output_root()
+            backup_dir = ims_sync_backup_dir(output_root)
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return False
+        self._overview_transfer_running = True
+        try:
+            # Waehrend des Wartens laeuft die Ereignisschleife: kein Artikelwechsel dazwischen.
+            with self._block_mask_switch():
+                return self._transfer_overview_brand(brand, targets, source_article, skipped_source, output_root, backup_dir)
+        finally:
+            self._overview_transfer_running = False
+
+    def _plan_overview_brand_transfer(self, targets: list[str], brand: str, with_search_terms: bool) -> list[BrandTransferPlan]:
+        option = brand_attribute_option(self.attribute_options_by_id)
+        brand_list = self.brand_list_var.get()
+        return [
+            plan_brand_transfer(
+                self.article_browser_records[article],
+                brand,
+                with_search_terms,
+                brand_list=brand_list,
+                option=option,
+                attribute_key_values_by_group=self.attribute_key_values_by_group,
+            )
+            for article in targets
+            if article in self.article_browser_records
+        ]
+
+    def _transfer_overview_brand(
+        self,
+        brand: str,
+        targets: list[str],
+        source_article: str,
+        skipped_source: bool,
+        output_root: Path,
+        backup_dir: Path,
+    ) -> bool:
+        """'Marke einfuegen…' / 'Marke setzen…' durchfuehren: Vorarbeit wie bei den GenArten
+        (_prepare_overview_transfer), Vorschau mit Wahl 'Suchwoerter mitziehen'
+        (plan_brand_transfer - Regeln wie Reiter Attribute/Suchwoerter der Maske), unter der
+        Datei-Sperre pruefen, sichern und jede Datei EINMAL schreiben (write_brand_transfer).
+        Danach Journal des Importstands, Verzeichnis-Eintraege und gemerkte Staende, Maske (zeigt
+        sie ein Ziel: neu aus dem Dateistand), Uebersicht und Verzeichnis."""
+        reason = "Marke übertragen: "
+        started = time.perf_counter()
+        prepared = self._prepare_overview_transfer(targets, reason, "Marke", {"attributes", "search_terms"})
+        if prepared is None:
+            return False
+        mask_article, present, missing = prepared
+        plans_by_mode = {mode: self._plan_overview_brand_transfer(present, brand, mode) for mode in (True, False)}
+        mode = OverviewBrandTransferDialog(
+            self.root,
+            brand,
+            plans_by_mode,
+            source_article=source_article,
+            skipped_source=skipped_source,
+            missing_articles=missing,
+            backup_dir=backup_dir,
+        ).show()
+        if mode is None:
+            self.status_var.set("Marke übertragen abgebrochen.")
+            return False
+        # Der Dialog hat die Ereignisschleife bedient: inzwischen Geschriebenes abholen und mit
+        # dem aktuellen Stand neu planen (ohne Aenderung ergibt das dieselbe Vorschau).
+        if not self._flush_live_writes(reason=reason):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Noch nicht gespeicherte Änderungen konnten nicht geschrieben werden.\n\n"
+                "Bitte kurz warten und die Marke erneut einfügen. Es wurde nichts übertragen.",
+            )
+            self.status_var.set("Marke nicht übertragen: das Speichern läuft noch.")
+            return False
+        self._refresh_article_browser()
+        plans = self._plan_overview_brand_transfer(present, brand, mode)
+        changed = [plan for plan in plans if plan.changed]
+        impossible = [plan for plan in plans if plan.error]
+        unchanged = len(plans) - len(changed) - len(impossible)
+        impossible_note = f"{len(impossible)} {BRAND_TRANSFER_IMPOSSIBLE_LABEL} (siehe Vorschau)" if impossible else ""
+        if not changed:
+            if not unchanged:
+                self.status_var.set(f"Marke {brand}: keine Änderung – {impossible_note}.")
+            elif impossible:
+                self.status_var.set(
+                    f"Marke {brand}: keine Änderung – {unchanged} Zielartikel haben diese Marke"
+                    f"{' und Suchwörter' if mode else ''} bereits, {impossible_note}."
+                )
+            else:
+                self.status_var.set(
+                    f"Marke {brand}: keine Änderung – alle {unchanged} Zielartikel haben diese Marke"
+                    f"{' und Suchwörter' if mode else ''} bereits."
+                )
+            return True
+        result = self._run_overview_transfer_write(
+            reason, "Marke", lambda: write_brand_transfer(output_root, plans, backup_dir), output_root, targets, mask_article, len(changed)
+        )
+        if not isinstance(result, BrandTransferWriteResult):
+            return False
+        note_failure = self._note_changed_since_import(
+            output_root, {article: result.written_at for article in sorted(result.changed_articles)}
+        )
+        self._apply_brand_transfer_to_memory(changed, result, output_root, mask_article)
+        added = sum(len(plan.terms_added) for plan in changed)
+        removed = sum(len(plan.terms_removed) for plan in changed)
+        status = (
+            f"Marke {brand} auf {len(changed)} Artikel übertragen ({unchanged} {OVERVIEW_TRANSFER_UNCHANGED_LABEL}) – "
+            f"Suchwörter: +{format_count_de(added)} / −{format_count_de(removed)}{impossible_note}"
+        )
+        if note_failure:
+            status += f" – {note_failure}"
+        self.status_var.set(status)
+        log_perf(
+            "Marke übertragen (Übersicht)",
+            time.perf_counter() - started,
+            detail=(
+                f"{'mit' if mode else 'ohne'} Suchwörter, {len(changed)} geändert, {unchanged} unverändert, "
+                f"Dateien: {', '.join(result.files_written) or '-'}"
+            ),
+        )
+        return True
+
+    def _apply_brand_transfer_to_memory(
+        self, plans: list[BrandTransferPlan], result: BrandTransferWriteResult, output_root: Path, mask_article: str
+    ) -> None:
+        """Nach write_brand_transfer: Verzeichnis-Eintraege der geaenderten Artikel (Attributzeilen,
+        Suchwoerter, Zeitstempel nur geaenderter Bereiche) und ihre gemerkten Staende (Fingerabdruck
+        Attribute/Suchwoerter = Dateistand) nachziehen - sonst hielte der Dirty-Check die Maske fuer
+        geaendert bzw. ein spaeteres Live-Speichern schriebe die alte Marke zurueck. Zeigt die Maske
+        ein Ziel, wird sie aus dem neuen Stand gefuellt. Dann Importstand (Journal) neu lesen,
+        Verzeichnis und Uebersicht zeichnen (wie _apply_genart_transfer_to_memory)."""
+        tree = self.article_browser_tree
+        prev_selection = tuple(tree.selection())
+        prev_focus = tree.focus()
+        written_at = result.written_at
+        mask_reload = False
+        for plan in plans:
+            article = plan.article_number
+            existing = self.article_browser_records.get(article)
+            if existing is None or plan.bundle is None:
+                continue
+            snapshot = self._copy_snapshot(existing)
+            snapshot.attribute_rows = list(plan.bundle.attribute_rows)
+            snapshot.search_terms = list(plan.bundle.search_terms)
+            if article in result.attributes_changed:
+                snapshot.note_written_at("attributes", written_at)
+            if article in result.search_terms_changed:
+                snapshot.note_written_at("search_terms", written_at)
+            self.article_browser_records[article] = snapshot
+            self._article_search_blob_cache.pop(article, None)
+            prev_entry = self._live_fingerprints.get(article)
+            # Gemerkten Stand behalten, solange er zum Eintrag passt (wie _apply_search_term_import_to_memory).
+            keep = prev_entry is not None and (
+                prev_entry[0] is existing or (prev_entry[0] is not None and article == mask_article)
+            )
+            cache = dict(prev_entry[1]) if keep else {}
+            for section in ("attributes", "search_terms"):
+                cache[section] = live_section_fingerprint(plan.bundle, section)[0]
+            self._live_fingerprints[article] = (snapshot, cache)
+            if article == mask_article:
+                mask_reload = True
+        self._mark_article_browser_in_sync(output_root)
+        if mask_reload:
+            with self._suspend_live_write():
+                self._apply_article_snapshot(self.article_browser_records[mask_article])
+        # Liest den eben geschriebenen Importstand (orange Markierung) und zeichnet das Verzeichnis.
+        self._refresh_article_browser()
+        self._restore_article_browser_selection(prev_selection, prev_focus)
+        self._render_overview()
 
     def _set_batch_ui_running(self, running: bool, total: int = 0) -> None:
         self.batch_import_running = running
