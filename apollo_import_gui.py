@@ -129,7 +129,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.56"
+APP_VERSION = "0.1.57"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -10719,6 +10719,19 @@ OVERVIEW_BRAND_EDITOR_PROMPT = "Marke wählen oder tippen"
 OVERVIEW_ACTION_BRAND = "Marke setzen"
 OVERVIEW_ACTION_UNDO = "Rückgängig"
 OVERVIEW_ACTION_GENARTS = "GenArten übertragen"
+# Spaltensuche (ab v0.1.57): ueber jedem Spaltenkopf steht ein Suchfeld, das nur in seiner Spalte
+# sucht. Suchzustand der Uebersicht = (Text der Suche oben, Texte der Spaltenfelder ohne Rand-
+# Leerzeichen in OVERVIEW_COLUMN_KEYS-Reihenfolge); OVERVIEW_NO_SEARCH_STATE = nichts gesucht.
+OVERVIEW_NO_SEARCH_STATE: tuple[str, tuple[str, ...]] = ("", ("",) * len(OVERVIEW_COLUMN_KEYS))
+# Die Suchzeile liegt deckungsgleich ueber den Kopfzellen. Linker Rand des Kopfbereichs in der
+# Tabelle = erstes x, an dem identify_region in der Kopfzeile (y = OVERVIEW_SEARCH_HEADING_PROBE_Y)
+# nicht 'nothing' meldet (Theme clam: 2 px); solange die Tabelle noch nie gezeichnet wurde, gilt
+# OVERVIEW_SEARCH_INSET_FALLBACK.
+OVERVIEW_SEARCH_INSET_FALLBACK = 2
+OVERVIEW_SEARCH_HEADING_PROBE_Y = 12
+# Sortierart je Spalte ('text', 'count', 'date', 'flag'): 'count'-Spalten kennen in der
+# Spaltensuche '=Anzahl' und haben einen eigenen Suchhinweis.
+OVERVIEW_COLUMN_KINDS = {column[0]: column[4] for column in OVERVIEW_COLUMNS}
 
 
 @dataclass
@@ -10823,6 +10836,72 @@ def overview_row_for_snapshot(snapshot: StoredArticleSnapshot, changed_at: str) 
         values.append(cell)
         keys.append(key)
     return values, keys
+
+
+# Spaltensuche der Uebersicht (ab v0.1.57), reine Hilfsfunktionen: Vergleichsform, Suchtext und
+# genaue Werte einer Zelle, Uebersetzen des Texts eines Spaltenfelds in eine Pruefung.
+def overview_search_fold(text: object) -> str:
+    """Vergleichsform der Spaltensuche: Umlaute wie in den Kurzbezeichnungen ersetzt ('ü' = 'ue',
+    'ß' = 'ss'), Gross-/Kleinschreibung egal - fuer den getippten Text UND die Zelltexte (die
+    Kurzbezeichnungen stehen mit 'ue', die GenArt-Bezeichnungen mit 'ü' in den Dateien)."""
+    return str(text or "").translate(SHORT_TEXT_UMLAUT_REPLACEMENTS).casefold()
+
+
+def overview_column_search_cell(
+    column: str, snapshot: StoredArticleSnapshot, value: str, sort_key: object
+) -> tuple[str, tuple[str, ...]]:
+    """Spaltensuche: (Suchtext, genaue Werte) einer Zelle - beides in der Vergleichsform
+    overview_search_fold, die genauen Werte ohne Rand-Leerzeichen. value = Anzeigewert der Zelle,
+    sort_key = ihr Sortierschluessel (beides aus overview_row_for_snapshot bzw. dem Zeilen-Cache).
+
+    Im Suchtext muessen alle getippten Woerter vorkommen; '=Text' trifft, wenn Text einer der
+    genauen Werte ist. Standard: beides der Anzeigewert. Kurzbezeichnung (DE): der ungekuerzte
+    Text aus derselben Quelle wie die Anzeige (DE, sonst UNI), genau auch der gekuerzte
+    Anzeigewert. GenArten: dazu die Bezeichnungen (je Zeile eine), genau auch jede einzelne ID und
+    Bezeichnung. Seit Import: 'ja' bzw. 'nein'. Spalten der Sortierart 'count' (die Bereiche,
+    Kurzbezeichnung und Text): genau auch die Anzahl aus dem Sortierschluessel (Zeilen bzw.
+    gefuellte Sprachen)."""
+    value = str(value or "")
+    exact: tuple[str, ...]
+    if column == "short_de":
+        full = snapshot.short_texts.de.strip() or snapshot.short_texts.uni.strip()
+        search_text, exact = full, (full, value)
+    elif column == "genarts":
+        selections = snapshot.genart_selections
+        names = [selection.bezeichnung for selection in selections]
+        search_text = value + "\n" + "\n".join(names)
+        exact = (value, *(selection.id for selection in selections), *names)
+    elif column == "since_import":
+        word = "ja" if value.strip() else "nein"
+        search_text, exact = word, (word,)
+    elif OVERVIEW_COLUMN_KINDS.get(column) == "count":
+        # Sortierschluessel = (Anzahl, Zeitstempel).
+        count = str(sort_key[0]) if isinstance(sort_key, (tuple, list)) and sort_key else ""
+        search_text, exact = value, ((value, count) if count else (value,))
+    else:
+        search_text, exact = value, (value,)
+    return overview_search_fold(search_text), tuple(overview_search_fold(candidate).strip() for candidate in exact)
+
+
+def compile_overview_column_filter(text: str) -> Callable[[str, str, tuple[str, ...]], bool] | None:
+    """Spaltensuche: uebersetzt den Text eines Spaltenfelds in eine Pruefung
+    predicate(Anzeigewert, Suchtext, genaue Werte) - Suchtext und genaue Werte aus
+    overview_column_search_cell. None = kein Filter (leer; '=' allein ist eine angefangene
+    Eingabe). '-' bzw. '–' allein: leere Zellen (Anzeigewert leer oder '–'). '=Text': genau dieser
+    Wert. Sonst: jedes Wort muss im Suchtext vorkommen (Teilwort)."""
+    wanted = str(text or "").strip()
+    if not wanted or wanted == "=":
+        return None
+    if wanted in ("-", "–"):
+        return lambda display_value, _search_text, _candidates: display_value.strip() in ("", OVERVIEW_EMPTY_CELL)
+    if wanted.startswith("="):
+        rest = wanted[1:].strip()
+        if not rest:
+            return None
+        exact = overview_search_fold(rest)
+        return lambda _display_value, _search_text, candidates: exact in candidates
+    words = overview_search_fold(wanted).split()
+    return lambda _display_value, search_text, _candidates: all(word in search_text for word in words)
 
 
 # ---------------------------------------------------------------------------
@@ -17276,13 +17355,19 @@ class ApolloImportApp:
         # Aenderungszeitpunkt), Suchtext, Sortierung; gezeichnet wird nur, wenn der
         # Reiter sichtbar ist (3.800 Zeilen x 19 Spalten).
         self.overview_search_var = tk.StringVar()
+        # Spaltensuche (ab v0.1.57): je Spalte ein Suchfeld ueber dem Spaltenkopf - Variablen in
+        # OVERVIEW_COLUMN_KEYS-Reihenfolge; die Felder, die Suchzeile und ihr innerer Rahmen entstehen
+        # in _build_overview_tab. Nicht im Sitzungszustand.
+        self.overview_column_search_vars: dict[str, tk.StringVar] = {key: tk.StringVar() for key in OVERVIEW_COLUMN_KEYS}
+        self.overview_column_search_entries: dict[str, ttk.Entry] = {}
         self.overview_count_var = tk.StringVar(value="0 Artikel")
         # Anzahl markierter Zeilen (Massenpflege: 'n markiert') neben dem Haekchen.
         self.overview_selection_var = tk.StringVar()
         self._overview_search_after_id: str | None = None
         self._overview_rows_cache: dict[str, tuple[int, str, list[str], list[object], str]] = {}
         self._overview_rendered_key: tuple[object, ...] | None = None
-        self._overview_rendered_search = ""
+        # Suchzustand (Suche oben + Spaltenfelder, _overview_search_state), mit dem zuletzt gezeichnet wurde.
+        self._overview_rendered_search: tuple[str, tuple[str, ...]] = OVERVIEW_NO_SEARCH_STATE
         # Seit-Import-Zeitpunkte, mit denen die Zeilen zuletzt gezeichnet wurden (das Nachziehen
         # einzelner Zeilen nach einer Markenaenderung faerbt nur die Zeilen um, die sich aendern).
         self._overview_rendered_changed_map: dict[str, str] = {}
@@ -17305,6 +17390,12 @@ class ApolloImportApp:
         self._overview_cell_frames: list[tk.Frame] = []
         self._overview_cell_frame_after_id: str | None = None
         self._overview_range_end = ""
+        # Suchzeile ueber den Spaltenkoepfen: zuletzt gesetzte Spaltenbreiten und (Versatz,
+        # Gesamtbreite) - platziert wird nur bei Aenderung -, dazu der einmal gemessene linke Rand
+        # des Kopfbereichs der Tabelle (None = noch nicht gemessen). Je Instanz, kein Modulzustand.
+        self._overview_search_widths: list[int] | None = None
+        self._overview_search_offset: tuple[int, int] | None = None
+        self._overview_search_inset: int | None = None
         # Strg+Klick, dessen Nachlauf (_after_overview_ctrl_click) noch aussteht: (Zeile, bisherige
         # aktive Zeile). Tasten laufen ihn vorher synchron (_run_pending_overview_ctrl_click).
         self._overview_pending_ctrl_click: tuple[str, str] | None = None
@@ -26553,6 +26644,9 @@ if ($copied) {{
                 "Alle Artikel des Ausgabeordners auf einen Blick. Je Reiter steht 'Anzahl (TT.MM.)' = Zeilen in der "
                 "Output-Datei und Datum der letzten Änderung; Kurzbezeichnung und Text zeigen Text-Modul-ID und "
                 "Anzahl gefüllter Sprachen. Hellorange = seit dem Apollo-Importstand geändert. "
+                "Die Suchfelder über den Spaltenköpfen suchen nur in ihrer Spalte ('-' = leere Zellen, '=Text' = genau "
+                "dieser Wert) und gelten zusammen mit der Suche oben; Strg+F springt aus der Tabelle ins Suchfeld der "
+                "aktiven Spalte, 'Leeren' leert alle Suchfelder. "
                 "Spaltenkopf anklicken sortiert (nochmal: umgekehrt), Doppelklick lädt den Artikel in die Maske. "
                 "Wie in Excel hat die aktive Zelle einen blauen Rahmen (Klick, Pfeiltasten); Zeilen markieren mit "
                 "Strg/Umschalt + Klick, Umschalt + Pfeil oder Strg+A. Spalte Marke: tippen, F2, Enter oder Doppelklick "
@@ -26572,6 +26666,7 @@ if ($copied) {{
         self.overview_search_entry = ttk.Entry(toolbar, textvariable=self.overview_search_var)
         self.overview_search_entry.grid(row=0, column=1, sticky="ew")
         self.overview_search_entry.bind("<Return>", self._on_overview_search_return)
+        self.overview_search_entry.bind("<KP_Enter>", self._on_overview_search_return)
         self.overview_search_entry.bind("<Escape>", self._on_overview_search_escape)
         ttk.Button(toolbar, text="Leeren", width=8, command=self._clear_overview_search).grid(row=0, column=2, padx=(6, 10))
         ttk.Label(toolbar, textvariable=self.overview_count_var, foreground=UI_TEXT_MUTED).grid(row=0, column=3, padx=(0, 12))
@@ -26591,18 +26686,53 @@ if ($copied) {{
         table = ttk.Frame(tab)
         table.grid(row=2, column=0, sticky="nsew")
         table.columnconfigure(0, weight=1)
-        table.rowconfigure(0, weight=1)
+        # Zeile 0 = Suchzeile der Spaltensuche, Zeile 1 = Tabelle + senkrechter Rollbalken, Zeile 2 =
+        # waagerechter Rollbalken.
+        table.rowconfigure(0, weight=0)
+        table.rowconfigure(1, weight=1)
+        # Spaltensuche: je Spalte ein Suchfeld deckungsgleich ueber dem Spaltenkopf. Die Felder stehen in
+        # einem inneren Rahmen, den die Suchzeile abschneidet und der beim waagerechten Rollen als Ganzes
+        # verschoben wird (_place_overview_column_search_row). Suchzeile und Felder entstehen VOR der
+        # Tabelle - die Tab-Reihenfolge ist so Werkzeugleiste -> 19 Felder -> Tabelle. Die Felder nie
+        # einzeln heben/senken oder per place_forget ausblenden (beides aendert die Tab-Reihenfolge);
+        # Suchzeile und innerer Rahmen bekommen keine Tasten-/Fokus-Bindungen (sie waeren sonst selbst
+        # Tab-Stationen). Der flache Stil (vgl. OverviewCell.TCombobox am Ende) muss VOR dem Anlegen der
+        # Felder gesetzt sein: ihre Wunschhoehe bestimmt die Hoehe der Suchzeile (place meldet dem
+        # Rahmen keine Groesse, eine spaetere Stil-Aenderung wirkt erst im Leerlauf).
+        ttk.Style().configure("OverviewSearch.TEntry", padding=(4, 2))
+        self.overview_column_search_row = ttk.Frame(table)
+        self.overview_column_search_row.grid(row=0, column=0, sticky="ew")
+        self.overview_column_search_inner = ttk.Frame(self.overview_column_search_row)
+        for key in OVERVIEW_COLUMN_KEYS:
+            search_var = self.overview_column_search_vars[key]
+            search_entry = ttk.Entry(self.overview_column_search_inner, textvariable=search_var, style="OverviewSearch.TEntry")
+            # Enter filtert sofort neu (wie im Suchfeld oben), Esc leert das Feld, Pfeil unten geht in die
+            # Tabelle. Per Tab erreicht, wird die Spalte ins Bild gerollt (nicht bei Mausklick oder wenn
+            # das Fenster wieder aktiv wird); mit dem Fokus zeigt die Hinweiszeile den Suchhinweis.
+            search_entry.bind("<Return>", self._on_overview_search_return)
+            search_entry.bind("<KP_Enter>", self._on_overview_search_return)
+            search_entry.bind("<Escape>", lambda _event, column=key: self._on_overview_column_search_escape(column))
+            search_entry.bind("<Down>", lambda _event, column=key: self._on_overview_column_search_down(column))
+            search_entry.bind("<<TraverseIn>>", lambda _event, column=key: self._see_overview_column(column))
+            search_entry.bind("<FocusIn>", lambda _event, column=key: self._on_overview_column_search_focus_in(column))
+            search_entry.bind("<FocusOut>", lambda _event: self._update_overview_cell_hint())
+            # EIN Zeitgeber (250 ms) fuer die Suche oben und alle Spaltenfelder.
+            search_var.trace_add("write", self._on_overview_search_changed)
+            self.overview_column_search_entries[key] = search_entry
+        self.overview_column_search_row.configure(
+            height=self.overview_column_search_entries[OVERVIEW_COLUMN_KEYS[0]].winfo_reqheight()
+        )
         # Mehrfachauswahl: Ziele fuer GenArten/Marke (Doppelklick laedt weiter die angeklickte Zeile).
         self.overview_tree = ttk.Treeview(table, columns=OVERVIEW_COLUMN_KEYS, show="headings", selectmode="extended")
-        self.overview_tree.grid(row=0, column=0, sticky="nsew")
+        self.overview_tree.grid(row=1, column=0, sticky="nsew")
         for key, label, width, anchor, _kind in OVERVIEW_COLUMNS:
             self.overview_tree.heading(key, text=label, command=lambda column=key: self._overview_sort_by(column))
             self.overview_tree.column(key, width=width, minwidth=60, anchor=anchor, stretch=(key == "short_de"))
         self.overview_tree.tag_configure(ARTICLE_CHANGED_ROW_TAG, background=ARTICLE_CHANGED_ROW_COLOR)
         vertical = ttk.Scrollbar(table, orient="vertical", command=self.overview_tree.yview)
-        vertical.grid(row=0, column=1, sticky="ns")
+        vertical.grid(row=1, column=1, sticky="ns")
         horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.overview_tree.xview)
-        horizontal.grid(row=1, column=0, sticky="ew")
+        horizontal.grid(row=2, column=0, sticky="ew")
         # Jede Aenderung der Ansicht (Mausrad, Rollbalken, see(), Spaltenbreite) zieht den Rahmen nach.
         self.overview_tree.configure(
             yscrollcommand=lambda first, last: self._on_overview_tree_scrolled(vertical, first, last),
@@ -26639,6 +26769,9 @@ if ($copied) {{
             tree.bind(sequence, self._on_overview_undo_key)
         for sequence in ("<Control-a>", "<Control-A>"):
             tree.bind(sequence, self._on_overview_select_all)
+        # Strg+F: aus der Tabelle ins Suchfeld der aktiven Spalte (Spaltensuche).
+        for sequence in ("<Control-f>", "<Control-F>"):
+            tree.bind(sequence, self._on_overview_find_key)
         # Tastatur wie in Excel: links/rechts wechselt die aktive Spalte, Pos1/Ende springt an den
         # Rand, Umschalt+oben/unten erweitert die Markierung; oben/unten bleibt die Standardbindung.
         # Ist der Editor der Marke offen (Tasten, die vor ihm in der Tabelle ankommen), gehen alle
@@ -26665,8 +26798,11 @@ if ($copied) {{
         # VOR allen anderen holt den Nachlauf dann zuerst nach - ohne 'break', die gewohnten
         # Bindungen laufen danach.
         tree.bindtags((OVERVIEW_PENDING_CLICK_TAG, *tree.bindtags()))
-        for sequence in ("<KeyPress>", "<ButtonPress>"):
-            self.root.bind_class(OVERVIEW_PENDING_CLICK_TAG, sequence, lambda _event: self._run_pending_overview_ctrl_click())
+        # Tasten wenden davor noch eine entprellte Sucheingabe an (_on_overview_pending_keypress):
+        # Strg+A, das Tippen einer Marke oder Strg+V wirken nie auf die Zeilen von vor der Suche.
+        # Klicks nicht - die Zeilen wuerden sich sonst unter dem Zeiger verschieben.
+        self.root.bind_class(OVERVIEW_PENDING_CLICK_TAG, "<KeyPress>", self._on_overview_pending_keypress)
+        self.root.bind_class(OVERVIEW_PENDING_CLICK_TAG, "<ButtonPress>", lambda _event: self._run_pending_overview_ctrl_click())
         # Eintraege je aktiver Spalte baut _update_overview_context_menu beim Oeffnen.
         self.overview_context_menu = tk.Menu(self.overview_tree, tearoff=0)
         self._update_overview_context_menu()
@@ -26682,6 +26818,11 @@ if ($copied) {{
         # Editor der Marke: flach genug fuer die Zeilenhoehe der Tabelle (26 px).
         style.configure("OverviewCell.TCombobox", padding=(4, 0, 2, 0))
         self.root.bind_class(OVERVIEW_BRAND_EDITOR_KEY_TAG, "<KeyPress>", self._on_overview_brand_editor_key)
+        # Suchzeile einmal ausrichten - das geht schon vor dem ersten Anzeigen des Reiters.
+        try:
+            self._place_overview_column_search_row()
+        except (tk.TclError, ValueError):
+            pass
 
     def _is_overview_visible(self) -> bool:
         if not hasattr(self, "overview_tree"):
@@ -26696,8 +26837,8 @@ if ($copied) {{
             # Reiter verlassen: ein offener Editor der Marke wird verworfen (wie Fokusverlust).
             self._discard_overview_brand_editor()
             return
-        # Nur zeichnen, wenn sich seit dem letzten Aufbau Datensaetze, Importstand oder Suchtext geaendert haben.
-        if self._overview_rendered_key != self._article_browser_render_key() or self._overview_rendered_search != self.overview_search_var.get():
+        # Nur zeichnen, wenn sich seit dem letzten Aufbau Datensaetze, Importstand oder Suchzustand geaendert haben.
+        if not self._overview_is_current():
             self._render_overview()
         self._schedule_overview_cell_frame()
 
@@ -26714,7 +26855,7 @@ if ($copied) {{
             return
         # Schon aktuell (z. B. hat eine Markenaenderung nur ihre Zeilen nachgezogen): nicht neu
         # zeichnen - Reihenfolge, Markierung und aktive Zelle bleiben wie in Excel stehen.
-        if self._overview_rendered_key == self._article_browser_render_key() and self._overview_rendered_search == self.overview_search_var.get():
+        if self._overview_is_current():
             return
         self._render_overview()
 
@@ -26733,22 +26874,40 @@ if ($copied) {{
         self._overview_rows_cache[article_number] = (weakref.ref(snapshot), changed_at, values, keys, blob)
         return values, keys, blob
 
-    def _overview_visible_articles(self, changed_map: dict[str, str]) -> list[str]:
-        """Artikel, die der Suchtext der Uebersicht uebrig laesst (Begriffe wie im Verzeichnis:
-        alle muessen vorkommen - im Such-Blob des Artikels oder in den Zellen der Zeile)."""
+    def _overview_visible_articles(
+        self, changed_map: dict[str, str], state: tuple[str, tuple[str, ...]] | None = None
+    ) -> list[str]:
+        """Artikel, die die Suche der Uebersicht uebrig laesst: der Suchtext oben (Begriffe wie im
+        Verzeichnis: alle muessen vorkommen - im Such-Blob des Artikels oder in den Zellen der
+        Zeile) UND jedes Spaltenfeld mit Filter (Spaltensuche). state = Suchzustand
+        (_overview_search_state; None liest ihn jetzt). Die Texte der Spaltenfelder werden einmal
+        je Zeichnen uebersetzt (compile_overview_column_filter); Suchtext und genaue Werte einer
+        Zelle baut overview_column_search_cell nur fuer Spalten mit Filter - der Zeilen-Cache
+        bleibt, wie er ist."""
         records = self.article_browser_records
         if len(self._overview_rows_cache) > len(records):
             for cached_article in list(self._overview_rows_cache):
                 if cached_article not in records:
                     del self._overview_rows_cache[cached_article]
-        tokens = [token.casefold() for token in self.overview_search_var.get().split()]
+        query, column_texts = self._overview_search_state() if state is None else state
+        tokens = [token.casefold() for token in query.split()]
+        column_filters: list[tuple[int, str, Callable[[str, str, tuple[str, ...]], bool]]] = []
+        for index, (key, column_text) in enumerate(zip(OVERVIEW_COLUMN_KEYS, column_texts)):
+            predicate = compile_overview_column_filter(column_text)
+            if predicate is not None:
+                column_filters.append((index, key, predicate))
         visible: list[str] = []
         for article_number, snapshot in records.items():
-            _values, _keys, row_blob = self._overview_entry(article_number, snapshot, changed_map.get(article_number, ""))
+            values, keys, row_blob = self._overview_entry(article_number, snapshot, changed_map.get(article_number, ""))
             if tokens:
                 blob = self._article_search_blob(article_number, snapshot)
                 if not all(token in blob or token in row_blob for token in tokens):
                     continue
+            if column_filters and not all(
+                predicate(values[index], *overview_column_search_cell(key, snapshot, values[index], keys[index]))
+                for index, key, predicate in column_filters
+            ):
+                continue
             visible.append(article_number)
         return visible
 
@@ -26756,12 +26915,15 @@ if ($copied) {{
         if not hasattr(self, "overview_tree"):
             return
         tree = self.overview_tree
-        query = self.overview_search_var.get()
+        # Suchzustand (Suche oben + Spaltenfelder) genau EINMAL lesen: gemerkt, gefiltert und im
+        # Zaehler genannt wird derselbe Stand.
+        state = self._overview_search_state()
+        state_changed = state != self._overview_rendered_search
         self._overview_rendered_key = self._article_browser_render_key()
-        self._overview_rendered_search = query
+        self._overview_rendered_search = state
         records = self.article_browser_records
         changed_map = changed_since_import_map(records, self.import_stand)
-        visible = self._overview_visible_articles(changed_map)
+        visible = self._overview_visible_articles(changed_map, state)
         column_index = OVERVIEW_COLUMN_KEYS.index(self._overview_sort_column)
         visible.sort(key=lambda article: self._overview_rows_cache[article][3][column_index], reverse=self._overview_sort_desc)
         self._overview_visible = visible
@@ -26780,28 +26942,53 @@ if ($copied) {{
             tree.focus(focused)
         elif still_selected:
             tree.focus(still_selected[0])
+        if self._overview_range_end and self._overview_range_end not in still_selected:
+            # Das Ende eines per Umschalt+Pfeil markierten Bereichs ist nicht mehr markiert (z. B. von der
+            # Suche ausgeblendet): es gilt nicht mehr.
+            self._overview_range_end = ""
         self._overview_rendered_changed_map = changed_map
         self._update_overview_count(len(visible), changed_map)
+        if state_changed:
+            # Geaenderte Suche (nicht: neue Daten): die aktive Zeile ins Bild holen, wenn es sie noch gibt.
+            active = self._overview_active_row()
+            if active:
+                tree.see(active)
         self._schedule_overview_cell_frame()
 
     def _update_overview_count(self, visible_count: int, changed_map: dict[str, str]) -> None:
-        """Zaehler der Uebersicht: 'n Artikel (k geaendert seit Import)', mit Suche 'n von N Artikeln …'."""
+        """Zaehler der Uebersicht: 'n Artikel (k geaendert seit Import)', mit Suche 'n von N Artikeln …',
+        mit Spaltensuche dazu ' – Spaltensuche: Marke, GenArten' (Ueberschriften der Spalten mit
+        Filter in Spaltenreihenfolge, hoechstens zwei, dann ' +n'). Gilt fuer den GEZEICHNETEN
+        Suchzustand (_overview_rendered_search), nicht fuer die Felder, wie sie gerade stehen."""
         total_label = format_count_de(len(self.article_browser_records))
         changed_total = len(changed_map)
-        if self.overview_search_var.get().strip():
-            self.overview_count_var.set(
-                f"{format_count_de(visible_count)} von {total_label} Artikeln ({changed_total} geändert seit Import)"
-            )
+        query, column_texts = self._overview_rendered_search
+        column_labels = [
+            label
+            for (_key, label, _width, _anchor, _kind), column_text in zip(OVERVIEW_COLUMNS, column_texts)
+            if compile_overview_column_filter(column_text) is not None
+        ]
+        if query.strip() or column_labels:
+            text = f"{format_count_de(visible_count)} von {total_label} Artikeln ({changed_total} geändert seit Import)"
+            if column_labels:
+                text += " – Spaltensuche: " + ", ".join(column_labels[:2])
+                if len(column_labels) > 2:
+                    text += f" +{len(column_labels) - 2}"
+            self.overview_count_var.set(text)
         else:
             self.overview_count_var.set(f"{total_label} Artikel ({changed_total} geändert seit Import)")
 
     def _update_overview_rows(self, articles: Iterable[str]) -> bool:
-        """Nach einer Markenaenderung nur die geaenderten Zeilen nachziehen (Werte und orange
-        Markierung) statt alles neu zu zeichnen: Reihenfolge (auch bei Sortierung nach Marke),
-        Markierung, aktive Zelle und Rollposition bleiben wie in Excel stehen. Haben sich seit dem
-        letzten Zeichnen noch andere Datensaetze oder der Suchtext geaendert, wird komplett neu
-        gezeichnet. Faerbt auch Zeilen um, deren 'seit Import' sich geaendert hat (Journal).
-        Rueckgabe False, wenn komplett neu gezeichnet wurde."""
+        """Nach einer Markenaenderung bzw. GenArt-Uebertragung nur die geaenderten Zeilen nachziehen
+        (Werte und orange Markierung) statt alles neu zu zeichnen: Reihenfolge (auch bei Sortierung
+        nach Marke), Markierung, aktive Zelle und Rollposition bleiben wie in Excel stehen - auch
+        Zeilen, die danach nicht mehr zur Suche bzw. Spaltensuche passen (wie in Excel, bis der
+        Filter neu angewendet wird: Enter in einem Suchfeld, Sortieren, 'Liste aktualisieren',
+        Excel-Export); nach Strg+Z bleiben Zeilen, die die Suche ausgeblendet hat, bis dahin
+        ausgeblendet. Haben sich seit dem letzten Zeichnen noch andere Datensaetze oder der
+        Suchzustand geaendert, wird komplett neu gezeichnet. Faerbt auch Zeilen um, deren
+        'seit Import' sich geaendert hat (Journal). Rueckgabe False, wenn komplett neu gezeichnet
+        wurde."""
         if not hasattr(self, "overview_tree"):
             return False
         wanted = {normalize_article_number(article) for article in articles}
@@ -26810,7 +26997,7 @@ if ($copied) {{
         in_place = (
             old_key is not None
             and len(old_key) == len(new_key)
-            and self._overview_rendered_search == self.overview_search_var.get()
+            and self._overview_rendered_search == self._overview_search_state()
         )
         if in_place:
             for old, new in zip(old_key[1:], new_key[1:]):
@@ -26859,7 +27046,8 @@ if ($copied) {{
         self._render_overview()
 
     def _on_overview_search_changed(self, *_args: object) -> None:
-        # Entprellen wie im Verzeichnis (250 ms nach dem letzten Tastendruck).
+        # Entprellen wie im Verzeichnis (250 ms nach dem letzten Tastendruck) - EIN Zeitgeber fuer die
+        # Suche oben und alle Spaltenfelder.
         self._cancel_overview_search_timer()
         self._overview_search_after_id = self.root.after(250, self._apply_overview_search)
 
@@ -26872,33 +27060,145 @@ if ($copied) {{
             pass
         self._overview_search_after_id = None
 
-    def _apply_overview_search(self) -> None:
+    def _overview_search_state(self) -> tuple[str, tuple[str, ...]]:
+        """Suchzustand der Uebersicht: (Text der Suche oben wie getippt, Texte der Spaltenfelder
+        ohne Rand-Leerzeichen in OVERVIEW_COLUMN_KEYS-Reihenfolge) - so einen Wert haelt
+        _overview_rendered_search nach dem Zeichnen."""
+        return (
+            self.overview_search_var.get(),
+            tuple(self.overview_column_search_vars[key].get().strip() for key in OVERVIEW_COLUMN_KEYS),
+        )
+
+    def _overview_is_current(self) -> bool:
+        """True, wenn die Tabelle den aktuellen Datenstand (Datensaetze, Importstand) UND den
+        aktuellen Suchzustand zeigt - der eine Vergleich dafuer (Reiterwechsel, verzoegertes
+        Zeichnen, Anwenden der Suche). Nach einer Aenderung, die nur ihre Zeilen nachgezogen hat
+        (_update_overview_rows), gilt die Tabelle als aktuell."""
+        return (
+            self._overview_rendered_key == self._article_browser_render_key()
+            and self._overview_rendered_search == self._overview_search_state()
+        )
+
+    def _apply_overview_search(self, force: bool = False) -> None:
+        """Suche anwenden (Ablauf des Zeitgebers, 'Leeren', Esc, Pfeil unten): neu zeichnen, wenn
+        sich Suchzustand oder Datenstand seit dem letzten Zeichnen geaendert haben; mit force
+        immer (Enter in einem Suchfeld)."""
         self._overview_search_after_id = None
         if not hasattr(self, "overview_tree"):
             return
-        if self.overview_search_var.get() == self._overview_rendered_search and self._overview_rendered_key == self._article_browser_render_key():
+        if not force and self._overview_is_current():
             return
         self._render_overview()
 
+    def _flush_overview_search(self) -> None:
+        """Eine noch entprellte Sucheingabe sofort anwenden. Laeuft vor jeder Taste, die in der
+        Tabelle ankommt (_on_overview_pending_keypress): Strg+A, das Tippen einer Marke oder
+        Strg+V wirken so nie auf die Zeilen, die vor der Suche zu sehen waren."""
+        if self._overview_search_after_id is None:
+            return
+        self._cancel_overview_search_timer()
+        self._apply_overview_search()
+
     def _clear_overview_search(self) -> None:
+        """'Leeren': das Suchfeld oben und alle Spaltenfelder leeren und EINMAL sofort neu zeichnen."""
         self.overview_search_var.set("")
+        for search_var in self.overview_column_search_vars.values():
+            search_var.set("")
         self._cancel_overview_search_timer()
         self._apply_overview_search()
 
     def _on_overview_search_escape(self, _event: tk.Event[tk.Misc]) -> str:
-        self._clear_overview_search()
+        # Esc im Suchfeld oben leert nur dieses Feld (die Spaltenfelder bleiben) und filtert sofort.
+        self.overview_search_var.set("")
+        self._cancel_overview_search_timer()
+        self._apply_overview_search()
         return "break"
 
     def _on_overview_search_return(self, _event: tk.Event[tk.Misc]) -> str:
+        """Enter im Suchfeld oben bzw. in einem Spaltenfeld: sofort und IMMER neu zeichnen, auch
+        ohne geaenderten Text - so wird die Suche neu angewendet, nachdem eine Marken- bzw.
+        GenArt-Aenderung ihre Zeilen hat stehen lassen. Bleibt genau eine Zeile, wird sie
+        markiert. Der Tastaturfokus bleibt im Feld."""
         self._cancel_overview_search_timer()
-        self._apply_overview_search()
+        self._apply_overview_search(force=True)
         visible = self.overview_tree.get_children()
         if len(visible) == 1:
             article_number = str(visible[0])
             self.overview_tree.selection_set(article_number)
             self.overview_tree.focus(article_number)
             self.overview_tree.see(article_number)
+            # Neue Markierung: ein frueheres Bereichsende (Umschalt+Pfeil) gilt nicht mehr.
+            self._overview_range_end = ""
         return "break"
+
+    def _on_overview_column_search_escape(self, column: str) -> str:
+        """Esc in einem Spaltenfeld: steht Text darin, das Feld leeren und sofort filtern; der
+        Fokus bleibt im Feld. Leeres Feld: nichts."""
+        search_var = self.overview_column_search_vars[column]
+        if search_var.get():
+            search_var.set("")
+            self._cancel_overview_search_timer()
+            self._apply_overview_search()
+        return "break"
+
+    def _on_overview_column_search_down(self, column: str) -> str:
+        """Pfeil unten in einem Spaltenfeld: sofort filtern und in die Tabelle gehen - die Spalte
+        des Feldes wird die aktive Spalte, die aktive Zeile bleibt (gibt es keine, wird die erste
+        sichtbare Zeile markiert und aktiv). Leere Tabelle: der Fokus bleibt im Feld."""
+        self._cancel_overview_search_timer()
+        self._apply_overview_search()
+        tree = self.overview_tree
+        try:
+            children = tree.get_children()
+            if not children:
+                return "break"
+            self._set_overview_active_column(column)
+            item = self._overview_active_row()
+            if not item:
+                item = str(children[0])
+                tree.selection_set(item)
+                tree.focus(item)
+            # Neuer Einstieg in die Tabelle wie ein Klick: ein frueheres Bereichsende (Umschalt+Pfeil) gilt nicht mehr.
+            self._overview_range_end = ""
+            tree.see(item)
+            self._see_overview_column(column)
+            tree.focus_set()
+        except tk.TclError:
+            return "break"
+        self._schedule_overview_cell_frame()
+        return "break"
+
+    def _on_overview_column_search_focus_in(self, column: str) -> None:
+        """Ein Spaltenfeld bekommt den Fokus: ein offener Editor der Marke wird verworfen (nichts
+        geschrieben, die Tabelle bekommt den Fokus nicht zurueck), die Hinweiszeile zeigt den
+        Suchhinweis der Spalte (bis zum Fokusverlust, dann wieder den Hinweis der aktiven Zelle).
+        Aktive Spalte, aktive Zeile und Markierung bleiben."""
+        self._discard_overview_brand_editor()
+        self.overview_cell_hint_var.set(self._overview_column_search_hint(column))
+
+    def _overview_column_search_hint(self, column: str) -> str:
+        """Text der Hinweiszeile, solange das Suchfeld der Spalte den Fokus hat."""
+        label = self._overview_column_label(column)
+        if column == "genarts":
+            return (
+                f"Suchfeld {label} – ID oder Bezeichnung der GenArt; '-' zeigt Artikel ohne GenArt, '=93' nur genau "
+                "diese ID. Enter filtert sofort, Pfeil unten geht in die Tabelle, Esc leert das Feld."
+            )
+        if column == "since_import":
+            return (
+                f"Suchfeld {label} – 'ja' = seit dem Apollo-Importstand geändert, 'nein' = nicht geändert. "
+                "Enter filtert sofort, Pfeil unten geht in die Tabelle, Esc leert das Feld."
+            )
+        if OVERVIEW_COLUMN_KINDS.get(column) == "count":
+            return (
+                f"Suchfeld {label} – sucht im Zelltext, z. B. das Datum '03.11.'; '-' zeigt Artikel ohne Eintrag, "
+                "'=3' genau diese Anzahl. Enter filtert sofort, Pfeil unten geht in die Tabelle, Esc leert das Feld."
+            )
+        return (
+            f"Suchfeld {label} – alle Wörter müssen vorkommen (Groß-/Kleinschreibung egal, 'ue' findet auch 'ü'); "
+            "'-' zeigt leere Zellen, '=Text' nur genau diesen Wert. Enter filtert sofort, Pfeil unten geht in die "
+            "Tabelle, Esc leert das Feld."
+        )
 
     def _on_overview_double_click(self, event: tk.Event[tk.Misc]) -> str | None:
         """Doppelklick: in der Spalte Marke oeffnet er den Editor der Marke ueber der Zelle - wie in
@@ -27034,6 +27334,14 @@ if ($copied) {{
             self._overview_pending_ctrl_click = (item, previous)
             self.root.after_idle(self._run_pending_overview_ctrl_click)
         self._schedule_overview_cell_frame()
+
+    def _on_overview_pending_keypress(self, _event: object = None) -> None:
+        """Jede Taste der Tabelle (Bindtag OVERVIEW_PENDING_CLICK_TAG, VOR allen anderen Bindungen):
+        zuerst eine noch entprellte Sucheingabe anwenden (_flush_overview_search), dann einen
+        ausstehenden Strg+Klick-Nachlauf nachholen - ohne 'break', die gewohnten Bindungen laufen
+        danach."""
+        self._flush_overview_search()
+        self._run_pending_overview_ctrl_click()
 
     def _run_pending_overview_ctrl_click(self) -> None:
         """Ausstehenden Strg+Klick-Nachlauf jetzt ausfuehren: im Leerlauf, vor jeder Taste und jedem
@@ -27178,8 +27486,14 @@ if ($copied) {{
 
     def _place_overview_cell_frame(self) -> None:
         """Legt die vier Rahmen-Frames um die aktive Zelle (bzw. blendet sie aus) und fuehrt einen
-        offenen Editor der Marke mit; ist seine Zelle nicht mehr sichtbar, wird er verworfen."""
+        offenen Editor der Marke mit; ist seine Zelle nicht mehr sichtbar, wird er verworfen.
+        Zuerst - unabhaengig vom Rahmen, also auch ohne aktive Zelle und bei leerer Tabelle - wird
+        die Suchzeile der Spaltensuche nachgezogen (_place_overview_column_search_row)."""
         self._overview_cell_frame_after_id = None
+        try:
+            self._place_overview_column_search_row()
+        except (tk.TclError, ValueError):
+            pass
         frames = self._overview_cell_frames
         if not frames:
             return
@@ -27222,6 +27536,61 @@ if ($copied) {{
             return x, y, int(right["x"]) + int(right["width"]) - x, int(left["height"])
         except (tk.TclError, KeyError, ValueError):
             return None
+
+    def _place_overview_column_search_row(self) -> None:
+        """Legt die Suchfelder der Spaltensuche deckungsgleich ueber die Kopfzellen: die Felder
+        stehen im inneren Rahmen an x = Summe der Spaltenbreiten davor, der innere Rahmen wird um
+        den Rollversatz der Tabelle verschoben (die Suchzeile schneidet ihn ab). Platziert wird nur,
+        was sich geaendert hat (Spaltenbreiten bzw. Versatz/Gesamtbreite) - beim senkrechten Rollen
+        kostet der Aufruf nichts. Braucht weder Zeilen noch eine sichtbare Tabelle. Erster Schritt
+        von _place_overview_cell_frame (Rollen, Spaltenbreite ziehen, Groesse, Reiterwechsel,
+        Markierung, Zeichnen)."""
+        tree = self.overview_tree
+        # Zuerst xview(): die Abfrage zieht ein ausstehendes Layout der Tabelle nach - die
+        # Spaltenbreiten danach sind die gezeichneten (auch die der dehnbaren Spalte).
+        fraction = float(tree.xview()[0])
+        widths = [int(tree.column(key, "width")) for key in OVERVIEW_COLUMN_KEYS]
+        total = sum(widths)
+        offset = self._overview_tree_inset() - round(fraction * total)
+        if widths != self._overview_search_widths:
+            x = 0
+            for key, width in zip(OVERVIEW_COLUMN_KEYS, widths):
+                self.overview_column_search_entries[key].place(x=x, y=0, width=width, relheight=1)
+                x += width
+            self._overview_search_widths = widths
+        if (offset, total) != self._overview_search_offset:
+            self.overview_column_search_inner.place(x=offset, y=0, width=total, relheight=1)
+            self._overview_search_offset = (offset, total)
+
+    def _overview_tree_inset(self) -> int:
+        """Linker Rand des Kopfbereichs in der Tabelle (Rahmen des Themes): das erste x, an dem die
+        Kopfzeile beginnt. Einmal gemessen gilt der Wert fuer diese Instanz; solange nichts
+        gefunden wird (Tabelle noch nie gezeichnet), OVERVIEW_SEARCH_INSET_FALLBACK - nicht gemerkt."""
+        if self._overview_search_inset is None:
+            tree = self.overview_tree
+            try:
+                for x in range(8):
+                    if tree.identify_region(x, OVERVIEW_SEARCH_HEADING_PROBE_Y) != "nothing":
+                        self._overview_search_inset = x
+                        break
+            except tk.TclError:
+                pass
+        return OVERVIEW_SEARCH_INSET_FALLBACK if self._overview_search_inset is None else self._overview_search_inset
+
+    def overview_column_search_geometry(self) -> list[tuple[int, int]]:
+        """(x, Breite) jedes Suchfelds der Spaltensuche in Tabellen-Koordinaten, in
+        OVERVIEW_COLUMN_KEYS-Reihenfolge (fuer Tests und Diagnose): aus place_info, x des inneren
+        Rahmens + x des Feldes - Suchzeile und Tabelle haben denselben x-Ursprung. Leere Liste,
+        solange die Felder noch nicht platziert sind."""
+        try:
+            inner_x = int(self.overview_column_search_inner.place_info()["x"])
+            geometry: list[tuple[int, int]] = []
+            for key in OVERVIEW_COLUMN_KEYS:
+                info = self.overview_column_search_entries[key].place_info()
+                geometry.append((inner_x + int(info["x"]), int(info["width"])))
+        except (AttributeError, tk.TclError, KeyError, ValueError):
+            return []
+        return geometry
 
     def _on_overview_tree_scrolled(self, scrollbar: ttk.Scrollbar, first: str, last: str) -> None:
         """yscrollcommand/xscrollcommand: Rollbalken setzen und den Rahmen nachziehen."""
@@ -27321,22 +27690,29 @@ if ($copied) {{
         return "break"
 
     def _see_overview_column(self, column: str) -> None:
-        """Rollt waagerecht, bis die Spalte ganz sichtbar ist (soweit sie in das Fenster passt)."""
+        """Rollt waagerecht, bis die Spalte ganz sichtbar ist (soweit sie in das Fenster passt) -
+        samt ihrem Suchfeld: sichtbar ist der Kopfbereich, also die Tabellenbreite ohne den Rand
+        links und rechts."""
         tree = self.overview_tree
         try:
+            # Zuerst xview(): die Abfrage zieht ein ausstehendes Layout der Tabelle nach (Spaltenbreiten).
+            fraction = float(tree.xview()[0])
             widths = [int(tree.column(key, "width")) for key in OVERVIEW_COLUMN_KEYS]
             total = sum(widths)
-            view = int(tree.winfo_width())
+            view = int(tree.winfo_width()) - 2 * self._overview_tree_inset()
             if total <= 0 or total <= view:
                 return
             index = OVERVIEW_COLUMN_KEYS.index(column)
             left = sum(widths[:index])
             right = left + widths[index]
-            first = float(tree.xview()[0]) * total
+            first = fraction * total
             if left < first:
                 tree.xview_moveto(left / total)
             elif right > first + view:
                 tree.xview_moveto(max(0, min(left, right - view)) / total)
+            # Suchzeile und Rahmen im Leerlauf nachziehen - auch wenn die Tabelle (noch) nicht angezeigt wird
+            # und deshalb kein xscrollcommand kommt.
+            self._schedule_overview_cell_frame()
         except (tk.TclError, ValueError):
             return
 
@@ -27352,7 +27728,11 @@ if ($copied) {{
         if not anchor or anchor not in children:
             anchor = children[0]
             tree.focus(anchor)
-        end = self._overview_range_end if self._overview_range_end and tree.exists(self._overview_range_end) else anchor
+        # Ein gemerktes Bereichsende gilt nur, solange seine Zeile noch markiert ist: nach einer Suche, einem
+        # Neuzeichnen oder dem Wechsel aus einem Suchfeld in die Tabelle waere es veraltet - Umschalt+Pfeil
+        # markierte sonst alle Zeilen bis dorthin (die Ziele der naechsten Markenaenderung).
+        range_end = self._overview_range_end
+        end = range_end if range_end and tree.exists(range_end) and range_end in tree.selection() else anchor
         anchor_index = tree.index(anchor)
         end_index = max(0, min(len(children) - 1, tree.index(end) + delta))
         low, high = sorted((anchor_index, end_index))
@@ -27386,6 +27766,33 @@ if ($copied) {{
             self.status_var.set(f"Alle {format_count_de(len(children))} Zeilen der Übersicht markiert.")
         self._schedule_overview_cell_frame()
         return "break"
+
+    def _on_overview_find_key(self, event: object = None) -> str:
+        """Strg+F in der Tabelle: ins Suchfeld der aktiven Spalte (Spaltensuche). Aktive Spalte,
+        aktive Zeile und Markierung bleiben. Ist der Editor der Marke offen, gehoert die Taste ihm."""
+        if event is not None and self._forward_overview_key_to_editor(event):
+            return "break"
+        if not self._is_overview_visible():
+            return "break"
+        self.focus_overview_column_search(self._overview_active_column)
+        return "break"
+
+    def focus_overview_column_search(self, column: str | None = None) -> bool:
+        """Tastaturfokus in das Suchfeld der Spalte (None = aktive Spalte): die Spalte wird ins Bild
+        gerollt, der Text des Feldes markiert, die Schreibmarke steht am Ende. Aktive Spalte,
+        aktive Zeile und Markierung bleiben. Rueckgabe False, wenn es das Feld nicht gibt."""
+        key = column or self._overview_active_column
+        entry = self.overview_column_search_entries.get(key)
+        if entry is None:
+            return False
+        try:
+            self._see_overview_column(key)
+            entry.focus_set()
+            entry.selection_range(0, "end")
+            entry.icursor("end")
+        except tk.TclError:
+            return False
+        return True
 
     def _on_overview_edit_key(self, event: object = None) -> str | None:
         """Enter/F2: in der Spalte Marke den Editor ueber der aktiven Zelle oeffnen. Ist er schon
@@ -28224,7 +28631,8 @@ if ($copied) {{
         Staende (Fingerabdruck GenArt/Fahrzeuge = Dateistand) nachziehen - sonst hielte der Dirty-Check
         die Maske fuer geaendert bzw. ein spaeteres Live-Speichern schriebe den alten Stand zurueck.
         Zeigt die Maske ein Ziel, wird sie aus dem neuen Stand gefuellt. Dann Importstand (Journal)
-        neu lesen, Verzeichnis und Uebersicht zeichnen."""
+        neu lesen, Verzeichnis zeichnen und in der Uebersicht nur die geaenderten Zeilen nachziehen
+        (_update_overview_rows)."""
         tree = self.article_browser_tree
         prev_selection = tuple(tree.selection())
         prev_focus = tree.focus()
@@ -28269,7 +28677,9 @@ if ($copied) {{
         # Liest den eben geschriebenen Importstand (orange Markierung) und zeichnet das Verzeichnis.
         self._refresh_article_browser()
         self._restore_article_browser_selection(prev_selection, prev_focus)
-        self._render_overview()
+        # Wie nach einer Markenaenderung nur die geaenderten Zeilen nachziehen: auch unter einer
+        # Spaltensuche (z. B. GenArten = '-') bleiben die Zielzeilen stehen, bis neu gefiltert wird.
+        self._update_overview_rows(plan.article_number for plan in plans)
 
     # ------------------------------------------------------------------
     # Uebersicht: gemeinsamer Ablauf der Uebertragungen (GenArten, Marke)
