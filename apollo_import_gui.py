@@ -129,7 +129,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.55"
+APP_VERSION = "0.1.56"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -144,7 +144,7 @@ UI_ACCENT_DARK = "#1D4ED8"
 UI_ACCENT_SOFT = "#DCE7FB"
 UI_HEADING_BG = "#EDF0F4"
 UI_TAB_INACTIVE = "#E4E8EE"
-DEFAULT_IMPORT_DIR = Path(r"C:\Users\heimbuchner\Desktop\Apollo Import App\Aktuelle Import Datein")
+DEFAULT_IMPORT_DIR = Path(r"G:\Heimbuchner\Claude Programme\Apollo Import App\Aktuelle Import Datein")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "output"
 DEFAULT_GENART_SOURCE = Path(r"C:\Users\heimbuchner\Downloads\Genarten.xlsx")
 DEFAULT_COMPETITOR_SOURCE = Path(r"C:\Users\heimbuchner\Downloads\KHer.csv")
@@ -410,6 +410,11 @@ IMPORT_STAND_VERSION = 1
 IMPORT_STAND_CHANGES_HEADERS = ["Artikelnummer", "letzte Aenderung", "geaenderte Bereiche", "Status"]
 # Statuszeilen-Zusatz, wenn ein Journal-Vermerk im Importstand gescheitert ist (bleibt stehen).
 IMPORT_STAND_NOTE_FAILED = "Importstand nicht vermerkt"
+# Notiz des Stands, den 'Apollo-Import erledigt' setzt, und sein Klickzeitpunkt im Importstand:
+# import_done_at schreibt nur 'erledigt', 'Importstand setzen…' entfernt ihn (die Notiz kann dort
+# stehen bleiben) - siehe apollo_import_time_of_stand.
+APOLLO_IMPORT_DONE_NOTE = "Apollo-Import erledigt"
+IMPORT_DONE_AT_KEY = "import_done_at"
 # Massenimport: im Lauf geaenderte Artikel spaetestens nach so vielen Sekunden bzw.
 # Artikeln im Aenderungsjournal vermerken (ein Lese-/Schreibvorgang je Vermerk) - nicht
 # erst am Laufende, das beim Schliessen waehrend des Laufs nie kommt.
@@ -9972,6 +9977,660 @@ def write_import_delete_list(path: Path, changes: list[ArticleChangeSinceImport]
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Loeschlisten je Apollo-Haken: Apollo kann unter 'Artikelinformationen loeschen' einzelne
+# Bereiche eines Artikels loeschen (Art.-Detail, Attribute, Produktgruppen, Verknuepfungen,
+# Medienanhaenge, Texte, Referenzen). Statt ganzer Artikel werden dann nur die geaenderten
+# Bereiche geloescht und mit gefilterten Importdateien neu geschrieben.
+# ---------------------------------------------------------------------------
+# Je Haken: (Schluessel, Haken in Apollo, Dateiname der Liste, GUI-Bereiche aus LIVE_SECTIONS,
+# deren Daten Apollo mit diesem Haken loescht und die danach neu importiert werden). Zuordnung
+# nach Angabe des Users (03.11.2026): Art.-Detail = Zusatzbezeichnung (Kurzbezeichnung), Texte =
+# Infotext (Langtext), Referenzen = OE-, Vergleichs- und Gebrauchsnummern (Suchwoerter).
+# Stueckliste/Zubehoer (Artikellisten) hat keinen Haken - solche Artikel werden ganz geloescht.
+APOLLO_DELETE_CATEGORIES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    ("art_detail", "Art.-Detail", "02_Art-Detail", ("short_text",)),
+    ("texts", "Texte", "03_Texte", ("long_text",)),
+    ("attributes", "Attribute", "04_Attribute", ("attributes",)),
+    ("references", "Referenzen", "05_Referenzen", ("oe_numbers", "comparison_numbers", "search_terms")),
+    ("product_groups", "Produktgruppen", "06_Produktgruppen", ("genart",)),
+    ("linkages", "Verknüpfungen", "07_Verknuepfungen", ("vehicle_links",)),
+    ("media", "Medienanhänge", "08_Medienanhaenge", ("images", "documents", "videos", "web_links")),
+)
+# In Apollo haengen die Fahrzeugverknuepfungen an der GenArt (Produktgruppe): wer Produktgruppen
+# loescht, loescht und importiert die Verknuepfungen mit.
+APOLLO_DELETE_CATEGORY_IMPLIES: dict[str, tuple[str, ...]] = {"product_groups": ("linkages",)}
+# Angaben, die nur Apollo fuehrt (ApolloExportState.details), und die Haken, mit denen Apollo sie
+# vermutlich loescht - ganz geloeschte Artikel verlieren sie immer. Ob die EAN an 'Referenzen' oder
+# an 'Art.-Detail' haengt, ist nicht geprueft: beide zaehlen.
+APOLLO_DETAIL_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "ean": ("references", "art_detail"),
+    "accessory": ("art_detail",),
+    "infotext": ("texts",),
+}
+# GUI-Bereiche, die apollo_gui_differences je Bereich mit dem IMS-Export vergleicht. OE-/
+# Vergleichsnummern und Videos/Web Links liegen in Apollo ununterscheidbar zusammen (203 bzw. 232
+# DocType 04): sie werden je Nummer bzw. Link verglichen.
+APOLLO_COMPARED_SECTIONS: tuple[str, ...] = (
+    "short_text", "long_text", "attributes", "search_terms", "genart", "vehicle_links", "article_lists", "images", "documents",
+)
+APOLLO_COMPLETE_DELETE_FILE = "01_Komplett_loeschen"
+# Gruende auf 01_Komplett_loeschen fuer Artikel, die im IMS-Export fehlen: neu angelegte kennt Apollo
+# noch nicht (das Loeschen laeuft ins Leere); schon vor dem Stand vorhandene fehlen eher in einem
+# unvollstaendigen Export - Apollo hat sie dann womoeglich doch, samt Angaben, die nur Apollo fuehrt.
+APOLLO_UNKNOWN_ARTICLE_REASON = "neu, laut IMS-Export nicht in Apollo – das Löschen läuft dort ins Leere, alle Dateien werden importiert"
+APOLLO_MISSING_ARTICLE_REASON = (
+    "nicht im IMS-Export, stand aber schon vor dem Importstand in der GUI – wird ganz gelöscht, falls Apollo ihn doch hat "
+    "(EAN und Zubehör-Kennzeichen, die nur Apollo führt, kann der Abgleich dann nicht melden)"
+)
+# Vorsatz der Gruende fuer seit dem Stand unveraenderte Artikel, die vom Export abweichen.
+APOLLO_UNCHANGED_PREFIX = "seit dem Stand unverändert – "
+APOLLO_DELETE_OVERVIEW_FILE = "00_Ablauf.xlsx"
+APOLLO_IMPORT_PACKAGE_DIR = "Import"
+# Alle Output-Dateien mit ihren Spalten (dieselbe Liste wie beim Loeschen im Verzeichnis).
+OUTPUT_FILES_WITH_HEADERS: tuple[tuple[tuple[str, str], list[str]], ...] = (
+    (SHORT_TEXT_FILE, SHORT_TEXT_HEADERS),
+    (SHORT_MAPPING_FILE, SHORT_MAPPING_HEADERS),
+    (LONG_TEXT_FILE, SHORT_TEXT_HEADERS),
+    (GENART_FILE, GENART_HEADERS),
+    (ATTRIBUTE_FILE, ATTRIBUTE_HEADERS),
+    (OE_FILE, OE_HEADERS),
+    (COMPARISON_FILE, COMPARISON_HEADERS),
+    (ARTICLE_LIST_FILE, ARTICLE_LIST_HEADERS),
+    (USAGE_NUMBER_FILE, USAGE_NUMBER_HEADERS),
+    (VEHICLE_LINK_FILE, VEHICLE_LINK_HEADERS),
+    (IMAGE_FILE, IMAGE_HEADERS),
+    (DOCUMENT_FILE, DOCUMENT_HEADERS),
+    (VIDEO_FILE, VIDEO_HEADERS),
+    (WEB_LINK_FILE, WEB_HEADERS),
+)
+
+
+def apollo_delete_category_label(key: str) -> str:
+    return next((label for category, label, _file, _sections in APOLLO_DELETE_CATEGORIES if category == key), key)
+
+
+def apollo_delete_category_of_section(section: str) -> str:
+    """Haken-Schluessel eines GUI-Bereichs ('' fuer Stueckliste/Zubehoer - dafuer gibt es keinen)."""
+    return next((key for key, _label, _file, sections in APOLLO_DELETE_CATEGORIES if section in sections), "")
+
+
+def apollo_delete_category_files(key: str) -> list[str]:
+    """Output-Dateien, deren Zeilen nach dem Loeschen mit diesem Haken neu importiert werden."""
+    files: list[str] = []
+    for category, _label, _file, sections in APOLLO_DELETE_CATEGORIES:
+        if category != key:
+            continue
+        for section in sections:
+            for name in LIVE_SECTION_FILES.get(section, ()):
+                if name not in files:
+                    files.append(name)
+    return files
+
+
+def gui_sections_present(snapshot: StoredArticleSnapshot) -> set[str]:
+    """GUI-Bereiche (LIVE_SECTIONS), zu denen der Artikel Zeilen hat - an den Zeilen des Snapshots:
+    im Verzeichnis nach dem Live-Speichern aktuell, waehrend der Zeitstempel eines in der Sitzung
+    geleerten Bereichs dort stehen bleibt. Kurzbezeichnung und Langtext zaehlen ueber ihren
+    Zeitstempel: auch eine Zeile ohne Text ist eine Zeile (gui_text_gaps) - geleert hat die GUI
+    einen Bereich nur, wenn seine Zeilen weg sind."""
+    rows: dict[str, list] = {
+        "genart": snapshot.genart_selections,
+        "attributes": snapshot.attribute_rows,
+        "search_terms": snapshot.search_terms,
+        "oe_numbers": snapshot.oe_number_rows,
+        "comparison_numbers": snapshot.comparison_number_rows,
+        "vehicle_links": snapshot.vehicle_link_rows,
+        "article_lists": snapshot.article_list_rows,
+        "images": snapshot.image_rows,
+        "documents": snapshot.document_rows,
+        "videos": snapshot.video_rows,
+        "web_links": snapshot.web_rows,
+    }
+    present = {section for section in ("short_text", "long_text") if snapshot.last_written.get(section)}
+    present.update(section for section, items in rows.items() if items)
+    return present
+
+
+def gui_text_gaps(snapshot: StoredArticleSnapshot) -> set[str]:
+    """'short_text'/'long_text', zu denen die GUI eine Zeile, aber keinen Text hat."""
+    gaps: set[str] = set()
+    if snapshot.last_written.get("short_text") and not snapshot.short_texts.populated_count(snapshot.short_auto_uni):
+        gaps.add("short_text")
+    if snapshot.last_written.get("long_text") and not snapshot.long_texts.populated_count(snapshot.long_auto_uni):
+        gaps.add("long_text")
+    return gaps
+
+
+@dataclass
+class ApolloExportState:
+    """Was Apollo laut IMS-Export je Artikel hat (apollo_export_state)."""
+
+    articles: set[str] = field(default_factory=set)
+    # Artikel -> GUI-Bereiche (LIVE_SECTIONS), zu denen Apollo Daten hat - ohne OE-/Vergleichsnummern
+    # und Videos/Web Links: die stehen in Apollo ununterscheidbar in 203 bzw. 232 (DocType 04) und
+    # werden je Nummer bzw. Link verglichen (reference_keys, link_keys).
+    sections: dict[str, set[str]] = field(default_factory=dict)
+    # Artikel -> Referenznummern aus 203 als (Hersteller, Nummer), siehe apollo_reference_key.
+    reference_keys: dict[str, set[tuple[str, str]]] = field(default_factory=dict)
+    # Artikel -> Links aus 232 (DocType 04), siehe apollo_link_key.
+    link_keys: dict[str, set[str]] = field(default_factory=dict)
+    # Artikel mit Alt-Suchwoertern als Kriterium 9595 - in Apollo ein Attribut.
+    legacy_search_term_criteria: set[str] = field(default_factory=set)
+    # Artikel -> [(Art, Angabe)], die nur Apollo fuehrt: 'ean', 'accessory' (Zubehoer-Kennzeichen),
+    # 'infotext' (weitere Infotexte) - mit welchem Haken Apollo sie loescht: APOLLO_DETAIL_CATEGORIES.
+    details: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    # Saetze je TAF-Tabelle (Plausibilitaet des Exports).
+    record_counts: dict[str, int] = field(default_factory=dict)
+
+
+def apollo_reference_key(manufacturer: object, number: object) -> tuple[str, str]:
+    """Vergleichsschluessel einer Referenznummer (203 bzw. OE-/Vergleichszeile der GUI): Hersteller
+    ohne fuehrende Nullen, Nummer ohne Leerzeichen und ohne Gross-/Kleinschreibung."""
+    taf = _load_taf_sync_module()
+    return taf.strip_leading_zeros(str(manufacturer)), "".join(str(number).split()).casefold()
+
+
+def apollo_link_key(url: object) -> str:
+    """Vergleichsschluessel eines Links (232/DocType 04 bzw. Video-/Web-Link-Zeile der GUI): wie bei
+    'IMS-Export uebernehmen' (YouTube als Embed-Link), dekodiert, ohne '/' am Ende, ohne Gross-/
+    Kleinschreibung."""
+    _kind, link = _load_taf_sync_module().classify_url(str(url))
+    return unquote(link.strip()).rstrip("/").casefold()
+
+
+def gui_reference_keys(snapshot: StoredArticleSnapshot) -> set[tuple[str, str]]:
+    keys = {apollo_reference_key(row.manufacturer_id, row.value) for row in snapshot.oe_number_rows if row.value.strip()}
+    keys.update(
+        apollo_reference_key(row.competitor_id, row.reference_number)
+        for row in snapshot.comparison_number_rows
+        if row.reference_number.strip()
+    )
+    return keys
+
+
+def gui_link_keys(snapshot: StoredArticleSnapshot) -> set[str]:
+    return {apollo_link_key(row.path_or_link) for row in [*snapshot.video_rows, *snapshot.web_rows] if row.path_or_link.strip()}
+
+
+def apollo_export_state(export: Any) -> ApolloExportState:
+    """Aus einem IMS-Export (taf_sync.TafExport): je Artikel, was Apollo hat - mit derselben Zuordnung
+    wie 'IMS-Export uebernehmen': 200 TermNo -> Kurzbezeichnung, 206 -> Langtext, 210 -> Attribute
+    (Kriterium 9595 = Alt-Suchwoerter), 207 -> Suchwoerter, 211 -> GenArt, 400 -> Fahrzeuge,
+    222/205 -> Stueckliste/Zubehoer, 232 -> Dokumente (DocType 02) bzw. Bilder (alle uebrigen
+    Dateitypen, auch 07 = GIF, den die IMS-Uebernahme nicht kennt). 203 (OE- und Vergleichsnummern)
+    und die Links aus 232 (DocType 04: Videos und Web Links) kommen je Nummer bzw. Link nach
+    reference_keys/link_keys: welche Nummer OE und welche Vergleich ist, haengt am Mitbewerber-
+    Katalog, ob ein Link ein Video ist, an der URL - beides kann von den Dateien der GUI abweichen."""
+    taf = _load_taf_sync_module()
+    state = ApolloExportState(record_counts=dict(getattr(export, "record_counts", {}) or {}))
+
+    def add(art_no: object, section: str) -> str:
+        key = normalize_article_number(str(art_no))
+        if key:
+            state.sections.setdefault(key, set()).add(section)
+        return key
+
+    for article in export.articles:
+        key = normalize_article_number(str(article.art_no))
+        if not key:
+            continue
+        state.articles.add(key)
+        if article.term_no:
+            add(key, "short_text")
+        if article.accessory:
+            state.details.setdefault(key, []).append(("accessory", "Zubehör-Kennzeichen"))
+    for gtin in export.gtins:
+        key = normalize_article_number(str(gtin.art_no))
+        if key and str(gtin.gtin).strip():
+            state.details.setdefault(key, []).append(("ean", f"EAN {taf.gtin_to_ean(str(gtin.gtin))}"))
+    for info in export.info_texts:
+        key = add(info.art_no, "long_text")
+        if key and taf.strip_leading_zeros(str(info.sort_no)) not in ("", "1"):
+            # Die GUI uebernimmt nur den ersten Infotext (SortNo 01).
+            state.details.setdefault(key, []).append(("infotext", f"weiteren Infotext (Baustein {info.txt_mod_no})"))
+    for criterion in export.criteria:
+        if taf.strip_leading_zeros(str(criterion.crit_no)) == LEGACY_SEARCH_TERM_CRITERIA_ID:
+            key = add(criterion.art_no, "search_terms")
+            if key:
+                state.legacy_search_term_criteria.add(key)
+        else:
+            add(criterion.art_no, "attributes")
+    for number in export.trade_numbers:
+        add(number.art_no, "search_terms")
+    for reference in export.reference_numbers:
+        key = normalize_article_number(str(reference.art_no))
+        if key and str(reference.ref_no).strip():
+            state.reference_keys.setdefault(key, set()).add(apollo_reference_key(reference.man_no, reference.ref_no))
+    for genart in export.genarts:
+        add(genart.art_no, "genart")
+    for linkage in export.linkages:
+        add(linkage.art_no, "vehicle_links")
+    for entry in [*export.accessory_lists, *export.parts_lists]:
+        add(entry.art_no, "article_lists")
+    for allocation in export.allocations:
+        if allocation.doc_type == taf.URL_DOC_TYPE:
+            key = normalize_article_number(str(allocation.art_no))
+            document = export.documents.get((allocation.doc_no, allocation.doc_type))
+            if key and document is not None and str(document.url).strip():
+                state.link_keys.setdefault(key, set()).add(apollo_link_key(document.url))
+        elif allocation.doc_type in taf.DOCUMENT_DOC_TYPES:
+            add(allocation.art_no, "documents")
+        else:
+            add(allocation.art_no, "images")
+    return state
+
+
+@dataclass
+class CategoryDeletePlan:
+    """Ergebnis von plan_category_delete_lists."""
+
+    # Artikel -> Grund: ganz loeschen und komplett neu importieren (auch Artikel, die Apollo laut
+    # Export nicht kennt - das Loeschen laeuft dort ins Leere, wie bei der Loeschliste ganzer Artikel).
+    complete: dict[str, str] = field(default_factory=dict)
+    # Haken-Schluessel -> Artikel (Reihenfolge der Aenderungsliste).
+    by_category: dict[str, list[str]] = field(default_factory=dict)
+    # Artikel -> Haken-Schluessel -> Gruende (geaenderte, geleerte bzw. abweichende Bereiche).
+    reasons: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    # Artikel -> Angaben, die nur Apollo fuehrt und die ein Haken des Artikels
+    # (APOLLO_DETAIL_CATEGORIES) bzw. komplettes Loeschen in Apollo vermutlich entfernt.
+    detail_warnings: dict[str, list[str]] = field(default_factory=dict)
+    # Artikel -> Haken ('art_detail'/'texts'), zu denen die GUI eine Zeile ohne Text hat, Apollo aber
+    # einen Text, und mit denen der Artikel geloescht wird: danach fehlt der Text in Apollo.
+    text_gaps: dict[str, list[str]] = field(default_factory=dict)
+    # Seit dem Stand unveraenderte Artikel, bei denen der Export von der GUI abweicht (z. B. Zeilen,
+    # die nie in Apollo ankamen): sie stehen wie geaenderte auf den Listen.
+    unchanged: list[str] = field(default_factory=list)
+    # Artikel, die Apollo laut Export fuehrt, die GUI aber nicht (und nicht in der GUI geloescht):
+    # nur ein Hinweis - die Listen loeschen nichts, was die GUI nicht kennt.
+    apollo_only: list[str] = field(default_factory=list)
+    # Seit dem Stand unveraenderte Artikel -> Bereiche, zu denen Apollo mehr hat als die GUI und die
+    # kein Haken des Artikels beruehrt: nur ein Hinweis (womoeglich nur in Apollo gepflegt).
+    apollo_extra: dict[str, list[str]] = field(default_factory=dict)
+    # Dieselben Abweichungen, wenn ihr Haken ohnehin geloescht wird (oder der Artikel ganz): sie gehen
+    # mit diesem Loeschen verloren - Warnung.
+    unchanged_losses: dict[str, list[str]] = field(default_factory=dict)
+
+    def import_articles_by_file(self) -> dict[str, set[str]]:
+        """Je Output-Datei die Artikel, deren Zeilen neu importiert werden: ganz geloeschte Artikel
+        in allen Dateien, sonst die Dateien ihrer Haken."""
+        result = {file_spec[0]: set(self.complete) for file_spec, _headers in OUTPUT_FILES_WITH_HEADERS}
+        for key, articles in self.by_category.items():
+            for name in apollo_delete_category_files(key):
+                result.setdefault(name, set()).update(articles)
+        return result
+
+    def all_articles(self) -> set[str]:
+        articles = set(self.complete)
+        for listed in self.by_category.values():
+            articles.update(listed)
+        return articles
+
+
+def _listing_with_more(items: list[str], limit: int = 3) -> str:
+    """'a, b, c und 2 weitere'."""
+    shown = ", ".join(items[:limit])
+    return shown + (f" und {len(items) - limit} weitere" if len(items) > limit else "")
+
+
+def apollo_gui_differences(
+    snapshot: StoredArticleSnapshot, apollo: ApolloExportState, article: str
+) -> list[tuple[str, str, bool]]:
+    """Wo Apollo laut IMS-Export und die Output-Dateien der GUI bei einem Artikel auseinanderliegen,
+    ohne dass ein Zeitstempel es zeigt: [(GUI-Bereich, Grund, Apollo hat mehr)].
+
+    - Apollo hat Daten, die GUI keine Zeile mehr (ganz geleerter Bereich: keine Zeile, kein
+      Zeitstempel) - je Bereich (APOLLO_COMPARED_SECTIONS), bei OE-/Vergleichsnummern je Nummer und
+      bei Videos/Web Links je Link (in Apollo nicht zu trennen, siehe ApolloExportState).
+    - Die GUI hat Daten, Apollo keine (z. B. Zeilen, die ein frueherer Import nicht uebernommen hat,
+      oder ein von Hand zu spaet gesetzter Stand) - je Bereich, bei Texten nur mit Text.
+    Eine Text- bzw. Kurzbezeichnungszeile ohne Text zaehlt in der GUI als vorhanden (gui_text_gaps)."""
+    apollo_sections = apollo.sections.get(article, set())
+    gui_rows = gui_sections_present(snapshot)
+    gui_content = gui_rows - gui_text_gaps(snapshot)
+    differences: list[tuple[str, str, bool]] = []
+    for section in APOLLO_COMPARED_SECTIONS:
+        label = LIVE_SECTION_LABELS.get(section, section)
+        if section in apollo_sections and section not in gui_rows:
+            differences.append((section, f"{label}: in Apollo vorhanden, in der GUI ohne Zeilen", True))
+        elif section in gui_content and section not in apollo_sections:
+            differences.append((section, f"{label}: in der GUI vorhanden, in Apollo nicht", False))
+    apollo_refs = apollo.reference_keys.get(article, set())
+    gui_refs = gui_reference_keys(snapshot)
+    if apollo_refs - gui_refs:
+        missing = sorted(number.upper() for _manufacturer, number in apollo_refs - gui_refs)
+        differences.append(("oe_numbers", f"Referenznummern in Apollo, in der GUI nicht (mehr): {_listing_with_more(missing)}", True))
+    elif gui_refs and not apollo_refs:
+        differences.append(("oe_numbers", "OE-/Vergleichsnummern: in der GUI vorhanden, in Apollo nicht", False))
+    apollo_links = apollo.link_keys.get(article, set())
+    gui_links = gui_link_keys(snapshot)
+    if apollo_links - gui_links:
+        missing = sorted(apollo_links - gui_links)
+        differences.append(("web_links", f"Links in Apollo, in der GUI nicht (mehr): {_listing_with_more(missing, 1)}", True))
+    elif gui_links and not apollo_links:
+        differences.append(("web_links", "Videos/Web Links: in der GUI vorhanden, in Apollo nicht", False))
+    return differences
+
+
+def plan_category_delete_lists(
+    changes: list[ArticleChangeSinceImport],
+    records: dict[str, StoredArticleSnapshot],
+    apollo: ApolloExportState,
+) -> CategoryDeletePlan:
+    """Verteilt die Artikel der Loeschliste seit Apollo-Import (changed_articles_since) auf die
+    Haken von Apollos 'Artikelinformationen loeschen' (APOLLO_DELETE_CATEGORIES). Grundlage ist der
+    Stand in Apollo laut IMS-Export (apollo): ohne ihn laesst sich ein ganz geleerter Bereich nicht
+    erkennen - er hat keine Zeile und damit keinen Zeitstempel mehr, und das Journal kennt nur den
+    Artikel, nicht den Bereich.
+
+    - Ganz loeschen: in der GUI geloeschte Artikel; Artikel, die im Export fehlen (neu angelegt:
+      APOLLO_UNKNOWN_ARTICLE_REASON, das Loeschen laeuft ins Leere; schon vor dem Stand vorhanden:
+      APOLLO_MISSING_ARTICLE_REASON - alle Dateien werden importiert, so kann ein veralteter oder
+      unvollstaendiger Export keinen Artikel am Loeschen vorbeischleusen); neue Artikel, die Apollo
+      schon kennt; Aenderungen ohne erkennbaren Bereich (nur im Journal); Stueckliste/Zubehoer
+      (geaendert oder abweichend - dafuer gibt es keinen Haken).
+    - Sonst je Haken: die geaenderten Bereiche (Zeilen-Zeitstempel nach dem Stand) und die
+      Abweichungen zum Export (apollo_gui_differences). Produktgruppen ziehen die Verknuepfungen
+      mit. Hat Apollo Alt-Suchwoerter als Kriterium 9595, gehen Attribute und Referenzen zusammen:
+      'Attribute' loescht die 9595-Kriterien, die Suchwoerter kommen mit den Gebrauchsnummern der
+      Referenzen zurueck.
+    - Seit dem Stand unveraenderte Artikel (plan.unchanged, Grund mit APOLLO_UNCHANGED_PREFIX): was
+      die GUI hat und Apollo laut Export nicht (z. B. Zeilen, die nie in Apollo ankamen), kommt auf
+      den Haken; fehlt der Artikel im Export ganz, wird er ganz importiert - der Import ganzer Dateien
+      haette beides mitgenommen. Hat Apollo mehr als die GUI, nur ein Hinweis (plan.apollo_extra):
+      womoeglich direkt in Apollo gepflegt - wird derselbe Haken fuer das Nachholen ohnehin
+      geloescht (oder der Artikel ganz), eine Warnung (plan.unchanged_losses). Artikel, die nur
+      Apollo kennt (nicht in der GUI geloescht), stehen nur als Hinweis in plan.apollo_only.
+    - Hinweise: Angaben, die nur Apollo fuehrt, sobald ein Haken sie beruehrt
+      (APOLLO_DETAIL_CATEGORIES) oder der Artikel ganz geloescht wird (nicht bei in der GUI
+      geloeschten); Text-Luecken nur, wenn der Artikel mit ihrem Haken bzw. ganz geloescht wird."""
+    plan = CategoryDeletePlan()
+    order = [key for key, _label, _file, _sections in APOLLO_DELETE_CATEGORIES]
+    by_category: dict[str, list[str]] = {key: [] for key in order}
+    label_section = {label: section for section, label in LIVE_SECTION_LABELS.items()}
+    deleted: set[str] = set()
+    gaps_by_article: dict[str, list[str]] = {}
+
+    def note_text_gaps(article: str, snapshot: StoredArticleSnapshot) -> None:
+        apollo_sections = apollo.sections.get(article, set())
+        gaps = [section for section in ("short_text", "long_text") if section in gui_text_gaps(snapshot) & apollo_sections]
+        if gaps:
+            gaps_by_article[article] = [apollo_delete_category_of_section(section) for section in gaps]
+
+    def plan_per_checkbox(article: str, sections: list[str], differences: list[tuple[str, str, bool]], prefix: str = "") -> None:
+        list_differences = [text for section, text, _apollo_has in differences if section == "article_lists"]
+        if "article_lists" in sections or list_differences:
+            reason = "Stückliste/Zubehör geändert" if "article_lists" in sections else list_differences[0]
+            plan.complete[article] = f"{prefix}{reason} (dafür gibt es keinen Haken)"
+            return
+        reasons: dict[str, list[str]] = {}
+        for section in sections:
+            reasons.setdefault(apollo_delete_category_of_section(section), []).append(LIVE_SECTION_LABELS.get(section, section))
+        for section, text, _apollo_has in differences:
+            reasons.setdefault(apollo_delete_category_of_section(section), []).append(prefix + text)
+        if article in apollo.legacy_search_term_criteria and reasons.keys() & {"attributes", "references"}:
+            for category in ("attributes", "references"):
+                reasons.setdefault(category, []).append("Alt-Suchwörter (Kriterium 9595) in Apollo: Attribute und Referenzen zusammen")
+        for category, implied in APOLLO_DELETE_CATEGORY_IMPLIES.items():
+            if category in reasons:
+                for other in implied:
+                    reasons.setdefault(other, []).append(f"mit {apollo_delete_category_label(category)}")
+        plan.reasons[article] = {key: reasons[key] for key in order if key in reasons}
+        for category in plan.reasons[article]:
+            by_category[category].append(article)
+        details = [
+            text for kind, text in apollo.details.get(article, []) if set(APOLLO_DETAIL_CATEGORIES.get(kind, ())) & set(plan.reasons[article])
+        ]
+        if details:
+            plan.detail_warnings[article] = details
+
+    for change in changes:
+        article = change.article_number
+        if change.status == "geloescht":
+            plan.complete[article] = "in der GUI gelöscht"
+            deleted.add(article)
+            continue
+        if article not in apollo.articles:
+            plan.complete[article] = APOLLO_UNKNOWN_ARTICLE_REASON if change.status == "neu" else APOLLO_MISSING_ARTICLE_REASON
+            continue
+        snapshot = records.get(article)
+        if snapshot is not None:
+            note_text_gaps(article, snapshot)
+        if change.status == "neu":
+            plan.complete[article] = "neu angelegt – Apollo kennt den Artikel schon"
+            continue
+        sections = [label_section.get(label, label) for label in change.changed_sections]
+        if not sections or snapshot is None:
+            plan.complete[article] = "Änderung ohne erkennbaren Bereich (nur im Journal)"
+            continue
+        plan_per_checkbox(article, sections, apollo_gui_differences(snapshot, apollo, article))
+    listed = {change.article_number for change in changes}
+    for article in sorted(records):
+        if article in listed:
+            continue
+        if article not in apollo.articles:
+            # Stand schon vor dem Stand in der GUI, kam aber nie in Apollo an (oder der Export ist
+            # unvollstaendig - dafuer die Rueckfrage): ganz importieren.
+            plan.unchanged.append(article)
+            plan.complete[article] = APOLLO_UNCHANGED_PREFIX + APOLLO_MISSING_ARTICLE_REASON
+            continue
+        differences = apollo_gui_differences(records[article], apollo, article)
+        # Unveraendert: nur nachholen, was Apollo fehlt. Hat Apollo mehr als die GUI, sind es
+        # womoeglich Daten, die nur Apollo fuehrt (z. B. direkt in Apollo gepflegt) - nur ein Hinweis.
+        gui_extra = [difference for difference in differences if not difference[2]]
+        if gui_extra:
+            plan.unchanged.append(article)
+            note_text_gaps(article, records[article])
+            plan_per_checkbox(article, [], gui_extra, APOLLO_UNCHANGED_PREFIX)
+        planned = set(plan.reasons.get(article, {}))
+        kept: list[str] = []
+        lost: list[str] = []
+        for section, text, apollo_has in differences:
+            if not apollo_has:
+                continue
+            if article in plan.complete or apollo_delete_category_of_section(section) in planned:
+                # Der Haken wird fuer das Nachholen ohnehin geloescht (bzw. der ganze Artikel).
+                lost.append(text)
+            else:
+                kept.append(text)
+        if kept:
+            plan.apollo_extra[article] = kept
+        if lost:
+            plan.unchanged_losses[article] = lost
+    plan.apollo_only = sorted(article for article in apollo.articles if article not in records and article not in deleted)
+    for article in plan.complete:
+        # Ganz geloeschte Artikel verlieren in Apollo alles, was nur Apollo fuehrt (in der GUI
+        # geloeschte sollen das).
+        if article not in deleted and apollo.details.get(article):
+            plan.detail_warnings[article] = [text for _kind, text in apollo.details[article]]
+    for article, gaps in gaps_by_article.items():
+        relevant = gaps if article in plan.complete else [key for key in gaps if key in plan.reasons.get(article, {})]
+        if relevant:
+            plan.text_gaps[article] = relevant
+    plan.by_category = {key: by_category[key] for key in order if by_category[key]}
+    return plan
+
+
+def _write_apollo_delete_list_workbook(path: Path, articles: Iterable[str]) -> None:
+    """Eine Loeschliste im Aufbau von VLoesch.xlsx: Blatt 'Loeschliste', A = 757, B = Artikelnummer."""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Loeschliste"
+    sheet.append(list(APOLLO_DELETE_LIST_HEADERS))
+    for article_number in articles:
+        sheet.append([APOLLO_DELETE_LIST_COLUMN_A_VALUE, _sanitize_cell_value(article_number)])
+    workbook.save(path)
+
+
+def write_category_delete_package(
+    target_dir: Path,
+    plan: CategoryDeletePlan,
+    changes: list[ArticleChangeSinceImport],
+    output_root: Path,
+    info: list[tuple[str, str]],
+) -> dict[str, int]:
+    """Schreibt die Loeschlisten je Haken (01_Komplett_loeschen.xlsx, 02_Art-Detail.xlsx, ...), die
+    Uebersicht 00_Ablauf.xlsx und im Unterordner 'Import' je Output-Datei nur die Zeilen der Artikel
+    und Bereiche, die vorher geloescht werden (gleiche Dateinamen, Blaetter und Spalten wie im
+    Ausgabeordner). Erst in einen Nachbarordner, dann umbenannt: ein Abbruch hinterlaesst keinen
+    halben Ordner unter dem Zielnamen. Der Aufrufer haelt WORKBOOK_WRITE_LOCK (die Output-Dateien
+    werden gelesen). Rueckgabe: Importdatei -> Zeilen."""
+    import shutil
+
+    if target_dir.exists():
+        raise OSError(f"Der Ordner existiert schon: {target_dir}")
+    temp_dir = target_dir.with_name(f".{target_dir.name}.{os.getpid()}.tmp")
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(parents=True)
+    try:
+        lists: list[tuple[str, str, list[str], list[str]]] = []
+        if plan.complete:
+            lists.append((APOLLO_COMPLETE_DELETE_FILE, "ganzen Artikel löschen (wie bisher)", list(plan.complete), ["alle Dateien"]))
+        for key, label, file_stem, _sections in APOLLO_DELETE_CATEGORIES:
+            if plan.by_category.get(key):
+                lists.append(
+                    (file_stem, f"Artikelinformationen löschen: nur „{label}“", plan.by_category[key], apollo_delete_category_files(key))
+                )
+        for file_stem, _action, articles, _files in lists:
+            _write_apollo_delete_list_workbook(temp_dir / f"{file_stem}.xlsx", articles)
+        import_dir = temp_dir / APOLLO_IMPORT_PACKAGE_DIR
+        import_dir.mkdir()
+        wanted = plan.import_articles_by_file()
+        written: dict[str, int] = {}
+        for (file_name, sheet_name), headers in OUTPUT_FILES_WITH_HEADERS:
+            articles = wanted.get(file_name, set())
+            source = output_root / file_name
+            if not articles or not source.exists():
+                continue
+            rows = [
+                list(row)
+                for row in prepare_existing_rows_for_write(source, sheet_name, headers)
+                if normalize_article_number(str(row[0])) in articles
+            ]
+            if rows:
+                write_workbook(import_dir / file_name, sheet_name, headers, rows)
+                written[file_name] = len(rows)
+        _write_category_delete_overview(temp_dir / APOLLO_DELETE_OVERVIEW_FILE, plan, changes, lists, written, info)
+        # Virenscanner, Indexer oder Sync-Programme oeffnen frisch geschriebene Dateien kurz - dann
+        # verweigert Windows das Umbenennen des Ordners: einige Male kurz versetzt wiederholen.
+        for attempt in range(1, IMPORT_STAND_REPLACE_ATTEMPTS + 1):
+            try:
+                os.replace(temp_dir, target_dir)
+                break
+            except PermissionError:
+                if attempt == IMPORT_STAND_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(IMPORT_STAND_REPLACE_RETRY_SECONDS)
+    except BaseException as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_dir.exists() and isinstance(exc, OSError):
+            raise OSError(f"{exc}\n\nDer Zwischenordner konnte nicht entfernt werden – bitte nicht verwenden: {temp_dir}") from exc
+        raise
+    return written
+
+
+def _write_category_delete_overview(
+    path: Path,
+    plan: CategoryDeletePlan,
+    changes: list[ArticleChangeSinceImport],
+    lists: list[tuple[str, str, list[str], list[str]]],
+    written: dict[str, int],
+    info: list[tuple[str, str]],
+) -> None:
+    """00_Ablauf.xlsx: Blatt 'Ablauf' (Schritte mit Liste, Haken, Artikelzahl, Importdateien,
+    Hinweise, Grundlage), 'Artikel' (je Artikel Haken, Gruende und Hinweise) und
+    'Loeschliste_komplett' (alle Artikel im Aufbau wie VLoesch.xlsx - falls doch ganze Artikel
+    geloescht werden sollen)."""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Ablauf"
+    sheet.append(["Schritt", "Löschliste", "In Apollo", "Artikel", "Danach neu importieren (Ordner Import)"])
+    step = 0
+    for file_stem, action, articles, files in lists:
+        step += 1
+        sheet.append([step, f"{file_stem}.xlsx", action, len(articles), ", ".join(files)])
+    step += 1
+    sheet.append([
+        step, f"{APOLLO_IMPORT_PACKAGE_DIR}\\*.xlsx", "in IMS importieren", "",
+        ", ".join(f"{name} ({count} Zeilen)" for name, count in written.items()) or "keine",
+    ])
+    step += 1
+    sheet.append([step, "", "in der GUI „Apollo-Import erledigt“ klicken", "", ""])
+    sheet.append([])
+    sheet.append(["Hinweise"])
+    sheet.append(["", "Jede Liste mit genau dem genannten Haken einspielen. Ein Artikel kann auf mehreren Listen stehen."])
+    sheet.append(["", "Die Importdateien enthalten nur die Zeilen der Artikel und Bereiche, die vorher gelöscht werden – alles andere bleibt in Apollo unverändert."])
+    sheet.append(["", "Das Blatt 'Loeschliste_komplett' (alle Artikel ganz) nur zusammen mit dem vollständigen Import der Output-Dateien aus dem Ausgabeordner verwenden – nie mit dem Ordner Import."])
+    unknown = [article for article, reason in plan.complete.items() if reason == APOLLO_UNKNOWN_ARTICLE_REASON]
+    if unknown:
+        sheet.append(["", f"Neu angelegte Artikel, die Apollo laut Export noch nicht kennt: {len(unknown)}. Sie stehen sicherheitshalber auf {APOLLO_COMPLETE_DELETE_FILE}.xlsx – das Löschen läuft für sie ins Leere, danach werden alle ihre Dateien importiert."])
+    if plan.unchanged:
+        sheet.append(["", f"Seit dem Stand unverändert, aber in Apollo fehlt laut Export, was die GUI hat (z. B. Zeilen, die nie in Apollo ankamen): {len(plan.unchanged)} Artikel ({_listing_with_more(plan.unchanged, 5)}) – auf den Listen wie geänderte Artikel, Gründe im Blatt 'Artikel'. Steht ein Artikel nach dem nächsten Import wieder hier, nimmt IMS seine Zeilen nicht an (IMS-Protokoll prüfen). Entstand der Export vor dem letzten Import, können hier auch Artikel stehen, deren Änderungen schon in Apollo sind."])
+    if plan.apollo_extra:
+        sheet.append(["", f"Seit dem Stand unverändert, aber Apollo hat laut Export mehr als die GUI: {len(plan.apollo_extra)} Artikel ({_listing_with_more(sorted(plan.apollo_extra), 5)}) – womöglich nur in Apollo gepflegt; diese Bereiche stehen auf keiner Liste, Apollo behält sie (Blatt 'Artikel'). Soll Apollo der GUI folgen, die Bereiche in Apollo von Hand löschen."])
+    for article, texts in plan.unchanged_losses.items():
+        via = "komplett" if article in plan.complete else ", ".join(apollo_delete_category_label(key) for key in plan.reasons.get(article, {}))
+        sheet.append(["", f"{article} (seit dem Stand unverändert, {via}): Apollo hat mehr als die GUI – {'; '.join(texts)}. Geht mit diesem Löschen verloren. Soll es bleiben: vor dem Einspielen in die GUI übernehmen (die Werte stehen im IMS-Export unter 'Grundlage', z. B. per 'IMS-Export übernehmen…') und die Löschlisten neu erstellen."])
+    if plan.apollo_only:
+        sheet.append(["", f"In Apollo, aber nicht in der GUI (und dort nicht gelöscht): {len(plan.apollo_only)} Artikel ({_listing_with_more(plan.apollo_only, 5)}) – auf keiner Liste (alle im Blatt 'Artikel'); bei Bedarf in Apollo von Hand löschen."])
+    missing = [article for article, reason in plan.complete.items() if reason.endswith(APOLLO_MISSING_ARTICLE_REASON)]
+    if missing:
+        sheet.append(["", f"Artikel, die schon vor dem Importstand in der GUI standen, aber im Export fehlen: {len(missing)} ({_listing_with_more(missing, 5)}). Sie stehen auf {APOLLO_COMPLETE_DELETE_FILE}.xlsx und werden ganz gelöscht, falls Apollo sie doch hat – EAN oder Zubehör-Kennzeichen, die nur Apollo zu ihnen führt, kann der Abgleich dann nicht melden. Ist der Export unvollständig, besser neu exportieren."])
+    gap_texts: dict[str, str] = {}
+    for article, keys in plan.text_gaps.items():
+        labels = " und ".join("Kurzbezeichnung" if key == "art_detail" else "Langtext" for key in keys)
+        gap_texts[article] = f"{labels} in der GUI leer, Apollo hat einen Text – mit diesem Löschen wäre er in Apollo weg"
+        sheet.append(["", f"{article}: {gap_texts[article]}. In der GUI nachtragen und die Löschlisten je Haken danach neu erstellen – dieses Paket enthält noch den leeren Text."])
+    detail_texts: dict[str, str] = {}
+    for article, details in plan.detail_warnings.items():
+        via = "komplett" if article in plan.complete else ", ".join(apollo_delete_category_label(key) for key in plan.reasons.get(article, {}))
+        detail_texts[article] = f"Apollo führt {', '.join(details)} – die GUI nicht; geht mit diesem Löschen ({via}) vermutlich verloren"
+        sheet.append(["", f"{article}: {detail_texts[article]}. Nach dem Import in Apollo prüfen und bei Bedarf von Hand nachtragen."])
+    sheet.append([])
+    sheet.append(["Grundlage"])
+    for label, value in info:
+        sheet.append(["", label, value])
+    articles_sheet = workbook.create_sheet("Artikel")
+    articles_sheet.append(["Artikelnummer", "Status", "letzte Aenderung", "geaenderte Bereiche", "Löschen über", "Grund", "Hinweis"])
+    rows = [change.as_row() for change in changes] + [[article, "", "", "unverändert"] for article in plan.unchanged]
+    for row in rows:
+        article = row[0]
+        if article in plan.complete:
+            via, reason = "Komplett", plan.complete[article]
+        else:
+            reasons = plan.reasons.get(article, {})
+            via = ", ".join(apollo_delete_category_label(key) for key in reasons)
+            reason = "; ".join(f"{apollo_delete_category_label(key)}: {', '.join(texts)}" for key, texts in reasons.items())
+        extra = "; ".join(plan.apollo_extra.get(article, []))
+        losses = "; ".join(plan.unchanged_losses.get(article, []))
+        hint = "; ".join(
+            text
+            for text in (
+                gap_texts.get(article, ""),
+                detail_texts.get(article, ""),
+                losses and f"geht verloren (nur in Apollo): {losses}",
+                extra and f"nur Hinweis, Apollo behält es: {extra}",
+            )
+            if text
+        )
+        articles_sheet.append([_sanitize_cell_value(cell) for cell in [row[0], row[3], row[1], row[2], via, reason, hint]])
+    # Nur Hinweise, auf keiner Liste (und nicht auf Loeschliste_komplett).
+    for article in sorted(set(plan.apollo_extra) - set(plan.unchanged)):
+        articles_sheet.append([_sanitize_cell_value(cell) for cell in [
+            article, "unverändert", "", "", "", "", f"nur Hinweis – Apollo hat mehr als die GUI: {'; '.join(plan.apollo_extra[article])}",
+        ]])
+    for article in plan.apollo_only:
+        articles_sheet.append([_sanitize_cell_value(cell) for cell in [
+            article, "nur in Apollo", "", "", "", "", "in der GUI nicht vorhanden – bei Bedarf in Apollo von Hand löschen",
+        ]])
+    complete_sheet = workbook.create_sheet("Loeschliste_komplett")
+    complete_sheet.append(list(APOLLO_DELETE_LIST_HEADERS))
+    for row in rows:
+        complete_sheet.append([APOLLO_DELETE_LIST_COLUMN_A_VALUE, _sanitize_cell_value(row[0])])
+    workbook.save(path)
+
+
 def format_import_stand_label(
     stand: dict[str, object] | None, changed_count: int, deleted_count: int = 0, read_error: str = ""
 ) -> str:
@@ -19068,6 +19727,11 @@ if ($copied) {{
             import_row, text="Löschliste seit Apollo-Import", command=self.save_apollo_delete_list_since_import
         )
         self.import_delete_list_button.grid(row=0, column=3, padx=(8, 0))
+        # Statt ganzer Artikel nur die geaenderten Bereiche loeschen (Apollo: Artikelinformationen loeschen).
+        self.import_category_delete_button = ttk.Button(
+            import_row, text="Löschlisten je Haken…", command=self.save_apollo_delete_lists_by_category
+        )
+        self.import_category_delete_button.grid(row=0, column=4, padx=(8, 0))
 
         columns = ("article", "changed", "source", "short_id", "long_id", "genart", "attr", "oe", "comparison", "lists", "images", "documents", "videos", "links")
         self.browser_content_frame = ttk.Frame(browser_frame)
@@ -25166,8 +25830,9 @@ if ($copied) {{
                     f"Ja: neuer Importstand {new_stand_text} (Zeitpunkt der Löschliste). Änderungen danach "
                     "bleiben markiert und kommen auf die nächste Löschliste.\n"
                     f"Nein: Der Apollo-Import lief schon nach der Prüfung vom {checked_text} (ohne Liste) – neuer "
-                    f"Importstand {checked_text}. Die Artikel der Liste bleiben markiert und kommen noch einmal auf "
-                    "die nächste Löschliste (erneutes Löschen und Importieren schadet nicht). Die Liste bleibt "
+                    f"Importstand {checked_text}. Die geänderten Artikel der Liste bleiben markiert und kommen noch "
+                    "einmal auf die nächste Löschliste (erneutes Löschen und Importieren schadet nicht; unveränderte "
+                    "Artikel aus Löschlisten je Haken kommen über deren nächsten Abgleich wieder). Die Liste bleibt "
                     "vermerkt: das nächste 'Apollo-Import erledigt' nimmt wieder ihren Zeitpunkt (sicher – was "
                     "danach geändert wurde, bleibt markiert).\n"
                     "Abbrechen: nichts ändern (z. B. wenn der Apollo-Import noch gar nicht gelaufen ist)."
@@ -25270,7 +25935,10 @@ if ($copied) {{
             if key and new_stand > journal.get(key, ""):
                 journal[key] = new_stand
         stand_record = delete_list_record(stand) if keep_list_record else None
-        stand.update(new_import_stand(new_stand, note="Apollo-Import erledigt", deleted_since=[], changed_since=journal))
+        stand.update(new_import_stand(new_stand, note=APOLLO_IMPORT_DONE_NOTE, deleted_since=[], changed_since=journal))
+        # Klickzeitpunkt: importiert wurde zwischen Liste (= Stand) und Klick - ein IMS-Export fuer
+        # die naechsten Loeschlisten je Haken muss danach entstehen (apollo_import_time_of_stand).
+        stand[IMPORT_DONE_AT_KEY] = stand["set_at"]
         if stand_record is not None and not stand_record.empty and stand_record.fits(new_stand):
             # Nur der Pruefungs-Vermerk entfaellt (er liegt jetzt auf dem Stand).
             stand.pop("delete_list_checked_at", None)
@@ -25322,6 +25990,8 @@ if ($copied) {{
                 changed_since=dict(stand.get("changed_since") or {}),
             )
         )
+        # Von Hand gesetzt: kein Klick auf 'erledigt' mehr, der Stand gilt beim Wort.
+        stand.pop(IMPORT_DONE_AT_KEY, None)
         checked_at = normalize_written_at(stand.get("delete_list_checked_at"))
         if checked_at and normalize_written_at(stand.get("last_import_at")) >= checked_at:
             stand.pop("delete_list_checked_at", None)
@@ -25362,7 +26032,9 @@ if ($copied) {{
             row=1, column=1, sticky="w", padx=(8, 0), pady=(4, 10)
         )
         ttk.Label(frame, text="Notiz (optional):").grid(row=2, column=0, columnspan=2, sticky="w")
-        note_var = tk.StringVar(value=str(self.import_stand.get("note", "")) if self.import_stand else "")
+        current_note = str(self.import_stand.get("note", "")) if self.import_stand else ""
+        # Die Notiz von 'erledigt' gehoert nicht zu einem von Hand gesetzten Stand.
+        note_var = tk.StringVar(value="" if current_note == APOLLO_IMPORT_DONE_NOTE else current_note)
         ttk.Entry(frame, textvariable=note_var, width=48).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 10))
         ttk.Label(
             frame,
@@ -25412,76 +26084,13 @@ if ($copied) {{
         geaendert, wird die Pruefung mit Groesse 0 vermerkt (_record_delete_list_at). Bestaetigung
         und Statuszeile nennen den Listenzeitpunkt mit Sekunden. Eine nicht lesbare
         Importstand-Datei wird gemeldet (nicht als 'kein Importstand gesetzt')."""
-        if self._import_stand_action_blocked():
+        prepared = self._prepare_delete_list_changes()
+        if prepared is None:
             return
-        try:
-            output_root = self._resolve_output_root()
-        except ValueError as exc:
-            messagebox.showwarning(APP_TITLE, str(exc))
-            return
-        if not self._flush_live_writes(reason="Löschliste: "):
-            # Ein noch laufender Auftrag fehlte auf der Liste und galte nach 'erledigt'
-            # (Stand = Zeitpunkt der Liste) als importiert.
-            messagebox.showwarning(
-                APP_TITLE,
-                "Es werden noch Änderungen gespeichert – die Löschliste wäre unvollständig.\n\n"
-                "Bitte kurz warten und erneut versuchen.",
-            )
-            return
-        # Im Massenimport geaenderte Artikel, deren Vermerk im Journal gescheitert war, jetzt
-        # vermerken (vor dem Listenzeitpunkt): ein geleerter Bereich steht nur im Journal.
-        not_noted = self._flush_batch_journal_for(output_root)
-        if not_noted:
-            shown = ", ".join(not_noted[:10]) + (" …" if len(not_noted) > 10 else "")
-            messagebox.showwarning(
-                APP_TITLE,
-                f"{len(not_noted)} im Massenimport geänderte Artikel konnten noch nicht im Apollo-Importstand "
-                f"vermerkt werden ({IMPORT_STAND_FILENAME} gesperrt?): {shown}\n\n"
-                "Die Löschliste wäre unvollständig und wurde nicht erstellt. Bitte kurz warten und erneut versuchen.",
-            )
-            return
-        # Zeitpunkt der Liste: nach dem Schreiben aller offenen Auftraege, vor dem
-        # Neuladen (dazwischen laeuft keine Ereignisschleife, also kein Live-Auftrag) -
-        # was danach geschrieben wird, ist juenger und bleibt nach 'Apollo-Import
-        # erledigt' markiert, alles davor steht auf der Liste.
-        list_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._refresh_article_browser()
-        if not self._import_stand_readable(output_root, "Die Löschliste wurde nicht erstellt."):
-            return
-        stand = self.import_stand
-        if stand is None:
-            messagebox.showinfo(
-                APP_TITLE,
-                "Es ist noch kein Apollo-Importstand gesetzt.\n\n"
-                "Mit 'Apollo-Import erledigt' oder 'Importstand setzen…' festlegen, "
-                "wann die Output-Dateien zuletzt in Apollo importiert wurden.",
-            )
-            return
-        if self.article_browser_cache_dir != str(output_root):
-            # Das Verzeichnis ist (noch) nicht aus diesem Ordner geladen, z. B. weil ein
-            # Neuladen gerade aufgeschoben ist - die Liste waere unvollstaendig.
-            messagebox.showinfo(
-                APP_TITLE,
-                f"Das Artikelverzeichnis zeigt noch nicht den Ausgabeordner {output_root} - "
-                "bitte kurz warten und erneut versuchen.",
-            )
-            return
+        output_root, stand, list_at, changes = prepared
         stand_label = format_written_at_display(str(stand.get("last_import_at", "")))
         list_base = str(stand.get("last_import_at") or "")
         list_at_text = format_written_at_display(list_at, with_seconds=True)
-        changes = changed_articles_since(self.article_browser_records, stand)
-        if not changes:
-            # Pruefung ohne Liste (Groesse 0): 'erledigt' nimmt ihren Zeitpunkt nur, solange
-            # keine echte Liste folgt - die erste echte Liste ersetzt sie.
-            record_error, fallback, fallback_empty = self._record_delete_list_at(output_root, list_at, list_base, 0)
-            messagebox.showinfo(
-                APP_TITLE,
-                f"Seit dem Apollo-Import vom {stand_label} wurde kein Artikel geändert, neu angelegt oder gelöscht.\n\n"
-                f"Eine Löschliste ist nicht nötig (geprüft am {list_at_text}).",
-            )
-            if record_error:
-                self._warn_delete_list_at_not_recorded(record_error, fallback, fallback_empty)
-            return
 
         if target_path is None:
             stand_date = str(stand.get("last_import_at", ""))[:10]
@@ -25514,6 +26123,325 @@ if ($copied) {{
             f"Löschliste vom {list_at_text} mit {len(changes)} Artikelnummern gespeichert:\n{target_path}\n\n{summary}.\n\n"
             f"Blatt 'Loeschliste': Spalte A = {APOLLO_DELETE_LIST_COLUMN_A_VALUE}, Spalte B = Artikelnummer "
             "(Aufbau wie VLoesch.xlsx). Blatt 'Aenderungen': je Artikel letzte Änderung, geänderte Bereiche und Status.",
+        )
+        if record_error:
+            self._warn_delete_list_at_not_recorded(record_error, fallback, fallback_empty)
+
+    def _prepare_delete_list_changes(
+        self, allow_empty: bool = False
+    ) -> tuple[Path, dict[str, object], str, list[ArticleChangeSinceImport]] | None:
+        """Gemeinsame Vorarbeit von 'Löschliste seit Apollo-Import' und 'Löschlisten je Haken…':
+        Sperren pruefen, offene Live-Auftraege und Massenimport-Vermerke schreiben, Zeitpunkt der
+        Liste nehmen, Verzeichnis abgleichen, Importstand lesen und die Aenderungen seit dem Stand
+        bestimmen. Ohne Aenderung wird die Pruefung vermerkt und gemeldet - ausser mit allow_empty
+        (die Loeschlisten je Haken gleichen dann noch mit dem IMS-Export ab). Rueckgabe
+        (Ausgabeordner, Stand, Zeitpunkt der Liste, Aenderungen) oder None (gemeldet bzw. nichts zu tun)."""
+        if self._import_stand_action_blocked():
+            return None
+        try:
+            output_root = self._resolve_output_root()
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return None
+        if not self._flush_live_writes(reason="Löschliste: "):
+            # Ein noch laufender Auftrag fehlte auf der Liste und galte nach 'erledigt'
+            # (Stand = Zeitpunkt der Liste) als importiert.
+            messagebox.showwarning(
+                APP_TITLE,
+                "Es werden noch Änderungen gespeichert – die Löschliste wäre unvollständig.\n\n"
+                "Bitte kurz warten und erneut versuchen.",
+            )
+            return None
+        # Im Massenimport geaenderte Artikel, deren Vermerk im Journal gescheitert war, jetzt
+        # vermerken (vor dem Listenzeitpunkt): ein geleerter Bereich steht nur im Journal.
+        not_noted = self._flush_batch_journal_for(output_root)
+        if not_noted:
+            shown = ", ".join(not_noted[:10]) + (" …" if len(not_noted) > 10 else "")
+            messagebox.showwarning(
+                APP_TITLE,
+                f"{len(not_noted)} im Massenimport geänderte Artikel konnten noch nicht im Apollo-Importstand "
+                f"vermerkt werden ({IMPORT_STAND_FILENAME} gesperrt?): {shown}\n\n"
+                "Die Löschliste wäre unvollständig und wurde nicht erstellt. Bitte kurz warten und erneut versuchen.",
+            )
+            return None
+        # Zeitpunkt der Liste: nach dem Schreiben aller offenen Auftraege, vor dem
+        # Neuladen (dazwischen laeuft keine Ereignisschleife, also kein Live-Auftrag) -
+        # was danach geschrieben wird, ist juenger und bleibt nach 'Apollo-Import
+        # erledigt' markiert, alles davor steht auf der Liste.
+        list_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._refresh_article_browser()
+        if not self._import_stand_readable(output_root, "Die Löschliste wurde nicht erstellt."):
+            return None
+        stand = self.import_stand
+        if stand is None:
+            messagebox.showinfo(
+                APP_TITLE,
+                "Es ist noch kein Apollo-Importstand gesetzt.\n\n"
+                "Mit 'Apollo-Import erledigt' oder 'Importstand setzen…' festlegen, "
+                "wann die Output-Dateien zuletzt in Apollo importiert wurden.",
+            )
+            return None
+        if self.article_browser_cache_dir != str(output_root):
+            # Das Verzeichnis ist (noch) nicht aus diesem Ordner geladen, z. B. weil ein
+            # Neuladen gerade aufgeschoben ist - die Liste waere unvollstaendig.
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Das Artikelverzeichnis zeigt noch nicht den Ausgabeordner {output_root} - "
+                "bitte kurz warten und erneut versuchen.",
+            )
+            return None
+        stand_label = format_written_at_display(str(stand.get("last_import_at", "")))
+        list_base = str(stand.get("last_import_at") or "")
+        list_at_text = format_written_at_display(list_at, with_seconds=True)
+        changes = changed_articles_since(self.article_browser_records, stand)
+        if not changes and not allow_empty:
+            # Pruefung ohne Liste (Groesse 0): 'erledigt' nimmt ihren Zeitpunkt nur, solange
+            # keine echte Liste folgt - die erste echte Liste ersetzt sie.
+            record_error, fallback, fallback_empty = self._record_delete_list_at(output_root, list_at, list_base, 0)
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Seit dem Apollo-Import vom {stand_label} wurde kein Artikel geändert, neu angelegt oder gelöscht.\n\n"
+                f"Eine Löschliste ist nicht nötig (geprüft am {list_at_text}).",
+            )
+            if record_error:
+                self._warn_delete_list_at_not_recorded(record_error, fallback, fallback_empty)
+            return None
+        return output_root, stand, list_at, changes
+
+    def save_apollo_delete_lists_by_category(self, target_dir: Path | None = None, export_dir: Path | str | None = None) -> None:
+        """'Löschlisten je Haken…': dieselben Artikel wie 'Löschliste seit Apollo-Import', verteilt auf
+        Apollos 'Artikelinformationen löschen' (plan_category_delete_lists): je Haken eine Liste, im
+        Unterordner 'Import' nur die Zeilen, die nach dem Loeschen neu importiert werden, und die
+        Uebersicht 00_Ablauf.xlsx (write_category_delete_package). Braucht einen IMS-Export (Stand in
+        Apollo): nur damit lassen sich ganz geleerte Bereiche erkennen - ohne Export bleibt die
+        Loeschliste ganzer Artikel. Ist der Export aelter als der letzte Apollo-Import
+        (apollo_import_time_of_stand) oder sein Alter unbekannt bzw. fehlen ihm Tabellen, die die GUI
+        fuellt, fragt die GUI vor dem Erstellen. Auch ohne Aenderung seit dem Stand wird abgeglichen
+        (unveraenderte Artikel, die laut Export abweichen); 'nicht noetig' heisst es erst, wenn auch
+        das nichts ergibt. Der Zeitpunkt wird wie bei der Loeschliste vermerkt ('Apollo-Import
+        erledigt'), mit allen Artikeln der Listen als Groesse."""
+        prepared = self._prepare_delete_list_changes(allow_empty=True)
+        if prepared is None:
+            return
+        output_root, stand, list_at, changes = prepared
+        stand_label = format_written_at_display(str(stand.get("last_import_at", "")))
+        list_base = str(stand.get("last_import_at") or "")
+        list_at_text = format_written_at_display(list_at, with_seconds=True)
+        cancelled = "Löschlisten je Haken: abgebrochen – nichts erstellt."
+        if export_dir is None:
+            if not messagebox.askokcancel(
+                APP_TITLE,
+                "Löschlisten je Haken brauchen einen IMS-Export (Stand in Apollo, nach dem letzten "
+                "Apollo-Import erstellt).\n\n"
+                "Nur damit lassen sich Bereiche erkennen, die in der GUI ganz geleert wurden (z. B. alle "
+                "OE-Nummern oder Texte entfernt) – sie haben keine Zeile und damit keinen Zeitstempel mehr. "
+                "Ohne Export bitte die Löschliste ganzer Artikel nehmen.\n\nExportordner jetzt wählen?",
+            ):
+                self.status_var.set(cancelled)
+                return
+            # Im Ordner ueber dem zuletzt gewaehlten Export oeffnen: der Abgleich braucht meist
+            # einen neueren Export, nicht wieder denselben.
+            selected = filedialog.askdirectory(
+                title="IMS-Export (TAF 2.7) zum Abgleich wählen",
+                initialdir=str(Path(self._last_ims_export_dir).parent) if self._last_ims_export_dir else str(output_root.parent),
+                mustexist=True,
+            )
+            if not selected:
+                self.status_var.set(cancelled)
+                return
+            export_dir = Path(selected)
+            if export_dir.name == IMS_SYNC_DATA_SUPPLIER and is_ims_export_dir(export_dir.parent):
+                # Der Datenordner 0757 selbst wurde gewaehlt.
+                export_dir = export_dir.parent
+        export_dir = Path(export_dir)
+        if not is_ims_export_dir(export_dir):
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Der gewählte Ordner ist kein IMS-Export:\n{export_dir}\n\n"
+                f"Erwartet wird der Exportordner mit dem Unterordner {IMS_SYNC_DATA_SUPPLIER} (200.dat, 030.dat, …).",
+            )
+            self.status_var.set(cancelled)
+            return
+        self.status_var.set(f"IMS-Export wird gelesen: {export_dir} …")
+        self.root.update_idletasks()
+        try:
+            export = _load_taf_sync_module().read_taf_export(export_dir)
+        except Exception as exc:  # noqa: BLE001 - Export nicht lesbar: melden, nichts erstellen
+            messagebox.showwarning(APP_TITLE, f"Der IMS-Export konnte nicht gelesen werden:\n{exc}")
+            self.status_var.set(cancelled)
+            return
+        self._last_ims_export_dir = str(export_dir)
+        apollo = apollo_export_state(export)
+        doubts: list[str] = []
+        exported_at = ims_export_time(export_dir)
+        import_time, from_done = apollo_import_time_of_stand(stand)
+        what = f"„{APOLLO_IMPORT_DONE_NOTE}“" if from_done else "der Importstand"
+        record = delete_list_record(stand)
+        if not exported_at:
+            doubts.append("Der Exportordner nennt keinen Zeitpunkt – ob er nach dem letzten Apollo-Import entstand, ist unklar.")
+        elif import_time and exported_at < import_time and exported_at[:16] == import_time[:16]:
+            # Der Ordnername kennt keine Sekunden.
+            doubts.append(
+                f"Der IMS-Export ({format_written_at_display(exported_at)}) stammt aus derselben Minute wie {what} "
+                f"({format_written_at_display(import_time, with_seconds=True)}) – ob er nach dem letzten Apollo-Import "
+                "entstand, ist nicht zu erkennen."
+            )
+        elif import_time and exported_at < import_time:
+            doubts.append(
+                f"Der IMS-Export ({format_written_at_display(exported_at)}) ist älter als {what} "
+                f"({format_written_at_display(import_time) if from_done else stand_label}) – was der letzte Import in "
+                "Apollo geschrieben hat, fehlt womöglich darin."
+            )
+        elif record is not None and not record.empty and record.fits(list_base) and exported_at < record.at:
+            doubts.append(
+                f"Seit dem Importstand wurde am {format_written_at_display(record.at, with_seconds=True)} schon eine "
+                "Löschliste erstellt, dieser Export ist älter. Wurde sie schon in Apollo eingespielt und importiert, ohne "
+                f"„{APOLLO_IMPORT_DONE_NOTE}“ zu klicken, fehlt das im Export – dann erst „{APOLLO_IMPORT_DONE_NOTE}“ "
+                "klicken und neu exportieren. Wurde sie nur erstellt (z. B. neu wegen Text-Lücken), passt der Export."
+            )
+        records = self.article_browser_records
+        statuses = {change.article_number: change.status for change in changes}
+        # Schon vor dem Stand in der GUI (geaendert oder unveraendert), aber nicht im Export.
+        missing = sorted(
+            article for article in records if article not in apollo.articles and statuses.get(article, "") not in ("neu", "geloescht")
+        )
+        if missing:
+            one = len(missing) == 1
+            doubts.append(
+                f"{len(missing)} Artikel {'stand' if one else 'standen'} schon vor dem Importstand in der GUI, "
+                f"{'fehlt' if one else 'fehlen'} aber im Export ({_listing_with_more(missing, 5)}) – ist der Export "
+                f"vollständig, oder hat IMS {'ihn' if one else 'sie'} nie angenommen (IMS-Protokoll prüfen)? "
+                f"{'Er wird' if one else 'Sie werden'} ganz gelöscht und neu importiert; was nur Apollo zu "
+                f"{'ihm' if one else 'ihnen'} führt (EAN, Zubehör-Kennzeichen), kann der Abgleich dann nicht melden."
+            )
+        for sections, tables, label in (
+            (("images", "documents", "videos", "web_links"), ("232",), "Medienzuordnungen (232)"),
+            (("vehicle_links",), ("400",), "Fahrzeugverknüpfungen (400)"),
+            (("oe_numbers", "comparison_numbers"), ("203",), "Referenznummern (203)"),
+            (("search_terms",), ("207",), "Gebrauchsnummern (207)"),
+            (("attributes",), ("210",), "Kriterien (210)"),
+            (("long_text",), ("206",), "Infotexte (206)"),
+            (("genart",), ("211",), "GenArt-Zuordnungen (211)"),
+            (("article_lists",), ("222", "205"), "Zubehör- und Stücklisten (222/205)"),
+        ):
+            if not any(apollo.record_counts.get(table) for table in tables) and any(
+                record.last_written.get(section) for record in records.values() for section in sections
+            ):
+                doubts.append(f"Im Export fehlen {label}, obwohl die GUI solche Daten hat – vermutlich beim Export abgewählt.")
+        if doubts and not messagebox.askyesno(
+            APP_TITLE,
+            "\n\n".join(doubts)
+            + "\n\nDann erkennt der Abgleich nicht sicher, was Apollo hat: Bereiche, die in der GUI ganz geleert "
+            "wurden, blieben womöglich in Apollo stehen, und unveränderte Artikel, deren Änderungen schon in Apollo "
+            "sind, kämen als Abweichung mit auf die Listen. Trotzdem fortfahren?",
+            icon=messagebox.WARNING,
+            default=messagebox.NO,
+        ):
+            self.status_var.set(cancelled)
+            return
+        plan = plan_category_delete_lists(changes, records, apollo)
+        hint_lines = []
+        if plan.apollo_extra:
+            hint_lines.append(
+                f"Unverändert, aber Apollo hat mehr als die GUI: {_listing_with_more(sorted(plan.apollo_extra), 5)} – "
+                "womöglich nur in Apollo gepflegt; diese Bereiche stehen auf keiner Liste, Apollo behält sie."
+            )
+        if plan.apollo_only:
+            hint_lines.append(
+                f"Nur in Apollo, nicht in der GUI: {_listing_with_more(plan.apollo_only, 5)} – auf keiner Liste, "
+                "bei Bedarf in Apollo von Hand löschen."
+            )
+        if not plan.all_articles():
+            # Nichts geaendert und laut Export fehlt Apollo nichts: Pruefung ohne Liste (Groesse 0)
+            # wie bei der Loeschliste ganzer Artikel. Die Hinweise vollstaendig (ohne Paket gibt es
+            # kein 00_Ablauf.xlsx).
+            record_error, fallback, fallback_empty = self._record_delete_list_at(output_root, list_at, list_base, 0)
+            self.status_var.set(f"Löschlisten je Haken: nicht nötig (geprüft am {list_at_text}).")
+            details = [f"{article}: {'; '.join(texts)}" for article, texts in sorted(plan.apollo_extra.items())]
+            details += [f"{article}: nur in Apollo" for article in plan.apollo_only]
+            shown = details[:30]
+            more = f"\n… und {len(details) - len(shown)} weitere" if len(details) > len(shown) else ""
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Seit dem Apollo-Import vom {stand_label} wurde kein Artikel geändert, neu angelegt oder gelöscht, "
+                "und laut IMS-Export fehlt Apollo kein Bereich, zu dem die GUI Daten hat.\n\n"
+                f"Eine Löschliste ist nicht nötig (geprüft am {list_at_text})."
+                + (
+                    "\n\nHinweise (auf keiner Liste – Apollo behält diese Daten):\n" + "\n".join(shown) + more
+                    if details
+                    else ""
+                ),
+            )
+            if record_error:
+                self._warn_delete_list_at_not_recorded(record_error, fallback, fallback_empty)
+            return
+        if target_dir is None:
+            selected = filedialog.askdirectory(
+                title="Ordner für die Löschlisten je Haken wählen", initialdir=str(output_root.parent), mustexist=True
+            )
+            if not selected:
+                self.status_var.set(cancelled)
+                return
+            target_dir = Path(selected) / f"Apollo-Import_{list_at.replace(' ', '_').replace(':', '-')}"
+        target_dir = Path(target_dir)
+        info = [
+            ("Importstand", stand_label),
+            ("Liste vom", list_at_text),
+            ("IMS-Export (Stand in Apollo)", str(export_dir)),
+            ("Ausgabeordner", str(output_root)),
+        ] + [("Hinweis", doubt) for doubt in doubts]
+        try:
+            # Die Output-Dateien werden gelesen: kein Schreiber dazwischen (Massenimport und
+            # Hintergrundvorgang sind ausgeschlossen, die Live-Auftraege abgeschlossen).
+            with WORKBOOK_WRITE_LOCK:
+                written = write_category_delete_package(target_dir, plan, changes, output_root, info)
+        except OSError as exc:
+            messagebox.showwarning(APP_TITLE, f"Die Löschlisten konnten nicht gespeichert werden:\n{exc}")
+            self.status_var.set(f"Löschlisten je Haken nicht gespeichert: {exc}")
+            return
+        record_error, fallback, fallback_empty = self._record_delete_list_at(
+            output_root, list_at, list_base, len(plan.all_articles())
+        )
+        parts = [f"komplett {len(plan.complete)}"] if plan.complete else []
+        parts += [f"{apollo_delete_category_label(key)} {len(articles)}" for key, articles in plan.by_category.items()]
+        summary = ", ".join(parts)
+        unchanged_text = ""
+        if len(plan.unchanged) == 1:
+            unchanged_text = " – dazu 1 seit dem Stand unveränderter Artikel, der laut Export abweicht"
+        elif plan.unchanged:
+            unchanged_text = f" – dazu {len(plan.unchanged)} seit dem Stand unveränderte, die laut Export abweichen"
+        head = f"{len(changes)} Artikel seit {stand_label}" if changes else f"Seit {stand_label} nichts geändert"
+        self.status_var.set(f"Löschlisten je Haken vom {list_at_text} gespeichert: {head}{unchanged_text} ({summary}) – {target_dir}")
+        notes = ""
+        if plan.text_gaps:
+            gap_articles = sorted(plan.text_gaps)
+            one = len(gap_articles) == 1
+            notes += (
+                f"\n\nVor dem Einspielen: {len(gap_articles)} Artikel {'hat' if one else 'haben'} in der GUI eine leere "
+                f"Kurzbezeichnung bzw. einen leeren Langtext, Apollo aber einen Text ({_listing_with_more(gap_articles, 5)}) – "
+                "mit diesem Löschen wäre er in Apollo weg. Erst in der GUI nachtragen, dann die Löschlisten neu erstellen."
+            )
+        if plan.detail_warnings:
+            one = len(plan.detail_warnings) == 1
+            notes += (
+                f"\n\n{len(plan.detail_warnings)} Artikel {'führt' if one else 'führen'} in Apollo Angaben, die die GUI "
+                f"nicht kennt (EAN, Zubehör-Kennzeichen, weitere Infotexte) – Liste in {APOLLO_DELETE_OVERVIEW_FILE}."
+            )
+        if plan.unchanged_losses:
+            count = len(plan.unchanged_losses)
+            notes += (
+                f"\n\nVor dem Einspielen: Bei {count} unveränderten {'Artikel' if count == 1 else 'Artikeln'} hat Apollo "
+                "in einem Bereich, der zum Nachholen gelöscht wird, mehr als die GUI – das geht dabei verloren. Soll es "
+                f"bleiben, erst in die GUI übernehmen und die Löschlisten neu erstellen (Liste in {APOLLO_DELETE_OVERVIEW_FILE})."
+            )
+        notes += "".join(f"\n\n{line}" for line in hint_lines)
+        messagebox.showinfo(
+            APP_TITLE,
+            f"Löschlisten je Haken vom {list_at_text} gespeichert:\n{target_dir}\n\n"
+            f"{head}{unchanged_text}: {summary}.\n\n"
+            f"Ablauf steht in {APOLLO_DELETE_OVERVIEW_FILE}: jede Liste mit ihrem Haken in Apollo einspielen, "
+            f"danach in IMS die {len(written)} Dateien aus dem Ordner '{APOLLO_IMPORT_PACKAGE_DIR}' importieren "
+            f"und zum Schluss '{APOLLO_IMPORT_DONE_NOTE}' klicken." + notes,
         )
         if record_error:
             self._warn_delete_list_at_not_recorded(record_error, fallback, fallback_empty)
@@ -25582,9 +26510,10 @@ if ($copied) {{
         if fallback and fallback_empty:
             consequence = (
                 "'Apollo-Import erledigt' setzt den Stand dann auf die Prüfung vom "
-                f"{format_written_at_display(fallback, with_seconds=True)} (keine Löschliste nötig) – die Artikel "
-                "dieser Liste bleiben danach markiert und kommen noch einmal auf die nächste Löschliste (erneutes "
-                "Löschen und Importieren schadet nicht)."
+                f"{format_written_at_display(fallback, with_seconds=True)} (keine Löschliste nötig) – die geänderten "
+                "Artikel dieser Liste bleiben danach markiert und kommen noch einmal auf die nächste Löschliste "
+                "(erneutes Löschen und Importieren schadet nicht; unveränderte Artikel aus Löschlisten je Haken kommen "
+                "über deren nächsten Abgleich wieder)."
             )
         elif fallback:
             consequence = (
@@ -28040,6 +28969,7 @@ if ($copied) {{
             self.import_done_button.configure(state="disabled")
             self.import_stand_button.configure(state="disabled")
             self.import_delete_list_button.configure(state="disabled")
+            self.import_category_delete_button.configure(state="disabled")
             self.batch_progress_bar.configure(maximum=max(total, 1), value=0)
             self.batch_progress_var.set(f"0/{total} Artikel verarbeitet")
             self.batch_progress_bar.grid()
@@ -28051,6 +28981,7 @@ if ($copied) {{
             self.import_done_button.configure(state="normal")
             self.import_stand_button.configure(state="normal")
             self.import_delete_list_button.configure(state="normal")
+            self.import_category_delete_button.configure(state="normal")
             self._update_ki_batch_resume_button()
 
     def _apply_batch_progress(self, done: int, total: int, detail: str, elapsed: float) -> None:
@@ -29778,6 +30709,28 @@ def _unique_ims_sync_stamp(backup_dir: Path, stamp: str) -> str:
         counter += 1
         candidate = f"{stamp}-{counter}"
     return candidate
+
+
+def ims_export_time(export_dir: Path | str) -> str:
+    """Zeitpunkt eines IMS-Exports aus dem Ordnernamen (20261026_1323_1 -> '2026-10-26 13:23:00');
+    '' wenn der Name keinen Zeitpunkt traegt."""
+    match = re.match(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})", Path(export_dir).name)
+    if not match:
+        return ""
+    year, month, day, hour, minute = match.groups()
+    return f"{year}-{month}-{day} {hour}:{minute}:00"
+
+
+def apollo_import_time_of_stand(stand: dict[str, object]) -> tuple[str, bool]:
+    """Ab wann ein IMS-Export den letzten Apollo-Import enthaelt: (Zeitpunkt, von 'erledigt').
+    Nach 'Apollo-Import erledigt' ist der Stand der Zeitpunkt der Liste - importiert wurde erst
+    danach, vor dem Klick: dann zaehlt der Klick (IMPORT_DONE_AT_KEY). Einen von Hand gesetzten
+    Stand nimmt die GUI beim Wort."""
+    last_import_at = normalize_written_at(stand.get("last_import_at")) or ""
+    done_at = normalize_written_at(stand.get(IMPORT_DONE_AT_KEY)) or ""
+    if done_at > last_import_at:
+        return done_at, True
+    return last_import_at, False
 
 
 def is_ims_export_dir(folder: Path | str) -> bool:
