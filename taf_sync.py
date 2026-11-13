@@ -911,7 +911,7 @@ class _Merger:
         if path.exists():
             long_terms: dict[str, int] = {}
             for row in m.read_workbook_rows(path, m.USAGE_NUMBER_FILE[1], len(m.USAGE_NUMBER_HEADERS)):
-                if len(str(row[2]).strip()) > 35:
+                if len(str(row[2]).strip()) > m.SEARCH_TERM_MAX_LENGTH:
                     long_terms[str(row[0])] = long_terms.get(str(row[0]), 0) + 1
             for article, count in long_terms.items():
                 self.report.add_hint("Suchwort > 35 Zeichen", article, f"{count} GUI-Suchwort/-woerter laenger als 35 Zeichen (passen nicht in TAF 207)")
@@ -925,11 +925,11 @@ class _Merger:
             manufacturer_id = strip_leading_zeros(reference.man_no)
             key = self.key_of.get(reference.art_no, m.normalize_article_number(reference.art_no))
             if manufacturer_id in self.competitors:
-                comparison_rows.setdefault(key, []).append([reference.art_no, "10", manufacturer_id, reference.ref_no])
+                comparison_rows.setdefault(key, []).append([reference.art_no, m.COMPARISON_NUMBER_TECDOC_ID, manufacturer_id, reference.ref_no])
                 continue
             if manufacturer_id not in self.manufacturers:
                 unknown_manufacturers[reference.man_no] = unknown_manufacturers.get(reference.man_no, 0) + 1
-            oe_rows.setdefault(key, []).append([reference.art_no, "4", manufacturer_id, reference.ref_no])
+            oe_rows.setdefault(key, []).append([reference.art_no, m.OE_NUMBER_TECDOC_ID, manufacturer_id, reference.ref_no])
         for man_no, count in unknown_manufacturers.items():
             self.report.add_hint(
                 "Hersteller-Katalog",

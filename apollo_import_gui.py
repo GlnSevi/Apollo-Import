@@ -129,7 +129,7 @@ def _get_playwright_api() -> tuple[Callable[..., Any], type[Exception]]:
 
 
 APP_TITLE = "Apollo Import GUI Prototype"
-APP_VERSION = "0.1.57"
+APP_VERSION = "0.1.58"
 APP_VERSION_TAG = f"v{APP_VERSION}"
 
 # Zentrale UI-Palette: helles, neutrales Design mit blauem Akzent.
@@ -152,6 +152,9 @@ DEFAULT_ATTRIBUTE_SOURCE = Path(r"G:\Apollo\Export aus SQL\Attribute alle.xlsx")
 DEFAULT_ATTRIBUTE_KEY_VALUE_SOURCE = Path("G:/Apollo/Export aus SQL/Schl\u00fcsselwerte.xlsx")
 DEFAULT_VEHICLE_SOURCE = Path(r"G:\Apollo\KTyp.xlsx")
 DEFAULT_ATTRIBUTE_MAPPING_SOURCE = Path(r"G:\Apollo\Attribut_Zuordnung.xlsx")
+# Zuordnung Schluesselwert-Kriterium -> Schluesselliste (Herkunft + Attribut-Tabellenbezeichnung der
+# Schluesselwerte.xlsx). Gemeinsam fuer alle Arbeitsplaetze; ergaenzt bzw. uebersteuert DEFAULT_KEY_LIST_ASSIGNMENTS.
+DEFAULT_ATTRIBUTE_KEY_LIST_MAPPING_SOURCE = Path(r"G:\Apollo\Schluessellisten_Zuordnung.xlsx")
 # Gesamtliste aller Artikel (SQL-Export) mit Produktgruppe je Artikel - liefert
 # der KI Fach-Kontext. Es wird immer der neueste Export im Ordner verwendet.
 ARTICLE_LIST_SOURCE_DIR = Path(r"G:\Apollo\Export aus SQL")
@@ -523,10 +526,56 @@ ARTICLE_LIST_HEADERS = [
 # Zuordnung von Text-Labels (aus gescrapten Produkttexten) zu TecDoc Kriterien IDs.
 ATTRIBUTE_MAPPING_SHEET = "Zuordnung"
 ATTRIBUTE_MAPPING_HEADERS = ["Text-Label", "TecDoc Kriterien ID", "Hinweis"]
+# Zuordnung Schluesselwert-Kriterium -> Schluesselliste (ab v0.1.58), siehe DEFAULT_ATTRIBUTE_KEY_LIST_MAPPING_SOURCE.
+ATTRIBUTE_KEY_LIST_MAPPING_SHEET = "Zuordnung"
+ATTRIBUTE_KEY_LIST_MAPPING_HEADERS = [
+    "TecDoc Kriterien ID", "Kriterium", "Herkunft", "Attribut-Tabellenbezeichnung", "Hinweis",
+    "Zugeordnet am", "Bisherige Herkunft", "Bisherige Tabelle", "Bestand geprüft am",
+]
+# Zweites Blatt derselben Datei (optional): GenArten, an denen Apollo keine Fahrzeuge fuehrt.
+GENARTS_WITHOUT_VEHICLES_SHEET = "GenArt ohne Fahrzeuge"
+GENARTS_WITHOUT_VEHICLES_HEADERS = ["GenArt ID", "Hinweis"]
+DEFAULT_GENARTS_WITHOUT_VEHICLES = ("17692", "4563")
+# Schluesselwert-Aufloesung (resolve_attribute_key_value): wer fragt, bestimmt die Strenge.
+KEY_VALUE_MODE_ENTRY = "eingabe"    # Maske; 'Zuweisen' im Vorschlagsdialog (der User tippt selbst)
+KEY_VALUE_MODE_TEXT = "text"        # automatische Findung; Anhaken/Uebernehmen im Vorschlagsdialog
+KEY_VALUE_MODE_STORED = "bestand"   # Laden, Anzeige, Markierung in der Maske, Vorlage (Zeilen tragen 'K | B')
+KEY_VALUE_MODE_FILE = "datei"       # Pruefung vor dem Import: die Rohzelle muss das Kuerzel selbst sein
+KEY_VALUE_STATUS_EMPTY = "leer"
+KEY_VALUE_STATUS_UNCHECKED = "ungeprueft"      # Kataloge nicht bereit - nichts wird geprueft
+KEY_VALUE_STATUS_NO_LIST = "keine_liste"
+KEY_VALUE_STATUS_OK = "ok"
+KEY_VALUE_STATUS_UNKNOWN = "unbekannt"
+KEY_VALUE_STATUS_AMBIGUOUS = "doppeldeutig"
+KEY_VALUE_STATUS_KEY_ONLY = "nur_kuerzel"
+KEY_VALUE_STATUS_MISMATCH = "widerspruch"
+# Im Schluesselindex genau dann vorhanden, wenn Schluesselwerte UND Kriterienkatalog geladen sind.
+ATTRIBUTE_KEY_VALUE_INDEX_READY_KEY = "#"
+# Eingaberegeln (attribute_row_violations): Stufen und Regelnamen wie im Pruefbericht.
+RULE_SEVERITY_ERROR = "Fehler"     # IMS lehnt ab oder Apollo speichert etwas anderes - sicher
+RULE_SEVERITY_REVIEW = "Prüfen"    # nicht entscheidbar ohne IMS (Katalogstand, fehlende Liste, Listenwechsel)
+RULE_SEVERITY_HINT = "Hinweis"     # wirkungslos oder doppelt, kein Schaden
+RULE_ATTRIBUTE_FORMAT = "Attribut: Format"
+RULE_KEY_VALUE_TO_FILLED = "Schlüsselwert: Wert bis gefüllt"
+RULE_KEY_VALUE_NO_LIST = "Schlüsselwert: keine Schlüsselliste"
+RULE_KEY_VALUE_PLAIN_TEXT = "Schlüsselwert: Klartext statt Kürzel"
+RULE_KEY_VALUE_NOT_IN_LIST = "Schlüsselwert: Kürzel nicht in der Schlüsselliste"
+RULE_KEY_VALUE_AMBIGUOUS = "Schlüsselwert: doppeldeutig"
+RULE_KEY_VALUE_KEY_ONLY = "Schlüsselwert: nur als Kürzel gefunden"
+RULE_KEY_VALUE_MISMATCH = "Schlüsselwert: Kürzel und Bezeichnung passen nicht"
+RULE_ATTRIBUTE_FROM_EQUALS_TO = "Attribut: von gleich bis"
+RULE_ATTRIBUTE_TOO_LONG = "Attribut: Wert über 20 Zeichen"
+RULE_ATTRIBUTE_FREE_TEXT_TWICE = "Attribut: Freitextfeld mehrfach"
+# Markierung von Bestandszeilen mit Regelverstoss in der Attribut-Tabelle der Maske.
+ATTRIBUTE_ROW_ERROR_TAG = "rule_error"
+ATTRIBUTE_ROW_REVIEW_TAG = "rule_review"
 # Suchwörter gehören in Apollo in die Referenzen-Tabelle als Typ "Gebrauchsnummer"
 # (TecDoc ID 2) mit dem Suchwort als Freitext in der Spalte "Nummer". Pro Suchwort
 # eine Referenzzeile in Gebrauchsnummern.xlsx.
 USAGE_NUMBER_TECDOC_ID = "2"
+# Referenztypen der Referenzen-Tabelle (TecDoc ID): OE-Nummer 4, Vergleichsnummer 10 (Gebrauchsnummer 2 siehe oben).
+OE_NUMBER_TECDOC_ID = "4"
+COMPARISON_NUMBER_TECDOC_ID = "10"
 # Bis v0.1.31 wurden Suchwörter als Attribut 'Zusatzbezeichnung' (9595) in die
 # Attribute.xlsx geschrieben. Solche Altzeilen werden beim Laden weiterhin als
 # Suchwörter erkannt und beim nächsten Schreiben der Suchwörter in die Referenzen
@@ -546,7 +595,10 @@ FREE_TEXT_CRITERIA_ID = FREE_TEXT_SLOT_IDS[0]
 # Referenzartikel wird von Hand gepflegt und ist die Wahrheit. Im Abrufumfang
 # aenderbar ('davon 1:1 uebernehmen (Kriterien-IDs)').
 DEFAULT_REFERENCE_COPY_CRITERIA_IDS = "9202, 9213, 9220, 9798"
-SEARCH_TERM_MAX_LENGTH = 50
+# Apollo-Feldgrenzen (TAF 2.7, taf_sync.TABLE_LAYOUTS): 207.TradeNo 35, 210.CritVal 20, 231.URL 300.
+SEARCH_TERM_MAX_LENGTH = 35
+ATTRIBUTE_VALUE_MAX_LENGTH = 20
+WEB_LINK_MAX_LENGTH = 300
 CSV_ARTICLE_HEADER_ALIASES = {
     "artikelnummer",
     "artikelnr",
@@ -862,15 +914,10 @@ class AttributeOption:
         return " | ".join(details)
 
     def key_value_group_candidates(self) -> list[str]:
-        candidates: list[str] = []
-        for value in [self.type_name.strip(), self.label.strip()]:
-            if not value:
-                continue
-            normalized = normalize_attribute_key_value_group(value)
-            if normalized in candidates:
-                continue
-            candidates.append(normalized)
-        return candidates
+        """Schluessel der Schluesselliste dieses Kriteriums im Index (ab v0.1.58 je Kriterien-ID, siehe
+        build_attribute_key_value_index) - nicht mehr ueber Typ/Bezeichnung."""
+        key = attribute_key_value_criteria_key(self.criteria_id)
+        return [key] if key else []
 
 
 @dataclass(frozen=True)
@@ -891,6 +938,97 @@ class AttributeKeyValueOption:
     def display_label(self) -> str:
         parts = [self.key_value_id.strip(), self.label.strip()]
         return " | ".join(part for part in parts if part) or self.key_value_id
+
+
+@dataclass(frozen=True)
+class KeyListAssignment:
+    """Feste Zuordnung eines Schluesselwert-Kriteriums zu seiner Schluesselliste."""
+
+    criteria_id: str
+    source: str = ""            # Herkunft der Liste ('' = Herkunft des Kriteriums)
+    table: str = ""             # Attribut-Tabellenbezeichnung
+    note: str = ""
+    assigned_at: str = ""       # 'YYYY-MM-DD HH:MM:SS'
+    previous_source: str = ""
+    previous_table: str = ""
+    stock_checked_at: str = ""  # 'Bestand geprueft am'
+    builtin: bool = False       # Programm-Vorgabe (nicht aus der Datei)
+
+
+@dataclass(frozen=True)
+class KeyValueResolution:
+    """Ergebnis von resolve_attribute_key_value (Status siehe KEY_VALUE_STATUS_*)."""
+
+    status: str
+    option: AttributeKeyValueOption | None = None            # nur bei 'ok'
+    label_matches: tuple[AttributeKeyValueOption, ...] = ()  # Eintraege, deren Bezeichnung trifft
+    key_match: AttributeKeyValueOption | None = None         # Eintrag, dessen Kuerzel trifft
+    list_label: str = ""                                     # 'TecDoc/Akkuspannung'
+    list_size: int = 0
+
+
+@dataclass(frozen=True)
+class AttributeRuleViolation:
+    """Ein Regelverstoss einer Attributzeile (attribute_row_violations)."""
+
+    rule: str              # Regelname wie im Pruefbericht
+    severity: str          # Stufe fuer Bestand/Pruefung; neue Eingaben werden bei JEDEM Verstoss abgewiesen
+    message: str           # ganzer Satz fuer die Maske
+    short: str = ""        # Kurztext fuer Listen (Pruefliste, Testbericht, Spalte 'Hinweis' im Dialog)
+    proposal: str = ""     # sicherer Vorschlag, sonst leer
+    confirmable: bool = False   # die Maske darf nach ausdruecklicher Rueckfrage trotzdem uebernehmen
+
+
+# Startbestand der Zuordnung Kriterium -> Schluesselliste: nur in IMS bzw. an Apollo-Daten BESTAETIGTE
+# Zuordnungen (Stand 12.11.2026). Sie stehen nicht in der Zuordnungsdatei; eine Dateizeile uebersteuert sie.
+# 468 Material -> TecDoc/Material ist ebenfalls bestaetigt, ergibt sich aber aus 'gleicher Name, gleiche Herkunft'.
+DEFAULT_KEY_LIST_ASSIGNMENTS: dict[str, KeyListAssignment] = {
+    assignment.criteria_id: assignment
+    for assignment in (
+        KeyListAssignment("596", "TecDoc", "Ergänzungsartikel", "IMS-Auswahlliste 12.11.2026 (IMS hat zusätzlich 993, 994)", builtin=True),
+        KeyListAssignment("701", "TecDoc", "seitig", "IMS-Auswahlliste 12.11.2026 (BD, DS, EL, ES, DL)", builtin=True),
+        KeyListAssignment("2151", "TecDoc", "Wahrheitstabelle_Werkstattbedarf", "IMS-Auswahlliste 12.11.2026 (1 ja, 0 nein, 2 optional)", builtin=True),
+        KeyListAssignment("2955", "TecDoc", "Batterie", "IMS-Auswahlliste 12.11.2026 (46 AGM, 504 LiFePO4)", builtin=True),
+        KeyListAssignment("3465", "TecDoc", "Akkuspannung", "aus Apollo-Daten belegt (PL-031: 8 = 3,7)", builtin=True),
+        KeyListAssignment("4374", "TecDoc", "Ladefunktion", "IMS-Auswahlliste 12.11.2026", builtin=True),
+        KeyListAssignment(
+            "9084", "TOPMOTIVE", "Stg_Material", "Apollo zeigt 194 als 'Nappaleder'",
+            previous_source="TecDoc", previous_table="Material", builtin=True,
+        ),
+        KeyListAssignment("9410", "TOPMOTIVE", "W-Akkuspannung [V]", "IMS-Auswahlliste 12.11.2026 (6 = 12,0; 13 = 3,7)", builtin=True),
+        KeyListAssignment("9411", "TOPMOTIVE", "W-Akkukapazität [Ah]", "IMS-Auswahlliste 12.11.2026", builtin=True),
+        # Nach dem Plan in IMS bestaetigt (Bildschirmfotos der Auswahllisten, 12.11.2026 ca. 14:30):
+        KeyListAssignment(
+            "1781", "TecDoc", "Netzspannung AC",
+            "IMS-Auswahlliste 12.11.2026 (1 = 230, 3 = 110 - 120, 4 = 12; IMS hat zusätzlich 5 = 400)",
+            builtin=True,
+        ),
+        KeyListAssignment(
+            "2923", "TecDoc", "Material",
+            "IMS-Auswahlliste 12.11.2026 (52 = ABS, 258 = FKM, 8 = Kupfer; IMS hat zusätzlich 309-314)",
+            builtin=True,
+        ),
+        # In IMS bestaetigt 12.11.2026 ca. 15:00-15:10 (damit alle 14 Zuordnungen; es bleibt kein reiner Vorschlag):
+        KeyListAssignment(
+            "3466", "TecDoc", "Akkukapazität",
+            "IMS-Auswahlliste 12.11.2026 (5 = 1,7; 25 = 1,9; 6 = 2,0; 21 = ohne Akku)",
+            builtin=True,
+        ),
+        KeyListAssignment(
+            "3217", "TecDoc", "SL_Numerische_Werte",
+            "IMS-Auswahlliste 12.11.2026 (1 = 1, 5 = 5, M = 1000, A2 = 2,5; nicht TOPMOTIVE/W-Anzahl X)",
+            builtin=True,
+        ),
+        KeyListAssignment(
+            "9327", "TOPMOTIVE", "W-Antrieb in mm (Zoll)",
+            "IMS-Auswahlliste 12.11.2026 (1 = 6,3 (1/4\"), 3 = 12,5 (1/2\"); nicht TecDoc/Maße Antriebsvierkant)",
+            builtin=True,
+        ),
+    )
+}
+# Nur Vorschlag im Zuordnungsdialog und im Pruefbericht (wahrscheinlich, nicht in IMS bestaetigt) - nie automatisch.
+# Seit der Bestaetigung aller 14 Zuordnungen (12.11.2026) leer; der Mechanismus bleibt fuer kuenftige Vorschlaege.
+SUGGESTED_KEY_LIST_ASSIGNMENTS: dict[str, KeyListAssignment] = {}
 
 
 @dataclass(frozen=True)
@@ -921,13 +1059,10 @@ class AttributeRow:
         return "-"
 
     def key_value_group_candidates(self) -> list[str]:
-        candidates: list[str] = []
-        for value in [self.type_name.strip(), self.label.strip()]:
-            normalized = normalize_attribute_key_value_group(value)
-            if not normalized or normalized in candidates:
-                continue
-            candidates.append(normalized)
-        return candidates
+        """Schluessel der Schluesselliste dieses Kriteriums im Index (ab v0.1.58 je Kriterien-ID, siehe
+        build_attribute_key_value_index) - nicht mehr ueber Typ/Bezeichnung."""
+        key = attribute_key_value_criteria_key(self.criteria_id)
+        return [key] if key else []
 
 
 @dataclass(frozen=True)
@@ -1002,6 +1137,12 @@ class ReferenceTemplate:
     reference_lines: list[str] = field(default_factory=list)
     all_ids_in_reference_order: list[str] = field(default_factory=list)
     unknown_copy_ids: list[str] = field(default_factory=list)
+    # v0.1.58: Kopier-IDs, deren Zeilen im Referenzartikel selbst gegen eine Eingaberegel verstossen
+    # (apply_reference_copy_rules) - sie werden weder kopiert noch gesucht noch ersetzt.
+    # Bewusst KEIN default_factory: eine KI-Batch-Sicherung (Pickle) aus v0.1.57 kennt die Felder nicht,
+    # pickle ruft kein __init__ - das alte Objekt findet so die Klassen-Vorgabe.
+    rule_blocked_copy_ids: tuple[str, ...] = ()
+    rule_blocked_notes: tuple[str, ...] = ()        # '9202: Freitextfeld schon belegt (3 Zeilen)'
 
     def copied_ids(self) -> list[str]:
         """Kriterien-IDs, zu denen der Referenzartikel 1:1-Zeilen hat (ohne Doppelte)."""
@@ -1010,7 +1151,7 @@ class ReferenceTemplate:
     def copy_ids_without_reference_rows(self) -> list[str]:
         """Kopier-IDs ohne Zeile im Referenzartikel: nichts kopiert, nichts gesucht,
         nichts ersetzt - vorhandene Zeilen des Artikels bleiben (Hinweis im Kurztext)."""
-        copied = set(self.copied_ids())
+        copied = set(self.copied_ids()) | set(self.rule_blocked_copy_ids)
         return [criteria_id for criteria_id in self.copy_ids if criteria_id not in copied]
 
     def summary_text(self) -> str:
@@ -1021,6 +1162,11 @@ class ReferenceTemplate:
             parts.append(f"1:1: {', '.join(self.copied_ids())}")
         if self.copy_ids_without_reference_rows():
             parts.append(f"ohne Zeile im Referenzartikel: {', '.join(self.copy_ids_without_reference_rows())}")
+        if self.rule_blocked_copy_ids:
+            parts.append(
+                "1:1 nicht übernommen – Referenzartikel verstößt gegen eine Eingaberegel: "
+                f"{', '.join(self.rule_blocked_copy_ids)}"
+            )
         if self.unknown_copy_ids:
             parts.append(f"unbekannte 1:1-IDs ignoriert: {', '.join(self.unknown_copy_ids)}")
         return f"{self.reference_article} ({'; '.join(parts)})" if parts else self.reference_article
@@ -1849,6 +1995,12 @@ def _search_term_title_candidates(text: str, article_key: str) -> list[str]:
     return candidates
 
 
+def search_term_too_long(term: str) -> bool:
+    """Suchwort laenger als SEARCH_TERM_MAX_LENGTH (Leerraum zusammengefasst) - Apollo (207.TradeNo)
+    schneidet es ab oder lehnt es ab. Nur Auskunft: Bestandswoerter werden damit markiert, nicht entfernt."""
+    return len(" ".join(str(term or "").split())) > SEARCH_TERM_MAX_LENGTH
+
+
 def generate_search_term_candidates(
     article_number: str,
     brand: str,
@@ -2178,14 +2330,44 @@ def validate_suggestion_value(
     source_line: str,
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
     parsed: tuple[float, float | None, str] | None = None,
+    apply_entry_rules: bool = True,
+    key_value_mode: str = KEY_VALUE_MODE_TEXT,
 ) -> AttributeSuggestion | None:
     """Prüft einen Rohwert gegen das Attributformat und liefert einen Vorschlag.
 
     Wird vom Regel-Pfad und vom KI-Pfad genutzt: Numerik wird geparst und in die
-    Zieleinheit umgerechnet, Schlüsselwerte gegen die Werteliste aufgelöst und
-    Maximallängen geprüft. `confident=True` bedeutet: darf automatisch
+    Zieleinheit umgerechnet, Schlüsselwerte gegen die Schlüsselliste des Kriteriums
+    aufgelöst und Maximallängen geprüft. `confident=True` bedeutet: darf automatisch
     übernommen werden.
+
+    Ab v0.1.58: Schlüsselwerte werden im Modus `key_value_mode` aufgelöst (Textfindung:
+    nur über die Bezeichnung, ein nacktes Kürzel nie automatisch; 'Zuweisen' im Dialog:
+    Regeln der Maske). Jeder sichere Vorschlag läuft zum Schluss durch die Eingaberegeln
+    (attribute_row_violations, kontextfrei) - ein Verstoß macht ihn unsicher, der Hinweis
+    nennt den Kurztext der Regel. `apply_entry_rules=False` lässt diese Nachprüfung weg
+    (Zahleneingabe der Maske: sie prüft danach selbst mit der richtigen Meldung).
     """
+    suggestion = _validate_suggestion_value_core(
+        option, raw_value, source_line, attribute_key_values_by_group, parsed, key_value_mode
+    )
+    if suggestion is not None and suggestion.confident and apply_entry_rules:
+        violations = attribute_row_violations(
+            attribute_suggestion_to_row(suggestion), [], attribute_key_values_by_group, key_value_mode
+        )
+        if violations:
+            suggestion.confident = False
+            suggestion.note = violations[0].short or violations[0].message
+    return suggestion
+
+
+def _validate_suggestion_value_core(
+    option: AttributeOption,
+    raw_value: str,
+    source_line: str,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    parsed: tuple[float, float | None, str] | None,
+    key_value_mode: str,
+) -> AttributeSuggestion | None:
     value_format = option.value_format.strip().casefold()
     if value_format == "kein wert":
         return None
@@ -2221,7 +2403,17 @@ def validate_suggestion_value(
         )
 
     if is_attribute_key_value_format(option.value_format):
-        candidates = [raw_value.strip()]
+        raw_text = raw_value.strip()
+
+        def unsure(value: str, note: str) -> AttributeSuggestion:
+            return AttributeSuggestion(option=option, value=value, source_line=source_line, confident=False, note=note)
+
+        # 1. Kataloge nicht bereit / 2. Kriterium ohne Liste: nichts raten, Rohtext als unsicher.
+        if not attribute_key_value_lists_ready(attribute_key_values_by_group):
+            return unsure(raw_text, "Schlüsselwerte nicht geladen – nicht geprüft")
+        if not attribute_key_value_list_for(option.criteria_id, attribute_key_values_by_group):
+            return unsure(raw_text, "keine Schlüsselliste zugeordnet")
+        candidates = [raw_text]
         if parsed is not None:
             number, _number_to, unit = parsed
             target_unit = extract_attribute_unit(option.label)
@@ -2235,17 +2427,42 @@ def validate_suggestion_value(
             criteria_id=option.criteria_id, label=option.label,
             value_format=option.value_format, type_name=option.type_name,
         )
-        for candidate in candidates:
-            resolved = resolve_attribute_key_value_option(probe, candidate, attribute_key_values_by_group)
-            if resolved is not None:
+        # 3. Erster Kandidat, der eindeutig aufloest (Bezeichnung; im Modus Eingabe auch das Kuerzel).
+        resolutions: list[tuple[str, KeyValueResolution]] = []
+        for candidate in dict.fromkeys(candidate for candidate in candidates if candidate):
+            resolution = resolve_attribute_key_value(probe, candidate, attribute_key_values_by_group, key_value_mode)
+            if resolution.status == KEY_VALUE_STATUS_OK and resolution.option is not None:
                 return AttributeSuggestion(
-                    option=option, value=resolved.display_label(), source_line=source_line,
+                    option=option, value=resolution.option.display_label(), source_line=source_line,
                     confident=True, note="Schlüsselwert",
                 )
-        return AttributeSuggestion(
-            option=option, value=raw_value.strip(), source_line=source_line,
-            confident=False, note="Schlüsselwert nicht in Werteliste gefunden",
-        )
+            resolutions.append((candidate, resolution))
+        # 4. Doppeldeutig: Vorschlag nur bei genau EINEM Bezeichnungstreffer - unsicher, zum Anhaken.
+        for candidate, resolution in resolutions:
+            if resolution.status != KEY_VALUE_STATUS_AMBIGUOUS:
+                continue
+            if len(resolution.label_matches) == 1 and resolution.key_match is not None:
+                return unsure(
+                    resolution.label_matches[0].display_label(),
+                    f"doppeldeutig: '{candidate}' ist auch Kürzel von {resolution.key_match.display_label()} – bitte prüfen",
+                )
+            return unsure(raw_text, "mehrere Einträge mit dieser Bezeichnung")
+        # 5. Sonst: Rohtext mit dem Kurztext der Regel (nur als Kuerzel gefunden / nicht in der Schluesselliste).
+        note_value = raw_text
+        for wanted in (KEY_VALUE_STATUS_KEY_ONLY, KEY_VALUE_STATUS_MISMATCH):
+            hit = next((candidate for candidate, resolution in resolutions if resolution.status == wanted), None)
+            if hit is not None:
+                note_value = hit
+                break
+        violations = [
+            violation
+            for violation in attribute_row_violations(
+                dataclass_replace(probe, value=note_value), [], attribute_key_values_by_group, key_value_mode
+            )
+            if violation.rule != RULE_ATTRIBUTE_FORMAT
+        ]
+        note = (violations[0].short or violations[0].message) if violations else "nicht in der Schlüsselliste"
+        return unsure(raw_text, note)
 
     # Alphanumerisch und alles Übrige: Text direkt übernehmen
     cleaned = " ".join(raw_value.split())
@@ -2361,6 +2578,58 @@ def restrict_hybrid_to_template(result: "HybridAttributeResult", template_ids: l
             )
     result.accepted = kept
     result.learned_entries = []
+
+
+def ki_batch_resume_app_version(resume: dict[str, object] | None) -> str:
+    """Programmversion, die in die KI-Batch-Sicherung geschrieben wird (ab v0.1.58).
+
+    Neue Sicherung: APP_VERSION. Beim Abholen einer vorhandenen Sicherung bleibt ihre Version stehen - die
+    gespeicherten Regel-Treffer stammen weiter aus der Version, die die Sicherung angelegt hat. Sonst gaelte
+    eine Sicherung aus v0.1.57 nach dem ersten Abholen (Batch noch offen, Sicherung neu geschrieben) nicht
+    mehr als 'vor dem Update' (ki_batch_resume_pre_update)."""
+    if resume is None:
+        return APP_VERSION
+    return str(resume.get("app") or "")
+
+
+def ki_batch_resume_pre_update(resume: dict[str, object] | None) -> bool:
+    """True = die Sicherung stammt aus einer anderen (aelteren) Version: beim Abholen geht jeder sichere
+    Schluesselwert-Vorschlag in die Pruefung (demote_rule_violations, pre_update)."""
+    return resume is not None and ki_batch_resume_app_version(resume) != APP_VERSION
+
+
+def demote_rule_violations(
+    result: "HybridAttributeResult",
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    pre_update: bool = False,
+) -> int:
+    """Letzte Sicherung vor dem Schreiben (ab v0.1.58): sichere Vorschlaege (result.accepted), die gegen
+    eine Eingaberegel verstossen (Modus Text, kontextfrei), mit confident=False und dem Kurztext der Regel
+    nach result.review verschieben (Muster restrict_hybrid_to_template).
+
+    pre_update: zusaetzlich JEDEN sicheren Schluesselwert-Vorschlag verschieben (Hinweis 'vor dem Update
+    gefunden – bitte prüfen') - Regel-Treffer einer KI-Batch-Sicherung aus einer aelteren Version wurden
+    mit der Reihenfolge Kuerzel-vor-Bezeichnung aufgeloest. Rueckgabe: Anzahl verschobener Vorschlaege."""
+    kept: list[AttributeSuggestion] = []
+    moved = 0
+    for suggestion in result.accepted:
+        note = ""
+        violations = attribute_row_violations(
+            attribute_suggestion_to_row(suggestion), [], attribute_key_values_by_group, KEY_VALUE_MODE_TEXT
+        )
+        if violations:
+            note = violations[0].short or violations[0].message
+        elif pre_update and is_attribute_key_value_format(suggestion.option.value_format):
+            note = "vor dem Update gefunden – bitte prüfen"
+        if not note:
+            kept.append(suggestion)
+            continue
+        moved += 1
+        result.review.append(
+            dataclass_replace(suggestion, confident=False, note=f"{suggestion.note}; {note}" if suggestion.note else note)
+        )
+    result.accepted = kept
+    return moved
 
 
 def missing_template_ids(
@@ -2577,6 +2846,38 @@ def prepare_ai_extraction(
     return user_message, candidates
 
 
+def ai_extraction_value_candidates(
+    option: AttributeOption, value: str, value_to: str, unit: str, raw_value: str
+) -> list[str]:
+    """Wert-Kandidaten einer KI-Angabe fuer validate_suggestion_value: erst der strukturierte KI-Wert
+    (mit Einheit fuer die Umrechnung; nicht doppelt angehaengt, wenn sie schon im Wert steht), dann der
+    Originaltext.
+
+    Numerisches Kriterium mit 'von' und 'bis' als Zahlen (ab v0.1.58):
+      von == bis -> der Bereich entfaellt, Kandidaten wie fuer einen Einzelwert ('30 - 30' ist 30);
+      von > bis  -> NUR der Bereichskandidat (er scheitert an der Eingaberegel und geht mit deren Text in
+                    die Pruefung; kein stiller Rueckfall auf 'von' oder den Rohtext);
+    sonst unveraendert: [Bereich, Einzelwert, Rohtext]."""
+    unit_suffix = unit if unit and not value.casefold().endswith(unit.casefold()) else ""
+    single: list[str] = []
+    if value:
+        single.append(f"{value} {unit_suffix}".strip() if unit_suffix else value)
+    if raw_value:
+        single.append(raw_value)
+    if not (value and value_to):
+        return single
+    range_candidate = f"{value} - {value_to} {unit_suffix}".strip()
+    if option.value_format.strip().casefold() == "numerisch":
+        number_from = parse_german_number(value)
+        number_to = parse_german_number(value_to)
+        if number_from is not None and number_to is not None:
+            if number_from == number_to:
+                return single
+            if number_from > number_to:
+                return [range_candidate]
+    return [range_candidate] + single
+
+
 def apply_ai_extractions(
     result: HybridAttributeResult,
     extractions: list[dict[str, object]],
@@ -2663,17 +2964,10 @@ def apply_ai_extractions(
         source_label = str(item.get("source_label") or "").strip()
         source_line = f"{source_label}: {raw_value}" if source_label and raw_value else (raw_value or value)
 
-        # Wert-Kandidaten für die lokale Validierung: erst der strukturierte
-        # KI-Wert (mit Einheit für die Umrechnung), dann der Originaltext.
-        # Einheit nicht doppelt anhängen, wenn sie schon im Wert steht.
-        unit_suffix = unit if unit and not value.casefold().endswith(unit.casefold()) else ""
-        raw_candidates: list[str] = []
-        if value and value_to:
-            raw_candidates.append(f"{value} - {value_to} {unit_suffix}".strip())
-        if value:
-            raw_candidates.append(f"{value} {unit_suffix}".strip() if unit_suffix else value)
-        if raw_value:
-            raw_candidates.append(raw_value)
+        # Wert-Kandidaten für die lokale Validierung (ai_extraction_value_candidates):
+        # erst der strukturierte KI-Wert, dann der Originaltext; ein Bereich 'von > bis'
+        # fällt nicht still auf den Einzelwert zurück.
+        raw_candidates = ai_extraction_value_candidates(option, value, value_to, unit, raw_value)
 
         validated: AttributeSuggestion | None = None
         for candidate_value in raw_candidates:
@@ -2875,6 +3169,338 @@ def attribute_row_format_error(row: AttributeRow) -> str:
             if field_value and len(field_value) > row.max_length:
                 return f"{row.display_label()}: {field_label} ist länger als erlaubt ({row.max_length} Zeichen)."
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Eingaberegeln (ab v0.1.58) - eine Regel, zwei Aufrufer: Maske, Vorschlagsdialog und
+# Findung weisen damit ab, die Pruefung vor dem Import macht daraus Befunde.
+# attribute_row_format_error (oben) und die Zeilen-Builder bleiben unveraendert:
+# vorhandene Zeilen sperren das Speichern nicht.
+# ---------------------------------------------------------------------------
+def _key_value_row_violations(
+    row: AttributeRow,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    mode: str,
+    catalog_date: str,
+) -> list[AttributeRuleViolation]:
+    """Regeln 3-8 einer Schluesselwert-Zeile (keine Liste, Klartext, Kuerzel nicht in der Liste,
+    doppeldeutig, nur Kuerzel, Widerspruch). Kataloge nicht bereit: nichts."""
+    value = row.value.strip()
+    if not value:
+        return []
+    resolution = resolve_attribute_key_value(row, value, attribute_key_values_by_group, mode)
+    status = resolution.status
+    if status in {KEY_VALUE_STATUS_EMPTY, KEY_VALUE_STATUS_UNCHECKED, KEY_VALUE_STATUS_OK}:
+        return []
+    label = row.display_label()
+    entry_like = mode in {KEY_VALUE_MODE_ENTRY, KEY_VALUE_MODE_TEXT}
+    list_label = resolution.list_label
+    stand = f" (Stand der Datei: {catalog_date})" if catalog_date else ""
+
+    if status == KEY_VALUE_STATUS_NO_LIST:
+        short = "keine Schlüsselliste zugeordnet"
+        if entry_like:
+            if attribute_key_value_list_for(row.criteria_id, attribute_key_values_by_group) is None:
+                message = (
+                    f"{label}: Das Kriterium steht nicht als Schlüsselwert-Kriterium im Attributkatalog – "
+                    "ein Schlüsselwert kann dafür nicht geprüft und nicht übernommen werden."
+                )
+            else:
+                message = (
+                    f"{label}: Für dieses Schlüsselwert-Kriterium ist keine gültige Schlüsselliste zugeordnet – "
+                    "ohne Liste kann kein Wert übernommen werden. Bitte über 'Schlüsselliste zuordnen…' "
+                    "die Liste aus IMS wählen."
+                )
+            return [AttributeRuleViolation(RULE_KEY_VALUE_NO_LIST, RULE_SEVERITY_REVIEW, message, short=short)]
+        longest_key = attribute_key_value_longest_key(attribute_key_values_by_group)
+        if key_value_text_is_key_shaped(value, None, longest_key):
+            return [
+                AttributeRuleViolation(
+                    RULE_KEY_VALUE_NO_LIST,
+                    RULE_SEVERITY_REVIEW,
+                    f"Für dieses Kriterium ist keine Schlüsselliste zugeordnet – '{value}' kann nicht geprüft "
+                    "werden. Bitte im Reiter Attribute 'Schlüsselliste zuordnen…'.",
+                    short=short,
+                )
+            ]
+        return [
+            AttributeRuleViolation(
+                RULE_KEY_VALUE_PLAIN_TEXT,
+                RULE_SEVERITY_ERROR,
+                f"'{value}' ist der Form nach kein Kürzel (keine Schlüsselliste zugeordnet) – "
+                "IMS lehnt Klartext still ab.",
+                short="Klartext statt Kürzel (keine Schlüsselliste zugeordnet)",
+            )
+        ]
+
+    if status == KEY_VALUE_STATUS_UNKNOWN:
+        options = attribute_key_value_list_for(row.criteria_id, attribute_key_values_by_group) or []
+        short = f"nicht in der Schlüsselliste {list_label}"
+        if resolution.label_matches or not key_value_text_is_key_shaped(value, options, 0):
+            # Sicher Klartext: trifft eine Bezeichnung oder ist der Form nach in keiner Fassung der Liste ein Kuerzel.
+            if entry_like:
+                message = (
+                    f"{label}: '{value}' steht nicht in der Schlüsselliste {list_label} ({resolution.list_size} Werte). "
+                    "Bitte einen Eintrag aus der Liste wählen (im Feld 'Wert' tippen und den Eintrag anklicken) – "
+                    "gespeichert wird das Kürzel."
+                )
+            else:
+                message = f"'{value}' ist kein Kürzel der Schlüsselliste {list_label} – IMS lehnt Klartext still ab."
+            return [AttributeRuleViolation(RULE_KEY_VALUE_PLAIN_TEXT, RULE_SEVERITY_ERROR, message, short=short)]
+        # Kuerzelfoermig: in IMS gesperrt oder neuer als der Export der Katalogdatei - nicht entscheidbar.
+        if mode == KEY_VALUE_MODE_ENTRY:
+            message = (
+                f"{label}: '{value}' steht nicht in der Schlüsselliste {list_label}{stand}.\n\n"
+                "Kennt IMS dieses Kürzel inzwischen (neuer als der Export)? Dann kann es ungeprüft übernommen "
+                "werden – die Prüfung vor dem Import führt es weiter unter 'Prüfen'.\n\n"
+                f"Als Kürzel '{value}' übernehmen?"
+            )
+        elif mode == KEY_VALUE_MODE_TEXT:
+            message = f"'{value}' steht nicht in der Schlüsselliste {list_label}"
+        else:
+            message = (
+                f"'{value}' steht nicht in der Schlüsselliste {list_label}{stand} – in IMS gesperrt oder neuer "
+                "als der Export; bitte in IMS prüfen."
+            )
+        return [
+            AttributeRuleViolation(
+                RULE_KEY_VALUE_NOT_IN_LIST, RULE_SEVERITY_REVIEW, message, short=short,
+                confirmable=mode == KEY_VALUE_MODE_ENTRY,
+            )
+        ]
+
+    if status == KEY_VALUE_STATUS_AMBIGUOUS:
+        entries = list(resolution.label_matches)
+        if resolution.key_match is not None and resolution.key_match not in entries:
+            entries.append(resolution.key_match)
+        entries_text = " / ".join(entry.display_label() for entry in entries)
+        return [
+            AttributeRuleViolation(
+                RULE_KEY_VALUE_AMBIGUOUS,
+                RULE_SEVERITY_ERROR,
+                f"{label}: '{value}' ist in der Schlüsselliste {list_label} doppeldeutig ({entries_text}). "
+                "Bitte den gemeinten Eintrag in der Auswahlliste anklicken.",
+                short=f"doppeldeutig: {entries_text}",
+            )
+        ]
+
+    if status == KEY_VALUE_STATUS_KEY_ONLY and resolution.key_match is not None:
+        entry_text = resolution.key_match.display_label()
+        if mode == KEY_VALUE_MODE_ENTRY:
+            message = (
+                f"{label}: '{value}' ist in der Schlüsselliste {list_label} keine Bezeichnung, sondern nur das "
+                f"Kürzel von '{entry_text}'. Diese Liste enthält Zahlen als Bezeichnungen – eine getippte Zahl "
+                f"gilt als Wert. Ist der Eintrag {entry_text} gemeint, bitte in der Auswahlliste anklicken."
+            )
+        else:
+            message = (
+                f"'{value}' kommt in der Schlüsselliste {list_label} nur als Kürzel vor ({entry_text}), nicht als "
+                "Bezeichnung – nicht automatisch übernommen."
+            )
+        return [
+            AttributeRuleViolation(
+                RULE_KEY_VALUE_KEY_ONLY, RULE_SEVERITY_ERROR, message, short=f"nur als Kürzel gefunden ({entry_text})"
+            )
+        ]
+
+    if status == KEY_VALUE_STATUS_MISMATCH and resolution.key_match is not None:
+        _key_text, entered_label = parse_attribute_key_value_display(value)
+        key_text = resolution.key_match.key_value_id
+        list_text = resolution.key_match.label
+        return [
+            AttributeRuleViolation(
+                RULE_KEY_VALUE_MISMATCH,
+                RULE_SEVERITY_ERROR,
+                f"{label}: Das Kürzel {key_text} bedeutet in der Schlüsselliste {list_label} '{list_text}', "
+                f"nicht '{entered_label}'. Bitte den Wert aus der Liste neu wählen.",
+                short=f"Kürzel {key_text} bedeutet '{list_text}'",
+            )
+        ]
+    return []
+
+
+def attribute_row_violations(
+    row: AttributeRow,
+    other_rows: list[AttributeRow],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    mode: str = KEY_VALUE_MODE_ENTRY,
+    catalog_date: str = "",
+) -> list[AttributeRuleViolation]:
+    """Alle Regelverstoesse EINER Attributzeile (v0.1.58).
+
+    other_rows = die Zeilen des Artikels, gegen die 'Freitextfeld mehrfach' zaehlt - das bestimmt der
+    Aufrufer (PLAN 3.3). Reihenfolge: Format (bisherige Pruefung), Schluesselwert, Bereich (von gleich bis),
+    Laenge (ueber 20 Zeichen), Freitextfeld. Wirft nie.
+    Sind die Kataloge nicht bereit (attribute_key_value_lists_ready), entfallen die Schluesselwert-Regeln
+    ausser 'Wert bis gefüllt'; Bereich, Laenge und Freitextfeld gelten immer."""
+    violations: list[AttributeRuleViolation] = []
+    try:
+        label = row.display_label()
+        format_error = attribute_row_format_error(row)
+        if format_error:
+            prefix = f"{label}: "
+            violations.append(
+                AttributeRuleViolation(
+                    RULE_ATTRIBUTE_FORMAT,
+                    RULE_SEVERITY_ERROR,
+                    format_error,
+                    short=format_error[len(prefix):] if format_error.startswith(prefix) else format_error,
+                )
+            )
+        if is_attribute_key_value_format(row.value_format):
+            if row.value_to.strip():
+                violations.append(
+                    AttributeRuleViolation(
+                        RULE_KEY_VALUE_TO_FILLED,
+                        RULE_SEVERITY_ERROR,
+                        f"{label}: Schlüsselwert-Kriterien haben keinen Bereich – bitte 'Wert bis' leeren.",
+                        short="Wert bis bei Schlüsselwert",
+                        proposal="Wert bis leeren",
+                    )
+                )
+            key_value_violations = _key_value_row_violations(row, attribute_key_values_by_group, mode, catalog_date)
+            violations.extend(key_value_violations)
+        else:
+            key_value_violations = []
+        violations.extend(
+            _attribute_scope_row_violations(row, other_rows, attribute_key_values_by_group, mode, bool(key_value_violations))
+        )
+    except Exception:  # pragma: no cover - die Regel darf Laden, Maske und Pruefung nie abbrechen
+        pass
+    return violations
+
+
+def _attribute_scope_row_violations(
+    row: AttributeRow,
+    other_rows: list[AttributeRow],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    mode: str,
+    key_value_rejected: bool,
+) -> list[AttributeRuleViolation]:
+    """Regeln 9-11 (ab v0.1.58, gelten auch ohne Kataloge): von gleich bis, Wert ueber 20 Zeichen,
+    Freitextfeld mehrfach."""
+    violations: list[AttributeRuleViolation] = []
+    label = row.display_label()
+    value = row.value.strip()
+    value_to = row.value_to.strip()
+    value_format = row.value_format.strip().casefold()
+
+    # Regel 9: Numerisch, Wert und Wert bis sind Zahlen und gleich ('30 bis 30' uebernimmt Apollo nicht).
+    if value_format == "numerisch" and value and value_to:
+        number_from = parse_german_number(value)
+        number_to = parse_german_number(value_to)
+        if number_from is not None and number_to is not None and number_from == number_to:
+            violations.append(
+                AttributeRuleViolation(
+                    RULE_ATTRIBUTE_FROM_EQUALS_TO,
+                    RULE_SEVERITY_ERROR,
+                    f"{label}: 'Wert' und 'Wert bis' sind gleich ({value}) – bitte nur 'Wert' füllen; einen "
+                    "Bereich mit gleichem Anfang und Ende übernimmt Apollo nicht.",
+                    short="von gleich bis",
+                    proposal="Wert bis leeren oder Zeile entfernen",
+                )
+            )
+
+    # Regel 10: Apollo speichert je Attributwert hoechstens ATTRIBUTE_VALUE_MAX_LENGTH Zeichen (210.CritVal).
+    fields: list[tuple[str, str]] = []
+    if is_attribute_key_value_format(row.value_format):
+        if mode == KEY_VALUE_MODE_FILE:
+            fields.append(("Wert", value))   # die Rohzelle wird so geschrieben
+        elif value and not key_value_rejected:
+            # Es zaehlt das Kuerzel (Export = Text vor dem ersten '|'); eine getippte lange Bezeichnung, die
+            # eindeutig aufloest, ist kein Verstoss. Scheitert die Aufloesung, meldet die Schluesselwert-Regel.
+            key_text = value.split("|", 1)[0].strip()
+            if attribute_key_value_lists_ready(attribute_key_values_by_group):
+                resolution = resolve_attribute_key_value(row, value, attribute_key_values_by_group, mode)
+                if resolution.status == KEY_VALUE_STATUS_OK and resolution.option is not None:
+                    key_text = resolution.option.key_value_id.strip()
+            fields.append(("Wert", key_text))
+    elif row.max_length is None or row.max_length > ATTRIBUTE_VALUE_MAX_LENGTH:
+        # Eine Katalog-Laenge bis 20 prueft schon die Formatregel (attribute_row_format_error).
+        fields.extend((("Wert", value), ("Wert bis", value_to)))
+    for field_label, field_text in fields:
+        if len(field_text) > ATTRIBUTE_VALUE_MAX_LENGTH:
+            violations.append(
+                AttributeRuleViolation(
+                    RULE_ATTRIBUTE_TOO_LONG,
+                    RULE_SEVERITY_ERROR,
+                    f"{label}: {field_label} ist länger als {ATTRIBUTE_VALUE_MAX_LENGTH} Zeichen ({len(field_text)}) – "
+                    f"Apollo speichert je Attributwert höchstens {ATTRIBUTE_VALUE_MAX_LENGTH} Zeichen.",
+                    short=f"{field_label} über {ATTRIBUTE_VALUE_MAX_LENGTH} Zeichen ({len(field_text)})",
+                )
+            )
+            break
+
+    # Regel 11: Freitextfelder 9202/9213/9220 nimmt Apollo je Artikel nur einmal (andere Kriterien duerfen
+    # mehrfach vorkommen). Welche Zeilen zaehlen, bestimmt der Aufrufer ueber other_rows.
+    criteria_id = row.criteria_id.strip()
+    if criteria_id in FREE_TEXT_SLOT_IDS and any(other.criteria_id.strip() == criteria_id for other in other_rows):
+        violations.append(
+            AttributeRuleViolation(
+                RULE_ATTRIBUTE_FREE_TEXT_TWICE,
+                RULE_SEVERITY_ERROR,
+                f"{label} ist bei diesem Artikel schon belegt – Apollo übernimmt je Artikel nur eine Zeile "
+                "dieses Freitextfelds.",
+                short="Freitextfeld schon belegt",
+            )
+        )
+    return violations
+
+
+def next_free_text_slot(rows: list[AttributeRow]) -> str:
+    """Erste ID aus FREE_TEXT_SLOT_IDS, die in rows nicht vorkommt; '' wenn alle belegt sind."""
+    used = {row.criteria_id.strip() for row in rows}
+    return next((slot for slot in FREE_TEXT_SLOT_IDS if slot not in used), "")
+
+
+def free_text_slot_proposals(rows: list[AttributeRow]) -> dict[int, str]:
+    """Je ueberzaehliger Freitext-Zeile (Position in rows: zweite und weitere Zeile derselben ID aus
+    FREE_TEXT_SLOT_IDS) das naechste freie Freitextfeld oder ''. Frei = von KEINER Zeile des Artikels belegt
+    und in diesem Durchgang noch nicht vorgeschlagen."""
+    used = {row.criteria_id.strip() for row in rows}
+    seen: set[str] = set()
+    proposals: dict[int, str] = {}
+    for position, row in enumerate(rows):
+        criteria_id = row.criteria_id.strip()
+        if criteria_id not in FREE_TEXT_SLOT_IDS:
+            continue
+        if criteria_id not in seen:
+            seen.add(criteria_id)
+            continue
+        free = next((slot for slot in FREE_TEXT_SLOT_IDS if slot not in used), "")
+        if free:
+            used.add(free)
+        proposals[position] = free
+    return proposals
+
+
+def attribute_row_entry_error(
+    row: AttributeRow,
+    other_rows: list[AttributeRow],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    mode: str = KEY_VALUE_MODE_ENTRY,
+    catalog_date: str = "",
+) -> str:
+    """Meldung des ersten Regelverstosses einer neuen/geaenderten Zeile; '' = annehmbar."""
+    violations = attribute_row_violations(row, other_rows, attribute_key_values_by_group, mode, catalog_date)
+    return violations[0].message if violations else ""
+
+
+def normalize_attribute_entry_row(
+    row: AttributeRow,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    mode: str = KEY_VALUE_MODE_ENTRY,
+) -> AttributeRow:
+    """Schluesselwert-Zeile: Wert auf die Anzeige 'Kuerzel | Bezeichnung' des aufgeloesten Eintrags
+    bringen; nicht aufgeloest oder anderes Format: unveraendert. Wer eine Schluesselwert-Zeile annimmt,
+    formt sie so um - der Export schreibt nur noch den Text vor dem ersten '|'."""
+    if not is_attribute_key_value_format(row.value_format):
+        return row
+    resolution = resolve_attribute_key_value(row, row.value, attribute_key_values_by_group, mode)
+    if resolution.status != KEY_VALUE_STATUS_OK or resolution.option is None:
+        return row
+    display = resolution.option.display_label()
+    return row if display == row.value else dataclass_replace(row, value=display)
 
 
 def normalize_attribute_rows(rows: list[AttributeRow]) -> list[AttributeRow]:
@@ -3296,6 +3922,56 @@ def merge_reference_attribute_rows(
     return order_attribute_rows_by_reference(merged, template.all_ids_in_reference_order)
 
 
+def reference_copy_rule_blocks(
+    copy_rows: list[AttributeRow],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+) -> dict[str, str]:
+    """Kopier-IDs, deren Zeilen im Referenzartikel selbst gegen eine Eingaberegel (Stufe Fehler) verstossen:
+    {Kriterien-ID: Kurztext des ersten Verstosses}. Die 1:1-Zeilen sind Bestand: geprueft im Modus Bestand,
+    in ihrer Reihenfolge (other_rows = die Referenzzeilen davor)."""
+    blocks: dict[str, str] = {}
+    before: list[AttributeRow] = []
+    for row in copy_rows:
+        criteria_id = row.criteria_id.strip()
+        errors = [
+            violation
+            for violation in attribute_row_violations(row, before, attribute_key_values_by_group, KEY_VALUE_MODE_STORED)
+            if violation.severity == RULE_SEVERITY_ERROR
+        ]
+        before.append(row)
+        if errors and criteria_id and criteria_id not in blocks:
+            blocks[criteria_id] = errors[0].short or errors[0].message
+    return blocks
+
+
+def apply_reference_copy_rules(
+    template: "ReferenceTemplate",
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+) -> "ReferenceTemplate":
+    """Vorlage ohne die Zeilen der Kopier-IDs, deren Zeilen im Referenzartikel selbst gegen eine Eingaberegel
+    verstossen; die IDs stehen in rule_blocked_copy_ids (mit Kurztext in rule_blocked_notes). Eine solche ID
+    wird in diesem Lauf weder kopiert noch gesucht noch ersetzt - vorhandene Zeilen der Zielartikel bleiben,
+    wie sie sind (nichts wird wegen der Regeln entfernt). Ohne Verstoss: die Vorlage unveraendert."""
+    blocks = reference_copy_rule_blocks(list(template.copy_rows), attribute_key_values_by_group)
+    if not blocks:
+        return template
+    counts = Counter(row.criteria_id.strip() for row in template.copy_rows)
+    blocked_ids = list(template.rule_blocked_copy_ids)
+    notes = list(template.rule_blocked_notes)
+    for criteria_id, short in blocks.items():
+        if criteria_id in blocked_ids:
+            continue
+        blocked_ids.append(criteria_id)
+        count = counts.get(criteria_id, 0)
+        notes.append(f"{criteria_id}: {short} ({count} Zeile{'n' if count != 1 else ''})")
+    return dataclass_replace(
+        template,
+        copy_rows=[row for row in template.copy_rows if row.criteria_id.strip() not in blocks],
+        rule_blocked_copy_ids=tuple(blocked_ids),
+        rule_blocked_notes=tuple(notes),
+    )
+
+
 def reference_replaced_attribute_rows(rows: list[AttributeRow], template: "ReferenceTemplate") -> list[AttributeRow]:
     """Zeilen eines Artikels (Maske), die merge_reference_attribute_rows durch die
     1:1-Zeilen des Referenzartikels ersetzt: Zeilen der kopierten IDs ohne gleiche
@@ -3594,9 +4270,11 @@ def score_attribute_key_value_match(option: AttributeKeyValueOption, query: str)
 
     score = 0.0
     for token in tokens:
-        if token == key_value_id:
+        # Reihenfolge wie die Aufloesung der Eingabe (ab v0.1.58): Bezeichnung (auch als Zahl gleich,
+        # '12' = '12,0') vor Kuerzel.
+        if token == label or key_value_label_matches(token, option.label):
             score += 5000
-        elif token == label:
+        elif token == key_value_id:
             score += 4500
         elif key_value_id.startswith(token):
             score += 2400
@@ -3615,68 +4293,438 @@ def score_attribute_key_value_match(option: AttributeKeyValueOption, query: str)
     return score
 
 
+# ---------------------------------------------------------------------------
+# Schluessellisten je Kriterium (ab v0.1.58)
+# Der Index bleibt ein einfaches dict (er wird flach kopiert und liegt in ExportBundle
+# bzw. der KI-Batch-Sicherung): Tabellen unter 'herkunft|tabelle', die Liste eines
+# Kriteriums unter '#<Kriterien-ID>', die Marke 'Kataloge vollstaendig' unter '#'.
+# Ein Tabellenschluessel beginnt nie mit '#'.
+# ---------------------------------------------------------------------------
+def attribute_key_value_table_key(source: str, table: str) -> str:
+    """'tecdoc|akkuspannung' - Schluessel einer Schluesseltabelle (Herkunft + Attribut-Tabellenbezeichnung)."""
+    return f"{normalize_lookup_text(source)}|{normalize_attribute_key_value_group(table)}"
+
+
+def attribute_key_value_criteria_key(criteria_id: str) -> str:
+    """'#3465' - Schluessel der Liste eines Kriteriums; '' ohne Kriterien-ID."""
+    criteria_id = str(criteria_id or "").strip()
+    return f"#{criteria_id}" if criteria_id else ""
+
+
+def build_attribute_key_value_index(
+    key_value_options: list[AttributeKeyValueOption],
+    attribute_options: list[AttributeOption] | None = None,
+    assignments: dict[str, KeyListAssignment] | None = None,
+) -> dict[str, list[AttributeKeyValueOption]]:
+    """Schluesselindex nach (Herkunft, Tabelle) und je Schluesselwert-Kriterium.
+
+    Liste eines Kriteriums: 1. feste Zuordnung (assignments; leere Herkunft = Herkunft des Kriteriums;
+    fehlt die Tabelle: [] - KEIN Rueckfall, ein Tippfehler soll nicht still eine andere Liste ergeben),
+    2. sonst die Tabelle mit gleichem Namen UND gleicher Herkunft, 3. sonst [] (keine gueltige Liste).
+    Ohne Schluesselwerte: {}. Ohne Kriterienkatalog oder wenn kein einziges Kriterium eine Liste findet
+    (z. B. Spalte 'Herkunft' fehlt): nur die Tabellen, nicht 'bereit' - dann wird nichts geprueft.
+    Ebenso nicht 'bereit', wenn kein Schluesselwert-Kriterium des Katalogs eine Herkunft traegt (Spalte
+    'Herkunft' fehlt im Attributkatalog): sonst faenden nur die festen Zuordnungen ihre Liste, alle uebrigen
+    Kriterien gaelten still als 'ohne Liste'."""
+    index: dict[str, list[AttributeKeyValueOption]] = {}
+    for option in key_value_options:  # Reihenfolge wie geladen
+        if option.attribute_group.strip():
+            index.setdefault(attribute_key_value_table_key(option.source, option.attribute_group), []).append(option)
+    if not index or not attribute_options:
+        return index
+    assignments = assignments or {}
+    criteria: dict[str, list[AttributeKeyValueOption]] = {}
+    any_criteria_source = False
+    for option in attribute_options:
+        if not is_attribute_key_value_format(option.value_format):
+            continue
+        criteria_key = attribute_key_value_criteria_key(option.criteria_id)
+        if not criteria_key:
+            continue
+        any_criteria_source = any_criteria_source or bool(option.source.strip())
+        assignment = assignments.get(option.criteria_id.strip())
+        if assignment is not None and assignment.table.strip():
+            table_key = attribute_key_value_table_key(assignment.source.strip() or option.source, assignment.table)
+        else:
+            table_key = attribute_key_value_table_key(option.source, option.label)
+        criteria[criteria_key] = index.get(table_key, [])
+    if not any(criteria.values()) or not any_criteria_source:
+        return index
+    index.update(criteria)
+    index[ATTRIBUTE_KEY_VALUE_INDEX_READY_KEY] = []
+    return index
+
+
+def build_attribute_key_value_group_index(
+    options: list[AttributeKeyValueOption],
+) -> dict[str, list[AttributeKeyValueOption]]:
+    """Name bis v0.1.57; liefert nur die Tabellen (ohne Kriterienkatalog gilt der Index als nicht bereit)."""
+    return build_attribute_key_value_index(options)
+
+
+def attribute_key_value_lists_ready(index: dict[str, list[AttributeKeyValueOption]] | None) -> bool:
+    """False = Schluesselwerte oder Kriterienkatalog fehlen: nichts pruefen, deutlich warnen, nichts umschreiben."""
+    return bool(index) and ATTRIBUTE_KEY_VALUE_INDEX_READY_KEY in index
+
+
+def attribute_key_value_list_for(
+    criteria_id: str, index: dict[str, list[AttributeKeyValueOption]]
+) -> list[AttributeKeyValueOption] | None:
+    """None = dem Index unbekannt (kein Schluesselwert-Kriterium des Katalogs); [] = keine gueltige Liste."""
+    key = attribute_key_value_criteria_key(criteria_id)
+    return index.get(key) if key else None
+
+
+def attribute_key_value_list_label(options: list[AttributeKeyValueOption] | None) -> str:
+    """'TecDoc/Akkuspannung'; '' ohne Liste."""
+    return f"{options[0].source}/{options[0].attribute_group}" if options else ""
+
+
+def _attribute_key_value_table_items(
+    index: dict[str, list[AttributeKeyValueOption]],
+) -> list[tuple[str, list[AttributeKeyValueOption]]]:
+    return [(key, options) for key, options in index.items() if not key.startswith("#") and options]
+
+
+def attribute_key_value_longest_key(index: dict[str, list[AttributeKeyValueOption]]) -> int:
+    """Laengstes Kuerzel ueber alle Tabellen (Katalog vom 02.06.2026: 3)."""
+    longest = 0
+    for _key, options in _attribute_key_value_table_items(index):
+        for option in options:
+            longest = max(longest, len(option.key_value_id.strip()))
+    return longest
+
+
+def attribute_key_value_tables(
+    index: dict[str, list[AttributeKeyValueOption]], preview: int = 6
+) -> list[tuple[str, str, str, int, str]]:
+    """Alle Schluesseltabellen fuer den Zuordnungsdialog: (Tabellenschluessel, Herkunft, Name, Anzahl,
+    erste Eintraege '1 = ja; 0 = nein; 2 = optional'), sortiert nach Herkunft und Name."""
+    tables: list[tuple[str, str, str, int, str]] = []
+    for key, options in _attribute_key_value_table_items(index):
+        first = options[0]
+        preview_text = "; ".join(
+            f"{option.key_value_id} = {option.label}" if option.label.strip() else option.key_value_id
+            for option in options[:preview]
+        )
+        tables.append((key, first.source, first.attribute_group, len(options), preview_text))
+    tables.sort(key=lambda entry: (entry[1].casefold(), entry[2].casefold()))
+    return tables
+
+
+def attribute_key_value_index_stats(
+    index: dict[str, list[AttributeKeyValueOption]],
+    assignments: dict[str, KeyListAssignment] | None = None,
+) -> dict[str, object]:
+    """Zaehlung fuer Datenstaemme und Tests: Schluessel, Tabellen (gesamt und je Herkunft),
+    Schluesselwert-Kriterien mit/ohne Liste, feste Zuordnungen ohne Tabelle in der Schluesselwertdatei."""
+    tables = _attribute_key_value_table_items(index)
+    by_source = Counter(options[0].source for _key, options in tables)
+    criteria = {
+        key: options
+        for key, options in index.items()
+        if key.startswith("#") and key != ATTRIBUTE_KEY_VALUE_INDEX_READY_KEY
+    }
+    missing = sorted(
+        criteria_id
+        for criteria_id, assignment in (assignments or {}).items()
+        if assignment.table.strip() and criteria.get(attribute_key_value_criteria_key(criteria_id)) == []
+    )
+    return {
+        "ready": attribute_key_value_lists_ready(index),
+        "keys": sum(len(options) for _key, options in tables),
+        "tables": len(tables),
+        "tables_by_source": dict(by_source),
+        "criteria_with_list": sum(1 for options in criteria.values() if options),
+        "criteria_without_list": sum(1 for options in criteria.values() if not options),
+        "assignments_missing_table": missing,
+    }
+
+
+def _german_count(number: int) -> str:
+    return f"{number:,}".replace(",", ".")
+
+
+def attribute_key_value_count_text(key_value_count: int, stats: dict[str, object], catalog_date: str = "") -> str:
+    """Zaehler 'Schlüsselwerte XLSX' unter Datenstaemme, z. B. '19.068 Schlüsselwerte in 642 Listen (Stand der
+    Datei: 02.06.2026) – 397 Schlüsselwert-Kriterien mit Liste, 685 ohne'."""
+    if key_value_count <= 0:
+        return "0 Schlüsselwerte geladen"
+    stand = f" (Stand der Datei: {catalog_date})" if catalog_date else ""
+    text = f"{_german_count(key_value_count)} Schlüsselwerte in {_german_count(int(stats.get('tables', 0)))} Listen{stand}"
+    if stats.get("ready"):
+        text += (
+            f" – {_german_count(int(stats.get('criteria_with_list', 0)))} Schlüsselwert-Kriterien mit Liste, "
+            f"{_german_count(int(stats.get('criteria_without_list', 0)))} ohne"
+        )
+    else:
+        text += " – Attributkatalog fehlt bzw. keine Liste gefunden: Schlüsselwerte werden NICHT geprüft"
+    return text
+
+
+def key_list_mapping_count_text(
+    assignments: dict[str, KeyListAssignment],
+    file_entries: dict[str, KeyListAssignment] | None = None,
+    session_entries: dict[str, KeyListAssignment] | None = None,
+    stats: dict[str, object] | None = None,
+) -> str:
+    """Zaehler 'Schlüssellisten-Zuordnung XLSX', z. B. '3 Zuordnungen aus der Datei, 9 Programm-Vorgaben'
+    (+ ', 1 nur diese Sitzung', + ', 1 zugeordnete Liste fehlt in der Schlüsselwertdatei')."""
+    file_ids = set(file_entries or {})
+    session_ids = set(session_entries or {})
+    builtin = sum(
+        1 for criteria_id, entry in assignments.items()
+        if entry.builtin and criteria_id not in file_ids and criteria_id not in session_ids
+    )
+    parts = [f"{len(file_ids)} Zuordnung{'en' if len(file_ids) != 1 else ''} aus der Datei", f"{builtin} Programm-Vorgaben"]
+    if session_ids:
+        parts.append(f"{len(session_ids)} nur diese Sitzung")
+    missing = list((stats or {}).get("assignments_missing_table") or [])
+    if missing:
+        parts.append(
+            f"{len(missing)} zugeordnete Liste{'n fehlen' if len(missing) != 1 else ' fehlt'} in der Schlüsselwertdatei"
+        )
+    return ", ".join(parts)
+
+
+_KEY_LIST_NAME_PREFIXES = ("912_SL_", "SL_", "W-", "W_", "Stg_", "GC_", "KT_")
+
+
+def _key_list_name_stem(name: str) -> str:
+    """Namensstamm fuer 'namensaehnlich': Einheit in eckigen Klammern und bekannte Praefixe entfernt,
+    '_', '-', '/' als Leerzeichen. Nur fuer Vorschlaege im Zuordnungsdialog - nie automatisch."""
+    text = re.sub(r"\[[^\]]*\]", " ", str(name or "")).strip()
+    for prefix in _KEY_LIST_NAME_PREFIXES:
+        if text.casefold().startswith(prefix.casefold()):
+            text = text[len(prefix):]
+            break
+    return normalize_lookup_text(re.sub(r"[_\-/]+", " ", text))
+
+
+def suggest_key_lists_for_criterion(
+    option: AttributeOption, index: dict[str, list[AttributeKeyValueOption]]
+) -> list[tuple[str, str]]:
+    """Vorschlaege (Tabellenschluessel, Grund) fuer den Zuordnungsdialog in der Reihenfolge
+    Programm-Vorschlag -> namensaehnlich bei gleicher Herkunft -> gleichnamig, andere Herkunft."""
+    suggestions: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(table_key: str, reason: str) -> None:
+        if table_key in seen or table_key.startswith("#") or not index.get(table_key):
+            return
+        seen.add(table_key)
+        suggestions.append((table_key, reason))
+
+    suggested = SUGGESTED_KEY_LIST_ASSIGNMENTS.get(option.criteria_id.strip())
+    if suggested is not None:
+        add(attribute_key_value_table_key(suggested.source or option.source, suggested.table), "Vorschlag (wahrscheinlich)")
+    own_source = normalize_lookup_text(option.source)
+    own_name = normalize_attribute_key_value_group(option.label)
+    own_stem = _key_list_name_stem(option.label)
+    tables = _attribute_key_value_table_items(index)
+    for table_key, options in tables:
+        if table_key.partition("|")[0] == own_source and own_stem and _key_list_name_stem(options[0].attribute_group) == own_stem:
+            add(table_key, "namensähnlich")
+    for table_key, _options in tables:
+        source_key, _separator, name_key = table_key.partition("|")
+        if source_key != own_source and own_name and name_key == own_name:
+            add(table_key, "gleichnamig – andere Herkunft")
+    return suggestions
+
+
+def attribute_option_choice_label(option: AttributeOption) -> str:
+    """Anzeige eines Kriteriums in den Auswahllisten: Nummer, Bezeichnung UND Herkunft - gleichnamige
+    Kriterien (468/9084 Material, 3465/9410 Akkuspannung) bleiben unterscheidbar."""
+    source = option.source.strip()
+    return f"{option.display_label()} | {source}" if source else option.display_label()
+
+
+_KEY_VALUE_NUMBER_PATTERN = re.compile(r"[+-]?\d+(?:[.,]\d+)?")
+
+
+def key_value_number(text: str) -> float | None:
+    """Zahl nur bei reiner Ziffernform ('12', '3,7', '12,0', '-5'); sonst None. Bewusst strenger als
+    parse_german_number, das ueber float() auch 'Infinity' oder '1e5' annimmt."""
+    value = str(text or "").strip()
+    if not _KEY_VALUE_NUMBER_PATTERN.fullmatch(value):
+        return None
+    return float(value.replace(",", "."))
+
+
+def key_value_label_matches(text: str, label: str) -> bool:
+    """Trifft text die Bezeichnung? Als Text gleich (Gross/Klein, Umlaute, Leerraum) oder beide Seiten
+    reine Zahlen und gleich ('12' = '12,0')."""
+    text_key = normalize_lookup_text(text)
+    if not text_key:
+        # Bezeichnung nur aus Zeichen, die normalize_lookup_text verwirft (z. B. '±' in TecDoc-Liste 4365):
+        # dann als Text ohne Gross/Klein und Leerraum vergleichen.
+        raw_text = " ".join(str(text or "").split()).casefold()
+        return bool(raw_text) and raw_text == " ".join(str(label or "").split()).casefold()
+    if text_key == normalize_lookup_text(label):
+        return True
+    text_number = key_value_number(text)
+    return text_number is not None and text_number == key_value_number(label)
+
+
+# Nachschlagetabellen je Schluesselliste (Kuerzel und Bezeichnungen normalisiert). Der Eintrag haelt die
+# Liste selbst fest - ihre id() kann deshalb nicht neu vergeben werden, solange er lebt.
+_KEY_VALUE_LOOKUP_CACHE: dict[int, tuple[object, int, dict, list, bool]] = {}
+
+
+def _key_value_list_lookup(
+    options: list[AttributeKeyValueOption],
+) -> tuple[dict[str, AttributeKeyValueOption], list[tuple[str, float | None, AttributeKeyValueOption]], bool]:
+    cached = _KEY_VALUE_LOOKUP_CACHE.get(id(options))
+    if cached is not None and cached[0] is options and cached[1] == len(options):
+        return cached[2], cached[3], cached[4]
+    by_key: dict[str, AttributeKeyValueOption] = {}
+    labels: list[tuple[str, float | None, AttributeKeyValueOption]] = []
+    numeric = False
+    for option in options:
+        by_key.setdefault(normalize_lookup_text(option.key_value_id), option)  # Kuerzel sind Text: '01' != '1'
+        number = key_value_number(option.label)
+        numeric = numeric or number is not None
+        labels.append((normalize_lookup_text(option.label), number, option))
+    if len(_KEY_VALUE_LOOKUP_CACHE) > 4096:
+        _KEY_VALUE_LOOKUP_CACHE.clear()
+    _KEY_VALUE_LOOKUP_CACHE[id(options)] = (options, len(options), by_key, labels, numeric)
+    return by_key, labels, numeric
+
+
+def key_value_list_has_numeric_labels(options: list[AttributeKeyValueOption] | None) -> bool:
+    """Zahlenliste: mindestens eine Bezeichnung ist eine Zahl (u. a. Akkuspannung, Akkukapazitaet).
+    Dort gilt eine getippte Zahl als Wert, nie still als Kuerzel."""
+    if not options:
+        return False
+    return _key_value_list_lookup(options)[2]
+
+
+def key_value_text_is_key_shaped(
+    text: str, options: list[AttributeKeyValueOption] | None, longest_key: int
+) -> bool:
+    """Koennte text der Form nach ein Kuerzel sein, das der Katalogdatei nur fehlt (in IMS gesperrt oder
+    neuer als der Export)?
+    - kein Leerraum, kein '|';
+    - mit Liste: hoechstens eine Stelle laenger als ihr laengstes Kuerzel; besteht die Liste nur aus
+      Ziffern-Kuerzeln (0-9), muss auch text nur aus Ziffern bestehen - ein Formvergleich, keine Umwandlung;
+    - ohne Liste: hoechstens longest_key + 1 Zeichen (longest_key = laengstes Kuerzel des ganzen Katalogs)."""
+    value = str(text or "").strip()
+    if not value or "|" in value or any(character.isspace() for character in value):
+        return False
+    if options:
+        keys = [option.key_value_id.strip() for option in options if option.key_value_id.strip()]
+        if not keys:
+            return False
+        if len(value) > max(len(key) for key in keys) + 1:
+            return False
+        if all(key.isascii() and key.isdigit() for key in keys):
+            return value.isascii() and value.isdigit()
+        return True
+    return len(value) <= longest_key + 1
+
+
+def resolve_attribute_key_value(
+    row: AttributeRow,
+    raw_value: str,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    mode: str = KEY_VALUE_MODE_STORED,
+) -> KeyValueResolution:
+    """Wert einer Schluesselwert-Zeile gegen die Schluesselliste ihres Kriteriums aufloesen.
+
+    Kuerzel werden immer als Text verglichen (normalize_lookup_text: 'DS' = 'ds', aber '01' != '1'),
+    nie in Zahlen gewandelt; es gibt in keinem Modus einen Teiltreffer.
+    Datei:   die Rohzelle muss das Kuerzel selbst sein (ein '|' ist nie ein Kuerzel).
+    Bestand: es zaehlt das Kuerzel ('K | B' -> K; die Bezeichnung dahinter wird nicht geprueft).
+    Eingabe: zuerst die Bezeichnung (auch als Zahl gleich), dann das Kuerzel; ist der Text Bezeichnung
+             eines Eintrags UND Kuerzel eines anderen (oder Bezeichnung mehrerer): doppeldeutig. In einer
+             Zahlenliste gilt eine getippte Zahl als Wert - nur Kuerzel: 'nur_kuerzel'.
+    Text:    wie Eingabe, aber ein nacktes Kuerzel wird nie automatisch angenommen ('nur_kuerzel')."""
+    value = str(raw_value or "").strip()
+    if not value:
+        return KeyValueResolution(KEY_VALUE_STATUS_EMPTY)
+    if not attribute_key_value_lists_ready(attribute_key_values_by_group):
+        return KeyValueResolution(KEY_VALUE_STATUS_UNCHECKED)
+    options = attribute_key_value_list_for(row.criteria_id, attribute_key_values_by_group)
+    if not options:
+        return KeyValueResolution(KEY_VALUE_STATUS_NO_LIST)
+    list_label = attribute_key_value_list_label(options)
+    list_size = len(options)
+    by_key, labels, numeric_labels = _key_value_list_lookup(options)
+
+    def result(status: str, **details: object) -> KeyValueResolution:
+        return KeyValueResolution(status, list_label=list_label, list_size=list_size, **details)  # type: ignore[arg-type]
+
+    def label_matches_for(text: str) -> tuple[AttributeKeyValueOption, ...]:
+        text_key = normalize_lookup_text(text)
+        if not text_key:
+            return tuple(option for _label_key, _number, option in labels if key_value_label_matches(text, option.label))
+        text_number = key_value_number(text)
+        return tuple(
+            option
+            for label_key, label_number, option in labels
+            if (text_key and text_key == label_key) or (text_number is not None and text_number == label_number)
+        )
+
+    has_separator = "|" in value
+    if mode == KEY_VALUE_MODE_FILE:
+        key_match = None if has_separator else by_key.get(normalize_lookup_text(value))
+        if key_match is not None:
+            return result(KEY_VALUE_STATUS_OK, option=key_match, key_match=key_match)
+        return result(KEY_VALUE_STATUS_UNKNOWN, label_matches=() if has_separator else label_matches_for(value))
+
+    if mode == KEY_VALUE_MODE_STORED:
+        key_text = parse_attribute_key_value_display(value)[0] if has_separator else value
+        key_match = by_key.get(normalize_lookup_text(key_text)) if key_text else None
+        if key_match is not None:
+            return result(KEY_VALUE_STATUS_OK, option=key_match, key_match=key_match)
+        return result(KEY_VALUE_STATUS_UNKNOWN, label_matches=() if has_separator else label_matches_for(value))
+
+    # Eingabe und Text
+    if has_separator:
+        key_text, label_text = parse_attribute_key_value_display(value)
+        key_match = by_key.get(normalize_lookup_text(key_text)) if key_text else None
+        if key_match is not None:
+            if not label_text or key_value_label_matches(label_text, key_match.label):
+                return result(KEY_VALUE_STATUS_OK, option=key_match, key_match=key_match)
+            return result(KEY_VALUE_STATUS_MISMATCH, key_match=key_match)
+        # 'K | B' und K ist kein Kuerzel: weiter mit dem ganzen Text
+    label_matches = label_matches_for(value)
+    key_match = by_key.get(normalize_lookup_text(value))
+    if len(label_matches) > 1:
+        return result(KEY_VALUE_STATUS_AMBIGUOUS, label_matches=label_matches, key_match=key_match)
+    if len(label_matches) == 1:
+        if key_match is not None and key_match is not label_matches[0]:
+            return result(KEY_VALUE_STATUS_AMBIGUOUS, label_matches=label_matches, key_match=key_match)
+        return result(KEY_VALUE_STATUS_OK, option=label_matches[0], label_matches=label_matches, key_match=key_match)
+    if key_match is not None:
+        if mode == KEY_VALUE_MODE_TEXT or (numeric_labels and key_value_number(value) is not None):
+            return result(KEY_VALUE_STATUS_KEY_ONLY, key_match=key_match)
+        return result(KEY_VALUE_STATUS_OK, option=key_match, key_match=key_match)
+    return result(KEY_VALUE_STATUS_UNKNOWN)
+
+
 def resolve_attribute_key_value_option(
     row: AttributeRow,
     raw_value: str,
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    mode: str = KEY_VALUE_MODE_STORED,
 ) -> AttributeKeyValueOption | None:
-    value = raw_value.strip()
-    if not value:
-        return None
-
-    group_options: list[AttributeKeyValueOption] = []
-    for group_key in row.key_value_group_candidates():
-        group_options = attribute_key_values_by_group.get(group_key, [])
-        if group_options:
-            break
-    if not group_options:
-        return None
-
-    value_key = normalize_lookup_text(value)
-    key_value_id, key_value_label = parse_attribute_key_value_display(value)
-    key_value_id_key = normalize_lookup_text(key_value_id)
-    key_value_label_key = normalize_lookup_text(key_value_label)
-
-    for option in group_options:
-        if value_key and value_key == normalize_lookup_text(option.display_label()):
-            return option
-    for option in group_options:
-        if key_value_id_key and key_value_id_key == normalize_lookup_text(option.key_value_id):
-            return option
-
-    exact_label_matches = [option for option in group_options if value_key and value_key == normalize_lookup_text(option.label)]
-    if len(exact_label_matches) == 1:
-        return exact_label_matches[0]
-
-    parsed_label_matches = [option for option in group_options if key_value_label_key and key_value_label_key == normalize_lookup_text(option.label)]
-    if len(parsed_label_matches) == 1:
-        return parsed_label_matches[0]
-
-    partial_matches = [
-        option
-        for option in group_options
-        if value_key
-        and (
-            value_key in normalize_lookup_text(option.display_label())
-            or value_key in normalize_lookup_text(option.label)
-            or value_key in normalize_lookup_text(option.key_value_id)
-        )
-    ]
-    if len(partial_matches) == 1:
-        return partial_matches[0]
-    return None
+    """Duenne Huelle um resolve_attribute_key_value: der Treffer oder None."""
+    resolution = resolve_attribute_key_value(row, raw_value, attribute_key_values_by_group, mode)
+    return resolution.option if resolution.status == KEY_VALUE_STATUS_OK else None
 
 
 def resolve_attribute_export_value(
     row: AttributeRow,
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
 ) -> str:
+    """Was der Export einer Schluesselwert-Zeile schreibt (ab v0.1.58 unabhaengig vom Katalog): den Text
+    vor dem ersten '|', sonst den Text selbst. Beim Schreiben wird nichts mehr aufgeloest - Bestandszeilen
+    kommen so heraus, wie sie in der Datei stehen; neue Zeilen formt die Annahme um (normalize_attribute_entry_row).
+    Der zweite Parameter bleibt in der Signatur und wird nicht ausgewertet."""
     raw_value = row.value.strip()
     if not raw_value:
         return ""
-    option = resolve_attribute_key_value_option(row, raw_value, attribute_key_values_by_group)
-    if option is not None:
-        return option.key_value_id
     key_value_id, _key_value_label = parse_attribute_key_value_display(raw_value)
     return key_value_id or raw_value
 
@@ -3685,23 +4733,15 @@ def resolve_attribute_key_value_display_value(
     row: AttributeRow,
     attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
 ) -> str:
+    """Dateiwert -> Anzeige beim Laden (Modus Bestand): 'Kuerzel | Bezeichnung' bei gueltigem Kuerzel,
+    sonst der Rohwert (Klartext bleibt Klartext und wird in der Maske markiert)."""
     raw_value = row.value.strip()
     if not raw_value:
         return ""
-    option = resolve_attribute_key_value_option(row, raw_value, attribute_key_values_by_group)
-    return option.display_label() if option is not None else raw_value
-
-
-def build_attribute_key_value_group_index(
-    options: list[AttributeKeyValueOption],
-) -> dict[str, list[AttributeKeyValueOption]]:
-    grouped: dict[str, list[AttributeKeyValueOption]] = {}
-    for option in options:
-        group_key = normalize_attribute_key_value_group(option.attribute_group)
-        if not group_key:
-            continue
-        grouped.setdefault(group_key, []).append(option)
-    return grouped
+    resolution = resolve_attribute_key_value(row, raw_value, attribute_key_values_by_group, KEY_VALUE_MODE_STORED)
+    if resolution.status == KEY_VALUE_STATUS_OK and resolution.option is not None:
+        return resolution.option.display_label()
+    return raw_value
 
 
 def normalize_article_number(value: str) -> str:
@@ -3887,7 +4927,7 @@ def _format_vehicle_date(value: object) -> str:
 # geschrieben. Der Cache ist reine Beschleunigung - ohne ihn laeuft alles wie
 # bisher.
 # ---------------------------------------------------------------------------
-CATALOG_CACHE_FORMAT_VERSION = 1
+CATALOG_CACHE_FORMAT_VERSION = 2
 CATALOG_CACHE_DIR_NAME = "Apollo Import GUI"
 
 CatalogT = TypeVar("CatalogT")
@@ -4353,6 +5393,318 @@ def append_attribute_mapping_entries(workbook_path: Path, entries: list[tuple[st
     workbook.save(workbook_path)
 
 
+# ---------------------------------------------------------------------------
+# Zuordnungsdatei Kriterium -> Schluesselliste (ab v0.1.58), ohne GUI testbar
+# ---------------------------------------------------------------------------
+def _catalog_cell_text(value: object) -> str:
+    """Zelle einer Katalog-/Zuordnungsdatei als Text: None -> ''; Text -> strip(); ganze Zahl bzw.
+    Gleitkommazahl ohne Nachkommaanteil -> die Ziffernfolge (1.0 -> '1', 0 -> '0'); sonst str().
+    Text wird nie in Zahlen gewandelt - fuehrende Nullen und Buchstaben-Kuerzel bleiben, wie sie sind.
+    (str(value or '') machte aus dem Kuerzel 0 eine leere Zelle.)"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and value == value and value not in (float("inf"), float("-inf")) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _key_list_criteria_id_text(value: object) -> str:
+    criteria_id = _catalog_cell_text(value)
+    if criteria_id.endswith(".0") and criteria_id[:-2].isdigit():
+        criteria_id = criteria_id[:-2]
+    return criteria_id
+
+
+def _key_list_mapping_columns(header_row: Iterable[object]) -> dict[str, int]:
+    """Spaltenindex je Feld von KeyListAssignment aus der Kopfzeile (normalize_header_key wirft das 'ü' weg)."""
+    header_map: dict[str, int] = {}
+    for index, value in enumerate(header_row):
+        key = normalize_header_key(_catalog_cell_text(value))
+        if key and key not in header_map:
+            header_map[key] = index
+    columns: dict[str, int] = {}
+    for field_name, header_keys in (
+        ("criteria_id", ("tecdockriterienid",)),
+        ("label", ("kriterium",)),
+        ("source", ("herkunft",)),
+        ("table", ("attributtabellenbezeichnung",)),
+        ("note", ("hinweis",)),
+        ("assigned_at", ("zugeordnetam",)),
+        ("previous_source", ("bisherigeherkunft",)),
+        ("previous_table", ("bisherigetabelle",)),
+        ("stock_checked_at", ("bestandgeprftam", "bestandgeprueftam")),
+    ):
+        for header_key in header_keys:
+            if header_key in header_map:
+                columns[field_name] = header_map[header_key]
+                break
+    return columns
+
+
+class KeyListAssignmentConflict(ValueError):
+    """Die Zuordnungsdatei enthaelt fuer das Kriterium inzwischen einen anderen Eintrag (anderer Arbeitsplatz)."""
+
+    def __init__(self, message: str, current: KeyListAssignment | None = None) -> None:
+        super().__init__(message)
+        self.current = current
+
+
+def load_attribute_key_list_assignments(workbook_path: Path) -> dict[str, KeyListAssignment]:
+    """Lädt die Zuordnung Schlüsselwert-Kriterium -> Schlüsselliste. Fehlende Datei: {}; nicht lesbar oder
+    Pflichtspalten fehlen: ValueError. Zeilen ohne ID oder ohne Tabelle werden übersprungen, die spätere
+    Zeile gewinnt."""
+    if not path_exists_safe(workbook_path):
+        return {}
+    try:
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+    except Exception as exc:
+        raise ValueError(f"Schlüssellisten-Zuordnung konnte nicht geladen werden: {exc}") from exc
+    try:
+        sheet_name = (
+            ATTRIBUTE_KEY_LIST_MAPPING_SHEET
+            if ATTRIBUTE_KEY_LIST_MAPPING_SHEET in workbook.sheetnames
+            else workbook.sheetnames[0]
+        )
+        row_iter = workbook[sheet_name].iter_rows(values_only=True)
+        header_row = next(row_iter, None)
+        columns = _key_list_mapping_columns(header_row or ())
+        if columns.get("criteria_id") is None or columns.get("table") is None:
+            raise ValueError(
+                "In der Schlüssellisten-Zuordnung fehlen die Spalten 'TecDoc Kriterien ID' und "
+                "'Attribut-Tabellenbezeichnung'."
+            )
+        assignments: dict[str, KeyListAssignment] = {}
+        for values in row_iter:
+
+            def cell(field_name: str) -> str:
+                index = columns.get(field_name)
+                if index is None or index >= len(values):
+                    return ""
+                return _catalog_cell_text(values[index])
+
+            criteria_id = _key_list_criteria_id_text(cell("criteria_id"))
+            table = cell("table")
+            if not criteria_id or not table:
+                continue
+            assignments[criteria_id] = KeyListAssignment(
+                criteria_id=criteria_id,
+                source=cell("source"),
+                table=table,
+                note=cell("note"),
+                assigned_at=cell("assigned_at"),
+                previous_source=cell("previous_source"),
+                previous_table=cell("previous_table"),
+                stock_checked_at=cell("stock_checked_at"),
+            )
+        return assignments
+    finally:
+        workbook.close()
+
+
+def merge_key_list_assignments(*layers: dict[str, KeyListAssignment]) -> dict[str, KeyListAssignment]:
+    """Spaetere Schicht gewinnt je Kriterien-ID: Programm-Vorgaben < Datei < nur-diese-Sitzung."""
+    merged: dict[str, KeyListAssignment] = {}
+    for layer in layers:
+        merged.update(layer or {})
+    return merged
+
+
+def _key_list_assignment_identity(entry: KeyListAssignment | None) -> tuple[str, str, str] | None:
+    if entry is None:
+        return None
+    return (entry.source.strip(), entry.table.strip(), entry.assigned_at.strip())
+
+
+def _check_key_list_assignment_conflict(
+    workbook_path: Path, criteria_id: str, known_file_entry: KeyListAssignment | None
+) -> None:
+    """Datei frisch lesen und mit dem bekannten Stand der Zeile vergleichen (Herkunft, Tabelle, Zugeordnet am)."""
+    current = load_attribute_key_list_assignments(workbook_path).get(criteria_id)
+    if _key_list_assignment_identity(current) != _key_list_assignment_identity(known_file_entry):
+        raise KeyListAssignmentConflict(
+            f"Die Schlüssellisten-Zuordnung für {criteria_id} wurde inzwischen geändert.", current
+        )
+
+
+def _save_workbook_via_temp(workbook: Workbook, path: Path) -> None:
+    """Schreiben ueber Temp-Datei + os.replace (Muster write_import_delete_list)."""
+    temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    try:
+        workbook.save(temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def _open_key_list_mapping_for_write(workbook_path: Path) -> tuple[Workbook, Any, dict[str, int]]:
+    """Zuordnungsdatei zum Aendern oeffnen (alle Blaetter/Spalten bleiben) bzw. neu anlegen (Blatt 'Zuordnung'
+    mit Kopf, Blatt 'GenArt ohne Fahrzeuge' mit Kopf und den Vorgaben). Fehlende Spalten werden angehaengt."""
+    if path_exists_safe(workbook_path):
+        workbook = load_workbook(workbook_path)
+        worksheet = (
+            workbook[ATTRIBUTE_KEY_LIST_MAPPING_SHEET]
+            if ATTRIBUTE_KEY_LIST_MAPPING_SHEET in workbook.sheetnames
+            else workbook.worksheets[0]
+        )
+    else:
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = ATTRIBUTE_KEY_LIST_MAPPING_SHEET
+        worksheet.append(list(ATTRIBUTE_KEY_LIST_MAPPING_HEADERS))
+        genart_sheet = workbook.create_sheet(GENARTS_WITHOUT_VEHICLES_SHEET)
+        genart_sheet.append(list(GENARTS_WITHOUT_VEHICLES_HEADERS))
+        for genart_id in DEFAULT_GENARTS_WITHOUT_VEHICLES:
+            genart_sheet.append([genart_id, "Vorgabe"])
+    header_row = [cell.value for cell in worksheet[1]] if worksheet.max_row >= 1 else []
+    while header_row and _catalog_cell_text(header_row[-1]) == "":
+        header_row.pop()
+    columns = _key_list_mapping_columns(header_row)
+    width = len(header_row)
+    for field_name, header in zip(
+        ("criteria_id", "label", "source", "table", "note", "assigned_at", "previous_source", "previous_table", "stock_checked_at"),
+        ATTRIBUTE_KEY_LIST_MAPPING_HEADERS,
+    ):
+        if field_name not in columns:
+            worksheet.cell(row=1, column=width + 1, value=header)
+            columns[field_name] = width
+            width += 1
+    return workbook, worksheet, columns
+
+
+def _key_list_mapping_rows_of(worksheet: Any, columns: dict[str, int], criteria_id: str) -> list[int]:
+    id_column = columns["criteria_id"] + 1
+    return [
+        row_number
+        for row_number in range(2, worksheet.max_row + 1)
+        if _key_list_criteria_id_text(worksheet.cell(row=row_number, column=id_column).value) == criteria_id
+    ]
+
+
+def save_attribute_key_list_assignment(
+    workbook_path: Path,
+    assignment: KeyListAssignment,
+    criteria_label: str = "",
+    known_file_entry: KeyListAssignment | None = None,
+    check_known: bool = True,
+) -> None:
+    """Zuordnung eines Kriteriums in die Zuordnungsdatei schreiben (Upsert je Kriterien-ID, alles als Text).
+
+    check_known: die Datei wird frisch gelesen; weicht ihre Zeile der ID (Herkunft, Tabelle, Zugeordnet am)
+    von known_file_entry ab -> KeyListAssignmentConflict, nichts wird geschrieben. So ueberschreibt niemand
+    unbemerkt die Wahl eines Kollegen. Fehlt die Datei, wird sie angelegt. OSError geht an den Aufrufer."""
+    criteria_id = assignment.criteria_id.strip()
+    if not criteria_id or not assignment.table.strip():
+        raise ValueError("Schlüssellisten-Zuordnung: Kriterien-ID und Attribut-Tabellenbezeichnung werden benötigt.")
+    if check_known:
+        _check_key_list_assignment_conflict(workbook_path, criteria_id, known_file_entry)
+    workbook, worksheet, columns = _open_key_list_mapping_for_write(workbook_path)
+    try:
+        matching = _key_list_mapping_rows_of(worksheet, columns, criteria_id)
+        if matching:
+            target_row = matching[-1]  # beim Lesen gewinnt die spaetere Zeile
+            for row_number in reversed(matching[:-1]):
+                worksheet.delete_rows(row_number)
+                target_row -= 1
+        else:
+            target_row = worksheet.max_row + 1
+        values = {
+            "criteria_id": criteria_id,
+            "label": criteria_label.strip(),
+            "source": assignment.source.strip(),
+            "table": assignment.table.strip(),
+            "note": assignment.note.strip(),
+            "assigned_at": assignment.assigned_at.strip(),
+            "previous_source": assignment.previous_source.strip(),
+            "previous_table": assignment.previous_table.strip(),
+            "stock_checked_at": assignment.stock_checked_at.strip(),
+        }
+        for field_name, text in values.items():
+            if field_name == "label" and not text and matching:
+                continue  # vorhandene Bezeichnung nicht leeren
+            worksheet.cell(row=target_row, column=columns[field_name] + 1).value = text or None
+        _save_workbook_via_temp(workbook, workbook_path)
+    finally:
+        workbook.close()
+
+
+def remove_attribute_key_list_assignment(
+    workbook_path: Path,
+    criteria_id: str,
+    known_file_entry: KeyListAssignment | None = None,
+    check_known: bool = True,
+) -> bool:
+    """Zeile(n) der Kriterien-ID aus der Zuordnungsdatei entfernen (True = etwas entfernt); dieselbe
+    Konfliktpruefung und Schreibtechnik wie save_attribute_key_list_assignment."""
+    criteria_id = str(criteria_id or "").strip()
+    if not criteria_id or not path_exists_safe(workbook_path):
+        return False
+    if check_known:
+        _check_key_list_assignment_conflict(workbook_path, criteria_id, known_file_entry)
+    workbook, worksheet, columns = _open_key_list_mapping_for_write(workbook_path)
+    try:
+        matching = _key_list_mapping_rows_of(worksheet, columns, criteria_id)
+        if not matching:
+            return False
+        for row_number in reversed(matching):
+            worksheet.delete_rows(row_number)
+        _save_workbook_via_temp(workbook, workbook_path)
+        return True
+    finally:
+        workbook.close()
+
+
+def load_genarts_without_vehicles(workbook_path: Path) -> tuple[str, ...]:
+    """GenArten, an denen Apollo keine Fahrzeuge fuehrt: Blatt GENARTS_WITHOUT_VEHICLES_SHEET, Spalte
+    'GenArt ID'. Fehlen Datei, Blatt oder Spalte (oder ist die Datei nicht lesbar): die Vorgabe."""
+    if not path_exists_safe(workbook_path):
+        return DEFAULT_GENARTS_WITHOUT_VEHICLES
+    try:
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+    except Exception:
+        return DEFAULT_GENARTS_WITHOUT_VEHICLES
+    try:
+        if GENARTS_WITHOUT_VEHICLES_SHEET not in workbook.sheetnames:
+            return DEFAULT_GENARTS_WITHOUT_VEHICLES
+        row_iter = workbook[GENARTS_WITHOUT_VEHICLES_SHEET].iter_rows(values_only=True)
+        header_row = next(row_iter, None) or ()
+        id_index = next(
+            (index for index, value in enumerate(header_row) if normalize_header_key(_catalog_cell_text(value)) == "genartid"),
+            None,
+        )
+        if id_index is None:
+            return DEFAULT_GENARTS_WITHOUT_VEHICLES
+        genart_ids: list[str] = []
+        for values in row_iter:
+            genart_id = _key_list_criteria_id_text(values[id_index]) if id_index < len(values) else ""
+            if genart_id and genart_id not in genart_ids:
+                genart_ids.append(genart_id)
+        return tuple(genart_ids)
+    except Exception:
+        return DEFAULT_GENARTS_WITHOUT_VEHICLES
+    finally:
+        workbook.close()
+
+
+def catalog_file_date_text(path: Path | None) -> str:
+    """Aenderungsdatum der Katalogdatei als '02.06.2026'; '' wenn nicht erreichbar."""
+    if path is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(Path(path).stat().st_mtime).strftime("%d.%m.%Y")
+    except (OSError, ValueError, OverflowError):
+        return ""
+
+
 def load_attribute_key_value_options(workbook_path: Path) -> list[AttributeKeyValueOption]:
     if not path_exists_safe(workbook_path):
         return []
@@ -4396,19 +5748,27 @@ def _parse_attribute_key_value_options(workbook_path: Path) -> list[AttributeKey
             raise ValueError("In der Schlüsselwertdatei fehlen benötigte Spalten.")
 
         options: list[AttributeKeyValueOption] = []
-        seen_keys: set[tuple[str, str]] = set()
+        seen_keys: set[tuple[str, str, str]] = set()
         for row in row_iter:
             values = list(row)
-            key_value_id = str(values[key_value_index] or "").strip() if key_value_index < len(values) else ""
-            label = str(values[label_index] or "").strip() if label_index < len(values) else ""
-            attribute_group = str(values[group_index] or "").strip() if group_index < len(values) else ""
+            # Zellen ueber _catalog_cell_text: ein Kuerzel 0 bzw. 1.0 als Zahl-Zelle geht nicht verloren,
+            # Text wird nie in Zahlen gewandelt (fuehrende Nullen, Buchstaben-Kuerzel).
+            key_value_id = _catalog_cell_text(values[key_value_index]) if key_value_index < len(values) else ""
+            label = _catalog_cell_text(values[label_index]) if label_index < len(values) else ""
+            attribute_group = _catalog_cell_text(values[group_index]) if group_index < len(values) else ""
+            source = _catalog_cell_text(values[source_index]) if source_index is not None and source_index < len(values) else ""
             if not key_value_id or not attribute_group:
                 continue
             deleted = parse_bool_flag(values[deleted_index]) if deleted_index is not None and deleted_index < len(values) else False
             deletion_date = str(values[deletion_date_index] or "").strip() if deletion_date_index is not None and deletion_date_index < len(values) else ""
             if deleted or deletion_date:
                 continue
-            dedupe_key = (normalize_attribute_key_value_group(attribute_group), key_value_id.casefold())
+            # Dubletten je (Herkunft, Tabelle, Kuerzel) - gleichnamige Tabellen beider Herkuenfte bleiben getrennt.
+            dedupe_key = (
+                normalize_lookup_text(source),
+                normalize_attribute_key_value_group(attribute_group),
+                key_value_id.casefold(),
+            )
             if dedupe_key in seen_keys:
                 continue
             seen_keys.add(dedupe_key)
@@ -4417,7 +5777,7 @@ def _parse_attribute_key_value_options(workbook_path: Path) -> list[AttributeKey
                     key_value_id=key_value_id,
                     label=label,
                     attribute_group=attribute_group,
-                    source=str(values[source_index] or "").strip() if source_index is not None and source_index < len(values) else "",
+                    source=source,
                 )
             )
 
@@ -5126,6 +6486,78 @@ def infer_attachment_format_type_id(path_or_link: str) -> str:
     suffix = Path(unquote(path_part)).suffix.lower()
     if suffix in ATTACHMENT_FORMAT_TYPE_BY_EXTENSION:
         return ATTACHMENT_FORMAT_TYPE_BY_EXTENSION[suffix]
+    return ""
+
+
+_LINK_SCHEME_HOST_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*://)([^/?#]*)(.*)$", re.DOTALL)
+
+
+def link_duplicate_key(link: str) -> str:
+    """Vergleichsschluessel 'derselbe Link' fuer Web-Links und Videos (ab v0.1.58): ohne Leerraum, Schema und
+    Host klein, ohne '/' am Ende; Pfad, Abfrage und Fragment bleiben, wie sie sind (YouTube-ID,
+    Konfigurator-Fragment sind schreibungsabhaengig)."""
+    text = "".join(str(link or "").split())
+    match = _LINK_SCHEME_HOST_RE.match(text)
+    if match is not None:
+        text = match.group(1).lower() + match.group(2).lower() + match.group(3)
+    return text.rstrip("/")
+
+
+def link_entry_error(link: str, existing_links: list[str]) -> str:
+    """Neue/geaenderte Link-Zeile (Web-Links, Videos): '' = annehmbar, sonst die Meldung - laenger als
+    WEB_LINK_MAX_LENGTH oder (link_duplicate_key) schon in existing_links."""
+    text = str(link or "").strip()
+    if len(text) > WEB_LINK_MAX_LENGTH:
+        return (
+            f"Der Link ist länger als {WEB_LINK_MAX_LENGTH} Zeichen ({len(text)}). Apollo speichert nur die "
+            f"ersten {WEB_LINK_MAX_LENGTH} Zeichen – der Link wäre dort abgeschnitten. Bitte einen kürzeren "
+            "Link verwenden."
+        )
+    key = link_duplicate_key(text)
+    if key and any(link_duplicate_key(other) == key for other in existing_links):
+        return "Dieser Link steht bei diesem Artikel schon in der Liste."
+    return ""
+
+
+def media_duplicate_key(path_or_link: str) -> str:
+    """Vergleichsschluessel 'dieselbe Datei' fuer Bilder/Dokumente (ab v0.1.58): unquote, '\\' -> '/', ohne '/'
+    am Ende, casefold (Windows-Pfade und der Kunzer-Medienserver unterscheiden keine Gross-/Kleinschreibung -
+    so entstand 800BEW11L)."""
+    return unquote(str(path_or_link or "").strip()).replace("\\", "/").rstrip("/").casefold()
+
+
+def dedupe_media_links(links: list[str], key: Callable[[str], str] = media_duplicate_key) -> list[str]:
+    """Links ohne Doppelte nach key; Reihenfolge bleibt, das erste Vorkommen gewinnt (leere Schluessel bleiben)."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for link in links:
+        link_key = key(link)
+        if link_key:
+            if link_key in seen:
+                continue
+            seen.add(link_key)
+        result.append(link)
+    return result
+
+
+def media_duplicate_error(existing_rows: list["MediaRow"], new_row: "MediaRow") -> str:
+    """'' oder die Meldung 'steht schon in der Liste'. Doppelt = gleicher media_duplicate_key UND gleiche Art
+    UND gleiche Sprache (dieselbe Datei in zwei Sprachen oder Arten bleibt erlaubt)."""
+    key = media_duplicate_key(new_row.path_or_link)
+    if not key:
+        return ""
+    art = str(new_row.art or "").strip().casefold()
+    sprache = str(new_row.sprache or "").strip().casefold()
+    for row in existing_rows:
+        if (
+            media_duplicate_key(row.path_or_link) == key
+            and str(row.art or "").strip().casefold() == art
+            and str(row.sprache or "").strip().casefold() == sprache
+        ):
+            return (
+                "Diese Datei bzw. dieser Link steht bei diesem Artikel schon in der Liste:\n"
+                f"{str(new_row.path_or_link).strip()}"
+            )
     return ""
 
 
@@ -6676,9 +8108,13 @@ class KunzerScraper:
                 long_text_de = self._select_long_text(short_text_de, description_text, info_text)
 
                 links = self._extract_links(page)
-                image_links = [href for href in links if self._is_image_link(href)]
-                document_links = [href for href in links if href.lower().endswith(".pdf")]
-                video_links = [href for href in links if self._is_video_link(href)]
+                # Ohne Doppelte (ab v0.1.58): dieselbe Datei einmal gross, einmal klein geschrieben ergab bei
+                # 800BEW11L zwei Bildzeilen.
+                image_links = dedupe_media_links([href for href in links if self._is_image_link(href)])
+                document_links = dedupe_media_links([href for href in links if href.lower().endswith(".pdf")])
+                video_links = dedupe_media_links(
+                    [href for href in links if self._is_video_link(href)], key=link_duplicate_key
+                )
 
                 article_number = normalize_article_number(
                     self._extract_article_number(page.url, page.locator("body").inner_text(), short_text_de)
@@ -7969,50 +9405,58 @@ def is_legacy_vehicle_link_workbook(path: Path, sheet_name: str) -> bool:
     return has_ktyp and not has_genart
 
 
-def read_workbook_rows(path: Path, sheet_name: str, expected_width: int) -> list[list[str]]:
+def read_workbook_rows(
+    path: Path, sheet_name: str, expected_width: int, row_numbers: list[int] | None = None
+) -> list[list[str]]:
+    """Datenzeilen (ohne Kopfzeile, ohne Leerzeilen) in Kopfzeilenbreite. row_numbers (ab v0.1.58,
+    Pruefung vor dem Import): erhaelt fuer jede gelieferte Zeile ihre Excel-Zeilennummer."""
     if not path.exists():
         return []
 
     existing_rows: list[list[str]] = []
     # Erste Rohzeile ist die Kopfzeile; die Zeilen sind frische Listen, die
     # Aufrufer gefahrlos veraendern duerfen.
-    for values in _workbook_raw_rows(path, sheet_name)[1:]:
+    for excel_row, values in enumerate(_workbook_raw_rows(path, sheet_name)[1:], start=2):
         row = values[:expected_width]
         if len(row) < expected_width:
             row.extend([""] * (expected_width - len(row)))
         if any(map(str.strip, row)):
             existing_rows.append(row)
+            if row_numbers is not None:
+                row_numbers.append(excel_row)
     return existing_rows
 
 
-def prepare_existing_rows_for_write(path: Path, sheet_name: str, headers: list[str]) -> list[list[str]]:
+def prepare_existing_rows_for_write(
+    path: Path, sheet_name: str, headers: list[str], row_numbers: list[int] | None = None
+) -> list[list[str]]:
     if headers == OE_HEADERS and is_legacy_oe_workbook(path, sheet_name):
-        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_OE_HEADERS))
+        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_OE_HEADERS), row_numbers)
         existing_rows = []
         for row in legacy_rows:
             padded = list(row) + [""] * max(0, len(LEGACY_OE_HEADERS) - len(row))
             existing_rows.append([padded[0], padded[1], "", padded[2], padded[3]])
     elif headers == ATTRIBUTE_HEADERS and is_attribute_workbook_with_value_from(path, sheet_name):
-        legacy_rows = read_workbook_rows(path, sheet_name, len(ATTRIBUTE_HEADERS_WITH_VALUE_FROM))
+        legacy_rows = read_workbook_rows(path, sheet_name, len(ATTRIBUTE_HEADERS_WITH_VALUE_FROM), row_numbers)
         existing_rows = []
         for row in legacy_rows:
             padded = list(row) + [""] * max(0, len(ATTRIBUTE_HEADERS_WITH_VALUE_FROM) - len(row))
             value = padded[4].strip() or padded[5].strip()
             existing_rows.append([padded[0], padded[1], padded[2], padded[3], value, padded[6], padded[7]])
     elif headers == ATTRIBUTE_HEADERS and is_legacy_attribute_workbook(path, sheet_name):
-        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_ATTRIBUTE_HEADERS))
+        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_ATTRIBUTE_HEADERS), row_numbers)
         existing_rows = []
         for row in legacy_rows:
             padded = list(row) + [""] * max(0, len(LEGACY_ATTRIBUTE_HEADERS) - len(row))
             existing_rows.append([padded[0], padded[1], padded[2], padded[3], padded[4], "", padded[5]])
     elif headers == VEHICLE_LINK_HEADERS and is_legacy_vehicle_link_workbook(path, sheet_name):
-        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_VEHICLE_LINK_HEADERS))
+        legacy_rows = read_workbook_rows(path, sheet_name, len(LEGACY_VEHICLE_LINK_HEADERS), row_numbers)
         existing_rows = []
         for row in legacy_rows:
             padded = list(row) + [""] * max(0, len(LEGACY_VEHICLE_LINK_HEADERS) - len(row))
             existing_rows.append([padded[0], padded[1], padded[2], padded[3], "", "", padded[4]])
     else:
-        existing_rows = read_workbook_rows(path, sheet_name, len(headers))
+        existing_rows = read_workbook_rows(path, sheet_name, len(headers), row_numbers)
     if headers and headers[-1] == LAST_WRITTEN_HEADER:
         fill_missing_written_at(path, existing_rows)
     return existing_rows
@@ -8544,13 +9988,13 @@ def build_oe_export_rows(bundle: ExportBundle) -> list[list[str]]:
     for row in normalize_oe_number_rows(bundle.oe_number_rows):
         if not row.manufacturer_id:
             raise ValueError(f"Bitte Hersteller für OE-Nummer '{row.value}' auswählen.")
-        export_rows.append([bundle.article_number, "4", row.manufacturer_id, row.value])
+        export_rows.append([bundle.article_number, OE_NUMBER_TECDOC_ID, row.manufacturer_id, row.value])
     return export_rows
 
 
 def build_comparison_export_rows(bundle: ExportBundle) -> list[list[str]]:
     return [
-        [bundle.article_number, "10", row.competitor_id, row.reference_number]
+        [bundle.article_number, COMPARISON_NUMBER_TECDOC_ID, row.competitor_id, row.reference_number]
         for row in normalize_comparison_number_rows(bundle.comparison_number_rows)
     ]
 
@@ -10134,9 +11578,10 @@ def apollo_reference_key(manufacturer: object, number: object) -> tuple[str, str
 def apollo_link_key(url: object) -> str:
     """Vergleichsschluessel eines Links (232/DocType 04 bzw. Video-/Web-Link-Zeile der GUI): wie bei
     'IMS-Export uebernehmen' (YouTube als Embed-Link), dekodiert, ohne '/' am Ende, ohne Gross-/
-    Kleinschreibung."""
+    Kleinschreibung. Ab v0.1.58 nur die ersten WEB_LINK_MAX_LENGTH Zeichen: mehr haelt Apollo (231.URL)
+    nicht - ein laengerer GUI-Link erscheint sonst dauerhaft als Abweichung."""
     _kind, link = _load_taf_sync_module().classify_url(str(url))
-    return unquote(link.strip()).rstrip("/").casefold()
+    return unquote(link.strip()[:WEB_LINK_MAX_LENGTH]).rstrip("/").casefold()
 
 
 def gui_reference_keys(snapshot: StoredArticleSnapshot) -> set[tuple[str, str]]:
@@ -10629,6 +12074,1021 @@ def _write_category_delete_overview(
     for row in rows:
         complete_sheet.append([APOLLO_DELETE_LIST_COLUMN_A_VALUE, _sanitize_cell_value(row[0])])
     workbook.save(path)
+
+
+# ---------------------------------------------------------------------------
+# Pruefung vor dem Import (ab v0.1.58) - ohne GUI testbar
+# Geprueft werden die ROHZEILEN der Output-Dateien (nicht die Snapshots: die sind bereinigt,
+# entdoppelt und zeigen 'Kuerzel | Bezeichnung'). Die Pruefung schreibt nichts in den Ausgabeordner
+# und korrigiert nichts; sie meldet in drei Stufen (RULE_SEVERITY_*): Fehler = IMS lehnt ab oder
+# Apollo speichert etwas anderes, Pruefen = ohne Blick in IMS nicht entscheidbar, Hinweis =
+# wirkungslos oder doppelt.
+# ---------------------------------------------------------------------------
+IMPORT_CHECK_HEADERS = ["Stufe", "Regel", "Datei", "Excel-Zeile", "Artikelnummer", "Feld", "Wert", "Grund", "Vorschlag", "Zeilen"]
+IMPORT_CHECK_REPORT_PREFIX = "Pruefung-vor-Import"
+IMPORT_CHECK_KEY_LIST_HEADERS = [
+    "Kriterium", "Herkunft", "Schlüsselliste", "Quelle", "Werte in der Liste", "Zeilen", "Listenwechsel offen", "Hinweis",
+]
+IMPORT_CHECK_SEVERITIES: tuple[str, ...] = (RULE_SEVERITY_ERROR, RULE_SEVERITY_REVIEW, RULE_SEVERITY_HINT)
+IMPORT_CHECK_SEVERITY_TEXTS: dict[str, str] = {
+    RULE_SEVERITY_ERROR: "IMS lehnt ab oder Apollo speichert etwas anderes – sicher.",
+    RULE_SEVERITY_REVIEW: "Ohne Blick in IMS nicht entscheidbar (Katalogstand, fehlende Liste, Listenwechsel).",
+    RULE_SEVERITY_HINT: "Wirkungslos oder doppelt, kein Schaden.",
+}
+# Regeln, die nur die Pruefung kennt (die Regeln der Eingabe liefert attribute_row_violations).
+RULE_ATTRIBUTE_NOT_IN_CATALOG = "Attribut: Kriterium nicht im Katalog"
+RULE_ATTRIBUTE_FORMAT_DIFFERS = "Attribut: Format weicht vom Katalog ab"
+RULE_ATTRIBUTE_NEGATIVE_TO = "Attribut: Bereich mit negativem Wert bis"
+RULE_KEY_VALUE_LIST_CHANGE = "Schlüsselwert: Listenwechsel nicht bestätigt"
+RULE_IMPORT_ROW_UNCHECKABLE = "Zeile nicht prüfbar"
+RULE_SEARCH_TERM_TOO_LONG = f"Suchwort über {SEARCH_TERM_MAX_LENGTH} Zeichen"
+RULE_LINK_TOO_LONG = f"Link über {WEB_LINK_MAX_LENGTH} Zeichen"
+RULE_LINK_DUPLICATE = "Link doppelt"
+RULE_MEDIA_DUPLICATE = "Mediendatei doppelt"
+RULE_MEDIA_IDENTICAL = "Mediendatei inhaltsgleich"
+RULE_MEDIA_MISSING = "Mediendatei fehlt"
+RULE_VEHICLE_GENART_WITHOUT_VEHICLES = "Fahrzeugzeile für GenArt ohne Fahrzeuge"
+# Die Regeln 9-11 der Eingabe (RULE_ATTRIBUTE_FROM_EQUALS_TO, _TOO_LONG, _FREE_TEXT_TWICE) stehen oben.
+# (Regelname, Stufe, Erklaerung 'was Apollo damit macht') - Reihenfolge = Reihenfolge im Bericht.
+IMPORT_CHECK_RULES: tuple[tuple[str, str, str], ...] = (
+    (RULE_KEY_VALUE_PLAIN_TEXT, RULE_SEVERITY_ERROR,
+     "IMS lehnt Klartext in Schlüsselwert-Kriterien still ab – die Zeile kommt in Apollo nicht an."),
+    (RULE_KEY_VALUE_TO_FILLED, RULE_SEVERITY_ERROR, "Schlüsselwert-Kriterien haben keinen Bereich."),
+    (RULE_ATTRIBUTE_TOO_LONG, RULE_SEVERITY_ERROR,
+     f"Apollo speichert je Attributwert höchstens {ATTRIBUTE_VALUE_MAX_LENGTH} Zeichen (CritVal)."),
+    (RULE_ATTRIBUTE_FROM_EQUALS_TO, RULE_SEVERITY_ERROR, "Ein Bereich mit gleichem Anfang und Ende kommt in Apollo nicht an."),
+    (RULE_ATTRIBUTE_FREE_TEXT_TWICE, RULE_SEVERITY_ERROR, "Apollo hält je Artikel nur die erste Zeile dieses Freitextfelds."),
+    (RULE_ATTRIBUTE_FORMAT, RULE_SEVERITY_ERROR,
+     "Bisherige Prüfung (keine Zahl, 'Wert' größer als 'Wert bis', länger als die Katalog-Länge) – blockiert schon "
+     "heute das Speichern des Bereichs."),
+    (RULE_KEY_VALUE_LIST_CHANGE, RULE_SEVERITY_REVIEW,
+     "Apollo zeigt für das Kürzel womöglich eine andere Bedeutung als die Maske bei der Eingabe (Listenwechsel)."),
+    (RULE_KEY_VALUE_NOT_IN_LIST, RULE_SEVERITY_REVIEW,
+     "Kürzel steht nicht in der Katalogdatei – in IMS gesperrt oder neuer als der Export (Stand im Grund)."),
+    (RULE_KEY_VALUE_NO_LIST, RULE_SEVERITY_REVIEW,
+     "Wert nicht prüfbar; ob IMS ihn annimmt, hängt von der Schlüsselliste ab."),
+    (RULE_ATTRIBUTE_NOT_IN_CATALOG, RULE_SEVERITY_REVIEW,
+     "Kriterium laut Katalog gelöscht, zur Löschung vorgesehen oder unbekannt – Apollo führt solche Zeilen teils noch."),
+    (RULE_ATTRIBUTE_FORMAT_DIFFERS, RULE_SEVERITY_REVIEW, "Die Datei nennt ein anderes Format als der Katalog."),
+    (RULE_IMPORT_ROW_UNCHECKABLE, RULE_SEVERITY_REVIEW, "Die Prüfung konnte die Zeile nicht auswerten (Grund in der Zeile)."),
+    (RULE_ATTRIBUTE_NEGATIVE_TO, RULE_SEVERITY_HINT, "Ein Bereich bis zu einem negativen Wert kam bisher nicht in Apollo an."),
+    (RULE_SEARCH_TERM_TOO_LONG, RULE_SEVERITY_ERROR,
+     f"Apollo speichert höchstens {SEARCH_TERM_MAX_LENGTH} Zeichen (TradeNo) – das Suchwort wird abgeschnitten oder abgelehnt."),
+    (RULE_LINK_TOO_LONG, RULE_SEVERITY_ERROR,
+     f"Apollo speichert nur die ersten {WEB_LINK_MAX_LENGTH} Zeichen (URL) – der Link ist dort abgeschnitten (toter Link)."),
+    (RULE_LINK_DUPLICATE, RULE_SEVERITY_HINT, "Derselbe Link steht zweimal beim Artikel."),
+    (RULE_MEDIA_DUPLICATE, RULE_SEVERITY_HINT, "Dieselbe Datei steht mit gleicher Art und Sprache zweimal beim Artikel."),
+    (RULE_MEDIA_IDENTICAL, RULE_SEVERITY_HINT,
+     "Gleiche Größe und gleicher SHA-1 wie eine frühere Zeile des Artikels (nur nach 'Mediendateien vergleichen…')."),
+    (RULE_MEDIA_MISSING, RULE_SEVERITY_ERROR, "IMS findet die Datei nicht (nur nach 'Mediendateien vergleichen…')."),
+    (RULE_VEHICLE_GENART_WITHOUT_VEHICLES, RULE_SEVERITY_HINT,
+     "Apollo führt an dieser GenArt keine Fahrzeuge; die Zeilen bleiben wirkungslos (sie werden weiter geschrieben)."),
+)
+_IMPORT_CHECK_RULE_RANK: dict[str, int] = {rule: rank for rank, (rule, _severity, _text) in enumerate(IMPORT_CHECK_RULES)}
+_IMPORT_CHECK_SEVERITY_RANK: dict[str, int] = {severity: rank for rank, severity in enumerate(IMPORT_CHECK_SEVERITIES)}
+_IMPORT_CHECK_FILE_RANK: dict[str, int] = {
+    file_name: rank for rank, ((file_name, _sheet_name), _headers) in enumerate(OUTPUT_FILES_WITH_HEADERS)
+}
+
+
+@dataclass(frozen=True)
+class ImportCheckFinding:
+    """Ein Befund der Pruefung vor dem Import (eine Zeile im Ergebnisfenster und im Bericht)."""
+
+    severity: str             # RULE_SEVERITY_ERROR / _REVIEW / _HINT
+    rule: str
+    file_name: str
+    article_number: str
+    excel_row: int            # erste betroffene Zeile der Datei
+    field: str                # '3465 | Akkuspannung [V]' bzw. Spaltenname
+    value: str
+    reason: str
+    proposal: str = ""
+    row_count: int = 1        # Zeilen, fuer die der Befund steht (Fahrzeuge je Artikel und GenArt gebuendelt)
+
+    def as_row(self) -> list[str]:
+        """Zeile in der Reihenfolge von IMPORT_CHECK_HEADERS (alles Text)."""
+        return [
+            self.severity, self.rule, self.file_name, str(self.excel_row), self.article_number,
+            self.field, self.value, self.reason, self.proposal, str(self.row_count),
+        ]
+
+    def criteria_id(self) -> str:
+        """Kriterien-ID eines Attribut-Befunds (Text vor ' | ' im Feld), sonst ''."""
+        if self.file_name != ATTRIBUTE_FILE[0]:
+            return ""
+        return self.field.split("|", 1)[0].strip()
+
+
+@dataclass
+class ImportCheckReport:
+    """Ergebnis von check_output_rows. Liegt in keiner Sicherung und keinem Cache (default_factory ist hier
+    unbedenklich)."""
+
+    output_root: str = ""
+    checked_at: str = ""
+    findings: list[ImportCheckFinding] = field(default_factory=list)
+    checked_rows: dict[str, int] = field(default_factory=dict)        # Datei -> gepruefte Zeilen
+    notes: list[str] = field(default_factory=list)                    # z. B. 'Schlüsselwert-Zeilen nicht geprüft ...'
+    basis: list[tuple[str, str]] = field(default_factory=list)        # Grundlage (Kataloge mit Dateidatum, Zuordnung, Version)
+    key_lists: list[list[str]] = field(default_factory=list)          # Blatt 'Schluessellisten' (IMPORT_CHECK_KEY_LIST_HEADERS)
+    catalog_text: str = ""                                          # 'Schlüsselwerte vom …, Attributkatalog vom …'
+    media_compared: bool = False                                    # 'Mediendateien vergleichen…' schon gelaufen
+
+    def count(self, severity: str) -> int:
+        """Zahl der Befunde dieser Stufe."""
+        return sum(1 for finding in self.findings if finding.severity == severity)
+
+    def row_total(self, severity: str = "") -> int:
+        """Summe row_count der Befunde dieser Stufe ('' = aller Befunde)."""
+        return sum(finding.row_count for finding in self.findings if not severity or finding.severity == severity)
+
+    def by_rule(self, include_empty: bool = False) -> list[tuple[str, str, int, int]]:
+        """(Regel, Stufe, Befunde, Zeilen) in der Reihenfolge von IMPORT_CHECK_RULES; Regeln ohne Befund nur mit
+        include_empty. Regeln, die der Katalog nicht kennt, folgen am Ende (Stufe des ersten Befunds)."""
+        counts: dict[str, list] = {}
+        for finding in self.findings:
+            entry = counts.setdefault(finding.rule, [finding.severity, 0, 0])
+            entry[1] += 1
+            entry[2] += finding.row_count
+        result: list[tuple[str, str, int, int]] = []
+        for rule, severity, _text in IMPORT_CHECK_RULES:
+            entry = counts.pop(rule, None)
+            if entry is not None:
+                result.append((rule, entry[0], entry[1], entry[2]))
+            elif include_empty:
+                result.append((rule, severity, 0, 0))
+        for rule, (severity, number, rows) in counts.items():
+            result.append((rule, severity, number, rows))
+        return result
+
+    def by_article(self) -> dict[str, list[ImportCheckFinding]]:
+        """Befunde je Artikelnummer (Reihenfolge der Befunde)."""
+        result: dict[str, list[ImportCheckFinding]] = {}
+        for finding in self.findings:
+            result.setdefault(finding.article_number, []).append(finding)
+        return result
+
+    def has_rule(self, rule: str) -> bool:
+        return any(finding.rule == rule for finding in self.findings)
+
+
+def import_check_rule_info(rule: str) -> tuple[str, str]:
+    """(Stufe, Erklaerung) einer Regel aus IMPORT_CHECK_RULES; ('', '') fuer unbekannte Regeln."""
+    for name, severity, text in IMPORT_CHECK_RULES:
+        if name == rule:
+            return severity, text
+    return "", ""
+
+
+def sort_import_check_findings(findings: list[ImportCheckFinding]) -> list[ImportCheckFinding]:
+    """Fehler, dann Pruefen, dann Hinweis; darin Datei (Reihenfolge OUTPUT_FILES_WITH_HEADERS), Excel-Zeile, Regel."""
+    return sorted(
+        findings,
+        key=lambda finding: (
+            _IMPORT_CHECK_SEVERITY_RANK.get(finding.severity, len(IMPORT_CHECK_SEVERITIES)),
+            _IMPORT_CHECK_FILE_RANK.get(finding.file_name, len(_IMPORT_CHECK_FILE_RANK)),
+            finding.file_name,
+            finding.excel_row,
+            _IMPORT_CHECK_RULE_RANK.get(finding.rule, len(IMPORT_CHECK_RULES)),
+            finding.rule,
+        ),
+    )
+
+
+def filter_import_check_findings(
+    findings: list[ImportCheckFinding], severity: str = "", rule: str = ""
+) -> list[ImportCheckFinding]:
+    """Filter des Ergebnisfensters ('' bzw. 'alle' = kein Filter)."""
+    severity = "" if severity in {"", "alle"} else severity
+    rule = "" if rule in {"", "alle"} else rule
+    return [
+        finding for finding in findings
+        if (not severity or finding.severity == severity) and (not rule or finding.rule == rule)
+    ]
+
+
+def import_check_key_list_change_criteria(report: ImportCheckReport) -> list[str]:
+    """Kriterien-IDs mit Befund 'Listenwechsel nicht bestätigt' (Knopf 'Listenwechsel als geprüft vermerken…')."""
+    ids: list[str] = []
+    for finding in report.findings:
+        if finding.rule == RULE_KEY_VALUE_LIST_CHANGE:
+            criteria_id = finding.criteria_id()
+            if criteria_id and criteria_id not in ids:
+                ids.append(criteria_id)
+    return ids
+
+
+def import_check_status_text(report: ImportCheckReport) -> str:
+    """Statuszeile nach der Pruefung (PLAN 7.7)."""
+    return (
+        f"Prüfung vor dem Import: {report.count(RULE_SEVERITY_ERROR)} Fehler, "
+        f"{report.count(RULE_SEVERITY_REVIEW)} zu prüfen, {report.count(RULE_SEVERITY_HINT)} Hinweise "
+        f"({report.row_total()} Zeilen betroffen)."
+    )
+
+
+def import_check_window_title(report: ImportCheckReport) -> str:
+    """Kopf des Ergebnisfensters: 'Prüfung vor dem Import – {Ausgabeordner}, {Zeitpunkt}'."""
+    return f"Prüfung vor dem Import – {report.output_root}, {report.checked_at}"
+
+
+def import_check_catalog_text(key_value_catalog_date: str, attribute_catalog_date: str) -> str:
+    """'Schlüsselwerte vom 02.06.2026, Attributkatalog vom 02.06.2026' (fehlendes Datum: 'nicht geladen')."""
+    key_values = f"vom {key_value_catalog_date}" if key_value_catalog_date else "nicht geladen"
+    attributes = f"vom {attribute_catalog_date}" if attribute_catalog_date else "nicht geladen"
+    return f"Schlüsselwerte {key_values}, Attributkatalog {attributes}"
+
+
+def build_import_check_basis(
+    app_version: str,
+    attribute_catalog_path: str,
+    attribute_catalog_date: str,
+    key_value_catalog_path: str,
+    key_value_catalog_date: str,
+    key_list_mapping_path: str,
+    key_list_assignments: dict[str, KeyListAssignment] | None,
+    genarts_without_vehicles: tuple[str, ...] = DEFAULT_GENARTS_WITHOUT_VEHICLES,
+) -> list[tuple[str, str]]:
+    """Grundlage fuer report.basis (Blatt 'Zusammenfassung'): Programmversion, Kataloge mit Pfad und
+    Dateidatum, Zuordnungsdatei mit Zahl der Eintraege, GenArten ohne Fahrzeuge."""
+    assignments = key_list_assignments or {}
+    builtin = sum(1 for entry in assignments.values() if entry.builtin)
+    return [
+        ("Programmversion", app_version),
+        ("Attributkatalog", f"{attribute_catalog_path} (Stand der Datei: {attribute_catalog_date or 'nicht geladen'})"),
+        ("Schlüsselwerte", f"{key_value_catalog_path} (Stand der Datei: {key_value_catalog_date or 'nicht geladen'})"),
+        (
+            "Schlüssellisten-Zuordnung",
+            f"{key_list_mapping_path} – {len(assignments)} Zuordnungen geltend "
+            f"({builtin} Programm-Vorgaben, {len(assignments) - builtin} aus Datei bzw. Sitzung)",
+        ),
+        ("GenArten ohne Fahrzeuge", ", ".join(genarts_without_vehicles) or "keine"),
+    ]
+
+
+def import_check_report_default_name(now: datetime | None = None) -> str:
+    """Vorgabename des Berichts: 'Pruefung-vor-Import_2026-11-12_1405.xlsx'."""
+    now = now or datetime.now()
+    return f"{IMPORT_CHECK_REPORT_PREFIX}_{now:%Y-%m-%d_%H%M}.xlsx"
+
+
+def import_check_report_target_error(target_path: Path | str, output_root: Path | str) -> str:
+    """'' oder die Ablehnung, wenn das Ziel IM Ausgabeordner (oder darunter) liegt (PLAN 7.8)."""
+    try:
+        target = os.path.normcase(os.path.abspath(str(target_path)))
+        root = os.path.normcase(os.path.abspath(str(output_root)))
+    except (OSError, ValueError):
+        return ""
+    if not str(output_root).strip():
+        return ""
+    if target == root or os.path.dirname(target) == root or target.startswith(root.rstrip("\\/") + os.sep):
+        return (
+            "Der Bericht darf nicht im Ausgabeordner liegen – eine dort in Excel geöffnete Datei blockiert "
+            "'IMS-Export übernehmen', und die Sicherung nähme sie jedes Mal mit."
+        )
+    return ""
+
+
+def read_output_rows_for_check(output_root: Path) -> dict[str, list[tuple[int, list[str]]]]:
+    """Je Datei aus OUTPUT_FILES_WITH_HEADERS: [(Excel-Zeile, Zeile in Kopfzeilenbreite)]; fehlende Datei fehlt.
+    Liest wie das Schreiben (prepare_existing_rows_for_write): Altformate kommen umgesetzt an, mit den
+    Excel-Zeilen der Datei. Der Aufrufer haelt dabei WORKBOOK_WRITE_LOCK (PLAN 7.7)."""
+    output_root = Path(output_root)
+    result: dict[str, list[tuple[int, list[str]]]] = {}
+    for (file_name, sheet_name), headers in OUTPUT_FILES_WITH_HEADERS:
+        path = output_root / file_name
+        if not path_exists_safe(path):
+            continue
+        row_numbers: list[int] = []
+        rows = prepare_existing_rows_for_write(path, sheet_name, headers, row_numbers=row_numbers)
+        if len(row_numbers) != len(rows):
+            raise ValueError(
+                f"{file_name}: Zeilennummern passen nicht zu den gelesenen Zeilen ({len(row_numbers)} / {len(rows)})."
+            )
+        result[file_name] = [(number, list(row)) for number, row in zip(row_numbers, rows)]
+    return result
+
+
+def _import_check_cell(row: list[str], headers: list[str], header: str) -> str:
+    index = headers.index(header)
+    return str(row[index] if index < len(row) and row[index] is not None else "")
+
+
+def _import_check_article(value: str) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _import_check_value_text(value: str, value_to: str) -> str:
+    value, value_to = value.strip(), value_to.strip()
+    if value and value_to:
+        return f"{value} bis {value_to}"
+    return value or (f"bis {value_to}" if value_to else "")
+
+
+def _import_check_reason(violation: AttributeRuleViolation, row: AttributeRow) -> str:
+    """Grund im Bericht: der ganze Satz der Regel ohne vorangestelltes '{Kriterium}: ' (steht schon im Feld)."""
+    message = (violation.message or violation.short or violation.rule).strip()
+    prefix = f"{row.display_label()}: "
+    if message.startswith(prefix):
+        message = message[len(prefix):]
+    return " ".join(message.split())
+
+
+def _import_check_key_value_proposal(
+    option: AttributeOption, raw_value: str, attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]]
+) -> str:
+    """Vorschlag zu Klartext / Kuerzel nicht in der Liste (PLAN 7.4) ueber dieselbe Logik wie die Findung:
+    sicher -> dessen Anzeige ('DS | doppelseitig'); unsicher mit genau einem Bezeichnungstreffer, der zugleich
+    Kuerzel eines anderen Eintrags ist -> '2 | 12 (bitte prüfen: '12' ist auch Kürzel von 12 | 7,2)'; sonst ''.
+    Kein Raten."""
+    try:
+        suggestion = validate_suggestion_value(option, raw_value, "", attribute_key_values_by_group)
+    except Exception:
+        return ""
+    if suggestion is None:
+        return ""
+    value = str(suggestion.value or "").strip()
+    if not value or value == raw_value.strip():
+        return ""
+    if suggestion.confident:
+        return value
+    note = str(suggestion.note or "")
+    if "|" in value and note.startswith("doppeldeutig:"):
+        detail = note.split(":", 1)[1].strip()
+        for tail in ("– bitte prüfen", "- bitte prüfen", "bitte prüfen"):
+            if detail.endswith(tail):
+                detail = detail[: -len(tail)].strip(" –-")
+                break
+        return f"{value} (bitte prüfen: {detail})" if detail else f"{value} (bitte prüfen)"
+    return ""
+
+
+def _import_check_lookup_key(options: list[AttributeKeyValueOption], key_text: str) -> AttributeKeyValueOption | None:
+    wanted = normalize_lookup_text(key_text)
+    if not wanted:
+        return None
+    return next((option for option in options if normalize_lookup_text(option.key_value_id) == wanted), None)
+
+
+def attribute_key_list_change_violation(
+    row: AttributeRow,
+    assignment: KeyListAssignment | None,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    written_at: str = "",
+) -> AttributeRuleViolation | None:
+    """'Listenwechsel nicht bestaetigt' (PLAN 7.5): Hat das Kriterium eine Zuordnung mit bisheriger Liste und ist
+    'Bestand geprueft am' leer, wird JEDE Zeile gemeldet, deren Kuerzel in der gueltigen UND in der bisherigen
+    Liste steht und dort Verschiedenes bedeutet - unabhaengig davon, wann die Zeile geschrieben wurde (written_at
+    steht nur im Grund). Das Kuerzel ist die Rohzelle bzw. der Text vor dem ersten '|'. Leere bisherige Herkunft =
+    Herkunft der gueltigen Zuordnung. Kataloge nicht bereit: None."""
+    if assignment is None or not assignment.previous_table.strip() or assignment.stock_checked_at.strip():
+        return None
+    if not attribute_key_value_lists_ready(attribute_key_values_by_group):
+        return None
+    current = attribute_key_value_list_for(row.criteria_id, attribute_key_values_by_group) or []
+    previous_source = assignment.previous_source.strip() or assignment.source.strip()
+    previous = attribute_key_values_by_group.get(
+        attribute_key_value_table_key(previous_source, assignment.previous_table), []
+    )
+    if not current or not previous:
+        return None
+    raw_value = row.value.strip()
+    key_text = parse_attribute_key_value_display(raw_value)[0] if "|" in raw_value else raw_value
+    current_entry = _import_check_lookup_key(current, key_text)
+    previous_entry = _import_check_lookup_key(previous, key_text)
+    if current_entry is None or previous_entry is None:
+        return None
+    if key_value_label_matches(previous_entry.label, current_entry.label):
+        return None
+    key = current_entry.key_value_id
+    new_label, old_label = current_entry.label, previous_entry.label
+    new_list = attribute_key_value_list_label(current)
+    old_list = attribute_key_value_list_label(previous)
+    date_text = written_at.strip() or "unbekannt"
+    message = (
+        f"Kürzel {key} bedeutet in der gültigen Liste {new_list} '{new_label}'; bis zum Listenwechsel zeigte die Maske "
+        f"dafür '{old_label}' ({old_list}). Zeile zuletzt geschrieben am {date_text}. Stimmt '{new_label}', nichts "
+        f"ändern – war '{old_label}' gemeint, das Kürzel ändern."
+    )
+    same_label = [option for option in current if key_value_label_matches(old_label, option.label)]
+    proposal = f"falls '{old_label}' gemeint war: {same_label[0].display_label()}" if len(same_label) == 1 else ""
+    return AttributeRuleViolation(
+        RULE_KEY_VALUE_LIST_CHANGE,
+        RULE_SEVERITY_REVIEW,
+        message,
+        short=f"Kürzel {key}: jetzt '{new_label}', vor dem Listenwechsel '{old_label}'",
+        proposal=proposal,
+    )
+
+
+def _import_check_key_list_rows(
+    used: dict[str, list],
+    attribute_options_by_id: dict[str, AttributeOption],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    assignments: dict[str, KeyListAssignment],
+) -> list[list[str]]:
+    """Blatt 'Schluessellisten': je in Attribute.xlsx benutztem Schluesselwert-Kriterium seine Liste und woher sie
+    kommt - so lassen sich die ueber den Namen gefundenen Listen einmal gegen IMS halten."""
+    ready = attribute_key_value_lists_ready(attribute_key_values_by_group)
+
+    def sort_key(criteria_id: str) -> tuple[int, str]:
+        return (int(criteria_id), "") if criteria_id.isdigit() else (10 ** 9, criteria_id)
+
+    rows: list[list[str]] = []
+    for criteria_id in sorted(used, key=sort_key):
+        probe, count = used[criteria_id]
+        option = attribute_options_by_id.get(criteria_id)
+        source = option.source if option is not None else ""
+        assignment = assignments.get(criteria_id)
+        options = attribute_key_value_list_for(criteria_id, attribute_key_values_by_group) if ready else None
+        list_label = attribute_key_value_list_label(options) if options else ""
+        if not ready:
+            origin = "nicht geprüft (Kataloge nicht geladen)"
+        elif assignment is not None and assignment.table.strip():
+            origin = "Programm-Vorgabe" if assignment.builtin else "Zuordnungsdatei"
+            if not options:
+                origin += " – Liste fehlt in der Schlüsselwertdatei"
+                list_label = f"{assignment.source.strip() or source}/{assignment.table.strip()}"
+        elif options:
+            origin = "gleicher Name"
+        else:
+            origin = "keine"
+        change_open = ""
+        if assignment is not None and assignment.previous_table.strip():
+            previous = f"{assignment.previous_source.strip() or assignment.source.strip()}/{assignment.previous_table.strip()}"
+            change_open = (
+                f"nein (geprüft am {assignment.stock_checked_at.strip()})" if assignment.stock_checked_at.strip()
+                else f"ja – vorher {previous}"
+            )
+        hint = assignment.note.strip() if assignment is not None else ""
+        suggested = SUGGESTED_KEY_LIST_ASSIGNMENTS.get(criteria_id)
+        if suggested is not None and origin in {"keine", "gleicher Name"}:
+            hint = f"Vorschlag: {suggested.source.strip() or source}/{suggested.table.strip()} ({suggested.note.strip() or 'wahrscheinlich'})"
+        rows.append([
+            probe.display_label(), source, list_label, origin, str(len(options)) if options else "0",
+            str(count), change_open, hint,
+        ])
+    return rows
+
+
+def _check_attribute_rows_for_import(
+    report: ImportCheckReport,
+    rows: list[tuple[int, list[str]]],
+    attribute_options_by_id: dict[str, AttributeOption],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    assignments: dict[str, KeyListAssignment],
+    catalog_date: str,
+) -> None:
+    """Attribute.xlsx (PLAN 7.3): je Artikel in Dateireihenfolge; 'davor' = schon gesehene Zeilen des Artikels."""
+    file_name = ATTRIBUTE_FILE[0]
+    headers = ATTRIBUTE_HEADERS
+    catalog_loaded = bool(attribute_options_by_id)
+    lists_ready = attribute_key_value_lists_ready(attribute_key_values_by_group)
+    findings = report.findings
+    used_key_value_criteria: dict[str, list] = {}
+    unchecked_key_value_rows = 0
+
+    def add(severity: str, rule: str, article: str, excel_row: int, field_text: str, value: str, reason: str,
+            proposal: str = "") -> None:
+        findings.append(ImportCheckFinding(severity, rule, file_name, article, excel_row, field_text, value, reason, proposal))
+
+    by_article: dict[str, list[tuple[int, list[str]]]] = {}
+    for excel_row, row in rows:
+        by_article.setdefault(_import_check_article(_import_check_cell(row, headers, "Artikelnummer")), []).append((excel_row, row))
+
+    for article, article_rows in by_article.items():
+        probes: list[tuple[int, AttributeRow, AttributeOption, str]] = []
+        for excel_row, row in article_rows:
+            try:
+                criteria_id = _import_check_cell(row, headers, "TecDoc Kriterien ID").strip()
+                if criteria_id == LEGACY_SEARCH_TERM_CRITERIA_ID:
+                    continue  # Alt-Suchwort 9595: gehoert zu den Suchwoertern, kein Attribut fuer Apollo
+                file_label = _import_check_cell(row, headers, "Attribut Bezeichnung").strip()
+                file_format = _import_check_cell(row, headers, "Format").strip()
+                value = _import_check_cell(row, headers, "Wert")
+                value_to = _import_check_cell(row, headers, "Wert bis")
+                written_at = _import_check_cell(row, headers, LAST_WRITTEN_HEADER).strip()
+                option = attribute_options_by_id.get(criteria_id) if criteria_id else None
+                field_text = AttributeRow(criteria_id=criteria_id, label=(option.label if option else "") or file_label).display_label()
+                value_text = _import_check_value_text(value, value_to)
+                if catalog_loaded and option is None:
+                    add(
+                        RULE_SEVERITY_REVIEW, RULE_ATTRIBUTE_NOT_IN_CATALOG, article, excel_row, field_text, value_text,
+                        f"Kriterium {criteria_id or '(leer)'} steht nicht (mehr) im Attributkatalog – gelöscht, zur "
+                        "Löschung vorgesehen oder unbekannt.",
+                    )
+                elif (
+                    option is not None and file_format and option.value_format.strip()
+                    and normalize_lookup_text(file_format) != normalize_lookup_text(option.value_format)
+                ):
+                    add(
+                        RULE_SEVERITY_REVIEW, RULE_ATTRIBUTE_FORMAT_DIFFERS, article, excel_row, field_text, value_text,
+                        f"Die Datei nennt das Format '{file_format}', der Katalog '{option.value_format.strip()}' – "
+                        "geprüft wird nach dem Katalog.",
+                    )
+                if option is None:
+                    option = AttributeOption(criteria_id=criteria_id, label=file_label, value_format=file_format)
+                probe = AttributeRow(
+                    criteria_id=criteria_id,
+                    label=option.label or file_label,
+                    value_format=option.value_format or file_format,
+                    max_length=option.max_length,
+                    type_name=option.type_name,
+                    value=value,
+                    value_to=value_to,
+                )
+                probes.append((excel_row, probe, option, written_at))
+            except Exception as exc:  # eine kaputte Zeile bricht die Pruefung nie ab
+                add(RULE_SEVERITY_REVIEW, RULE_IMPORT_ROW_UNCHECKABLE, article, excel_row, "", "", f"Zeile nicht prüfbar: {exc}")
+
+        try:
+            slot_proposals = free_text_slot_proposals([probe for _excel_row, probe, _option, _written_at in probes])
+        except Exception:
+            slot_proposals = {}
+
+        before: list[AttributeRow] = []
+        for position, (excel_row, probe, option, written_at) in enumerate(probes):
+            field_text = probe.display_label()
+            value_text = _import_check_value_text(probe.value, probe.value_to)
+            try:
+                is_key_value = is_attribute_key_value_format(probe.value_format)
+                if is_key_value:
+                    entry = used_key_value_criteria.setdefault(probe.criteria_id, [probe, 0])
+                    entry[1] += 1
+                    if not lists_ready and probe.value.strip():
+                        unchecked_key_value_rows += 1
+                violations = attribute_row_violations(
+                    probe, list(before), attribute_key_values_by_group, KEY_VALUE_MODE_FILE, catalog_date
+                )
+                key_value_violation = False
+                for violation in violations:
+                    proposal = violation.proposal
+                    if violation.rule in {RULE_KEY_VALUE_PLAIN_TEXT, RULE_KEY_VALUE_NOT_IN_LIST}:
+                        proposal = _import_check_key_value_proposal(option, probe.value, attribute_key_values_by_group) or proposal
+                    elif violation.rule == RULE_KEY_VALUE_NO_LIST:
+                        suggested = SUGGESTED_KEY_LIST_ASSIGNMENTS.get(probe.criteria_id)
+                        if suggested is not None and suggested.table.strip():
+                            proposal = (
+                                f"Liste zuordnen: {suggested.source.strip() or option.source}/{suggested.table.strip()} "
+                                "(wahrscheinlich)"
+                            )
+                    elif violation.rule == RULE_ATTRIBUTE_FREE_TEXT_TWICE:
+                        slot = slot_proposals.get(position, "")
+                        proposal = f"nach {slot} verschieben" if slot else ""
+                    if violation.rule.startswith("Schlüsselwert:"):
+                        key_value_violation = True
+                    add(
+                        violation.severity or RULE_SEVERITY_ERROR, violation.rule, article, excel_row, field_text,
+                        value_text, _import_check_reason(violation, probe), proposal,
+                    )
+                if is_key_value and not key_value_violation and lists_ready:
+                    change = attribute_key_list_change_violation(
+                        probe, assignments.get(probe.criteria_id), attribute_key_values_by_group, written_at
+                    )
+                    if change is not None:
+                        add(change.severity, change.rule, article, excel_row, field_text, value_text, change.message, change.proposal)
+                if probe.value_format.strip().casefold() == "numerisch" and probe.value_to.strip():
+                    number_to = parse_german_number(probe.value_to)
+                    if number_to is not None and number_to < 0:
+                        add(
+                            RULE_SEVERITY_HINT, RULE_ATTRIBUTE_NEGATIVE_TO, article, excel_row, field_text, value_text,
+                            f"Bereich bis {probe.value_to.strip()} – ein Bereich bis zu einem negativen Wert kam bisher "
+                            "nicht in Apollo an.",
+                        )
+            except Exception as exc:  # eine kaputte Zeile bricht die Pruefung nie ab
+                add(RULE_SEVERITY_REVIEW, RULE_IMPORT_ROW_UNCHECKABLE, article, excel_row, field_text, value_text, f"Zeile nicht prüfbar: {exc}")
+            before.append(probe)
+
+    if not catalog_loaded:
+        report.notes.append(
+            "Attributkatalog nicht geladen – 'Kriterium nicht im Katalog' und 'Format weicht vom Katalog ab' wurden nicht "
+            "geprüft; Format und Länge stammen aus der Datei."
+        )
+    if not lists_ready:
+        report.notes.append(
+            f"Schlüsselwert-Zeilen nicht geprüft ({unchecked_key_value_rows} Zeilen): Attributkatalog bzw. Schlüsselwerte "
+            "sind nicht geladen (bzw. kein Kriterium fand eine Liste)."
+        )
+    report.key_lists = _import_check_key_list_rows(
+        used_key_value_criteria, attribute_options_by_id, attribute_key_values_by_group, assignments
+    )
+
+
+def _check_search_term_rows_for_import(report: ImportCheckReport, rows: list[tuple[int, list[str]]]) -> None:
+    file_name = USAGE_NUMBER_FILE[0]
+    headers = USAGE_NUMBER_HEADERS
+    for excel_row, row in rows:
+        article = ""
+        try:
+            article = _import_check_article(_import_check_cell(row, headers, "Artikelnummer"))
+            term = _import_check_cell(row, headers, "Gebrauchsnummer")
+            if not search_term_too_long(term):
+                continue
+            normalized = " ".join(term.split())
+            report.findings.append(ImportCheckFinding(
+                RULE_SEVERITY_ERROR, RULE_SEARCH_TERM_TOO_LONG, file_name, article, excel_row, "Gebrauchsnummer", normalized,
+                f"{len(normalized)} Zeichen – Apollo speichert höchstens {SEARCH_TERM_MAX_LENGTH} (abgeschnitten oder "
+                f"abgelehnt): '{normalized[:SEARCH_TERM_MAX_LENGTH]}'",
+            ))
+        except Exception as exc:
+            report.findings.append(ImportCheckFinding(
+                RULE_SEVERITY_REVIEW, RULE_IMPORT_ROW_UNCHECKABLE, file_name, article, excel_row, "", "", f"Zeile nicht prüfbar: {exc}"
+            ))
+
+
+def _check_link_rows_for_import(
+    report: ImportCheckReport, file_name: str, headers: list[str], rows: list[tuple[int, list[str]]]
+) -> None:
+    """Web Link / Videos: Link ueber WEB_LINK_MAX_LENGTH (Fehler), derselbe Link zweimal beim Artikel (Hinweis)."""
+    seen: dict[tuple[str, str], int] = {}
+    for excel_row, row in rows:
+        article = ""
+        try:
+            article = _import_check_article(row[0] if row else "")
+            link = _import_check_cell(row, headers, "Link").strip()
+            if not link:
+                continue
+            if len(link) > WEB_LINK_MAX_LENGTH:
+                report.findings.append(ImportCheckFinding(
+                    RULE_SEVERITY_ERROR, RULE_LINK_TOO_LONG, file_name, article, excel_row, "Link", link,
+                    f"{len(link)} Zeichen – Apollo speichert nur die ersten {WEB_LINK_MAX_LENGTH}, der Link wäre dort "
+                    "abgeschnitten (toter Link).",
+                ))
+            key = (article, link_duplicate_key(link))
+            first_row = seen.get(key)
+            if first_row is None:
+                seen[key] = excel_row
+            else:
+                report.findings.append(ImportCheckFinding(
+                    RULE_SEVERITY_HINT, RULE_LINK_DUPLICATE, file_name, article, excel_row, "Link", link,
+                    f"derselbe Link wie Zeile {first_row}", "zweite Zeile entfernen",
+                ))
+        except Exception as exc:
+            report.findings.append(ImportCheckFinding(
+                RULE_SEVERITY_REVIEW, RULE_IMPORT_ROW_UNCHECKABLE, file_name, article, excel_row, "", "", f"Zeile nicht prüfbar: {exc}"
+            ))
+
+
+def _import_check_media_columns(file_name: str) -> tuple[list[str], str]:
+    if file_name == IMAGE_FILE[0]:
+        return IMAGE_HEADERS, "BILDPFAD"
+    return DOCUMENT_HEADERS, "Pfad zum Dokument"
+
+
+def _check_media_rows_for_import(report: ImportCheckReport, file_name: str, rows: list[tuple[int, list[str]]]) -> None:
+    """Bilder / Dokumente: dieselbe Datei (media_duplicate_key) mit gleicher Art und Sprache zweimal (Hinweis)."""
+    headers, path_header = _import_check_media_columns(file_name)
+    seen: dict[tuple[str, str, str, str], int] = {}
+    for excel_row, row in rows:
+        article = ""
+        try:
+            article = _import_check_article(_import_check_cell(row, headers, "Artikelnummer"))
+            path_text = _import_check_cell(row, headers, path_header).strip()
+            if not path_text:
+                continue
+            kind = _import_check_cell(row, headers, "Art").strip()
+            language = _import_check_cell(row, headers, "Sprache").strip()
+            key = (article, media_duplicate_key(path_text), kind, language)
+            first_row = seen.get(key)
+            if first_row is None:
+                seen[key] = excel_row
+                continue
+            report.findings.append(ImportCheckFinding(
+                RULE_SEVERITY_HINT, RULE_MEDIA_DUPLICATE, file_name, article, excel_row, path_header, path_text,
+                f"dieselbe Datei mit Art {kind or '-'} und Sprache {language or '-'} wie Zeile {first_row}",
+                "zweite Zeile entfernen",
+            ))
+        except Exception as exc:
+            report.findings.append(ImportCheckFinding(
+                RULE_SEVERITY_REVIEW, RULE_IMPORT_ROW_UNCHECKABLE, file_name, article, excel_row, "", "", f"Zeile nicht prüfbar: {exc}"
+            ))
+
+
+def _check_vehicle_rows_for_import(
+    report: ImportCheckReport, rows: list[tuple[int, list[str]]], genarts_without_vehicles: tuple[str, ...]
+) -> None:
+    """Fahrzeugzeilen fuer GenArten, an denen Apollo keine Fahrzeuge fuehrt: EIN Befund je (Artikel, GenArt) mit
+    row_count = Zeilenzahl und excel_row = erste Zeile (sonst fuellten 2.305 Zeilen Fenster und Bericht)."""
+    file_name = VEHICLE_LINK_FILE[0]
+    headers = VEHICLE_LINK_HEADERS
+    wanted = {str(genart).strip() for genart in genarts_without_vehicles if str(genart).strip()}
+    if not wanted:
+        return
+    groups: dict[tuple[str, str], list] = {}
+    for excel_row, row in rows:
+        genart = _import_check_cell(row, headers, "GenArt ID").strip()
+        if genart not in wanted:
+            continue
+        article = _import_check_article(_import_check_cell(row, headers, "Artikelnummer"))
+        group = groups.setdefault((article, genart), [excel_row, 0, _import_check_cell(row, headers, "GenArt Bezeichnung").strip()])
+        group[1] += 1
+    for (article, genart), (first_row, count, label) in groups.items():
+        report.findings.append(ImportCheckFinding(
+            RULE_SEVERITY_HINT, RULE_VEHICLE_GENART_WITHOUT_VEHICLES, file_name, article, first_row, "GenArt ID",
+            f"{genart} {label}".strip(),
+            f"Apollo führt an GenArt {genart} keine Fahrzeuge – {count} Fahrzeugzeile{'n' if count != 1 else ''} ab "
+            f"Zeile {first_row} bleiben wirkungslos (sie werden weiter geschrieben).",
+            row_count=count,
+        ))
+
+
+def check_output_rows(
+    rows_by_file: dict[str, list[tuple[int, list[str]]]],
+    attribute_options_by_id: dict[str, AttributeOption],
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    key_list_assignments: dict[str, KeyListAssignment] | None = None,
+    genarts_without_vehicles: tuple[str, ...] = DEFAULT_GENARTS_WITHOUT_VEHICLES,
+    catalog_date: str = "",
+    output_root: str = "",
+    checked_at: str = "",
+) -> ImportCheckReport:
+    """Pruefung vor dem Import (PLAN 7.3/7.6) auf den Rohzeilen aus read_output_rows_for_check.
+
+    attribute_key_values_by_group = der Index der App (build_attribute_key_value_index mit derselben Zuordnung);
+    key_list_assignments = die geltende Zuordnung (None = DEFAULT_KEY_LIST_ASSIGNMENTS) - nur fuer
+    'Listenwechsel nicht bestaetigt' und das Blatt 'Schluessellisten'; catalog_date = Dateidatum der
+    Schluesselwerte ('02.06.2026', steht im Grund von 'Kuerzel nicht in der Schluesselliste').
+    output_root/checked_at nur fuer den Kopf des Berichts. Liest keine Datei, wirft nicht wegen einzelner Zeilen
+    (Befund 'Zeile nicht pruefbar'). Befunde sortiert: Fehler, Pruefen, Hinweis; darin Datei und Excel-Zeile."""
+    report = ImportCheckReport(
+        output_root=str(output_root or ""),
+        checked_at=checked_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    rows_by_file = rows_by_file or {}
+    attribute_options_by_id = attribute_options_by_id or {}
+    attribute_key_values_by_group = attribute_key_values_by_group or {}
+    assignments = DEFAULT_KEY_LIST_ASSIGNMENTS if key_list_assignments is None else key_list_assignments
+    for (file_name, _sheet_name), _headers in OUTPUT_FILES_WITH_HEADERS:
+        if file_name in rows_by_file:
+            report.checked_rows[file_name] = len(rows_by_file[file_name])
+    for file_name, rows in rows_by_file.items():
+        report.checked_rows.setdefault(file_name, len(rows))
+
+    _check_attribute_rows_for_import(
+        report, rows_by_file.get(ATTRIBUTE_FILE[0], []), attribute_options_by_id, attribute_key_values_by_group,
+        assignments, catalog_date,
+    )
+    _check_search_term_rows_for_import(report, rows_by_file.get(USAGE_NUMBER_FILE[0], []))
+    _check_link_rows_for_import(report, WEB_LINK_FILE[0], WEB_HEADERS, rows_by_file.get(WEB_LINK_FILE[0], []))
+    _check_link_rows_for_import(report, VIDEO_FILE[0], VIDEO_HEADERS, rows_by_file.get(VIDEO_FILE[0], []))
+    _check_media_rows_for_import(report, IMAGE_FILE[0], rows_by_file.get(IMAGE_FILE[0], []))
+    _check_media_rows_for_import(report, DOCUMENT_FILE[0], rows_by_file.get(DOCUMENT_FILE[0], []))
+    _check_vehicle_rows_for_import(report, rows_by_file.get(VEHICLE_LINK_FILE[0], []), tuple(genarts_without_vehicles or ()))
+    report.findings = sort_import_check_findings(report.findings)
+    return report
+
+
+def _import_check_is_link(path_text: str) -> bool:
+    return path_text.strip().casefold().startswith(("http://", "https://", "ftp://"))
+
+
+def find_identical_media_files(
+    rows_by_file: dict[str, list[tuple[int, list[str]]]], base_dir: Path | str | None = None
+) -> list[ImportCheckFinding]:
+    """Medienvergleich auf Wunsch (Knopf 'Mediendateien vergleichen…', eigener Hintergrundvorgang OHNE Schreibsperre;
+    auf G: rund 10-15 s): je Artikel und Datei (Bilder, Dokumente)
+    - 'Mediendatei fehlt' (Fehler): lokaler Pfad, den es nicht (als Datei) gibt;
+    - 'Mediendatei inhaltsgleich' (Hinweis): gleiche Groesse und gleicher SHA-1 wie eine FRUEHERE Zeile des Artikels
+      unter einem anderen Namen (gleicher Name = 'Mediendatei doppelt' bzw. erlaubt bei anderer Art/Sprache).
+    Links (http/https) werden nicht geprueft. Relative Pfade gelten relativ zu base_dir (sonst wie angegeben).
+    Liest die Dateien nur; der Hash wird nur bei gleicher Groesse gebildet."""
+    findings: list[ImportCheckFinding] = []
+    digests: dict[str, str] = {}
+
+    def digest(path: Path) -> str:
+        key = os.path.normcase(str(path))
+        if key not in digests:
+            hasher = hashlib.sha1()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            digests[key] = hasher.hexdigest()
+        return digests[key]
+
+    for file_name in (IMAGE_FILE[0], DOCUMENT_FILE[0]):
+        headers, path_header = _import_check_media_columns(file_name)
+        earlier_by_article: dict[str, list[tuple[int, str, Path, int]]] = {}
+        for excel_row, row in (rows_by_file or {}).get(file_name, []):
+            article = ""
+            try:
+                article = _import_check_article(_import_check_cell(row, headers, "Artikelnummer"))
+                path_text = _import_check_cell(row, headers, path_header).strip()
+                if not path_text or _import_check_is_link(path_text):
+                    continue
+                path = Path(path_text)
+                if base_dir is not None and not path.is_absolute():
+                    path = Path(base_dir) / path
+                try:
+                    stat_result = path.stat()
+                    is_file = path.is_file()
+                except OSError:
+                    is_file = False
+                if not is_file:
+                    findings.append(ImportCheckFinding(
+                        RULE_SEVERITY_ERROR, RULE_MEDIA_MISSING, file_name, article, excel_row, path_header, path_text,
+                        "Die Datei ist nicht vorhanden bzw. nicht lesbar – IMS findet sie beim Import nicht.",
+                    ))
+                    continue
+                size = stat_result.st_size
+                # Dieselbe Datei (gleicher Name bzw. gleicher Pfad anders geschrieben) ist nicht 'inhaltsgleich':
+                # das meldet 'Mediendatei doppelt' bzw. ist bei anderer Art/Sprache erlaubt.
+                own_key = os.path.normcase(os.path.abspath(str(path)))
+                earlier_rows = earlier_by_article.setdefault(article, [])
+                for earlier_row, earlier_key, earlier_path, earlier_size in earlier_rows:
+                    if earlier_size != size or earlier_key == own_key or media_duplicate_key(str(earlier_path)) == media_duplicate_key(str(path)):
+                        continue
+                    if digest(earlier_path) == digest(path):
+                        findings.append(ImportCheckFinding(
+                            RULE_SEVERITY_HINT, RULE_MEDIA_IDENTICAL, file_name, article, excel_row, path_header, path_text,
+                            f"gleiche Größe ({size} Bytes) und gleicher SHA-1 wie Zeile {earlier_row} ({earlier_path.name})",
+                            "zweite Zeile entfernen",
+                        ))
+                        break
+                earlier_rows.append((excel_row, own_key, path, size))
+            except Exception as exc:
+                findings.append(ImportCheckFinding(
+                    RULE_SEVERITY_REVIEW, RULE_IMPORT_ROW_UNCHECKABLE, file_name, article, excel_row, "", "",
+                    f"Zeile nicht prüfbar: {exc}",
+                ))
+    return sort_import_check_findings(findings)
+
+
+def _import_check_autosize(sheet, widths: dict[str, int]) -> None:
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+
+
+def write_import_check_report(path: Path, report: ImportCheckReport) -> None:
+    """Excel-Bericht (PLAN 7.8): Blaetter 'Zusammenfassung', 'Befunde', 'Schluessellisten', 'Regeln'.
+    Schreiben ueber Temp-Datei + os.replace (Muster write_import_delete_list). OSError geht an den Aufrufer
+    (z. B. Datei in Excel offen). Ob das Ziel im Ausgabeordner liegt, prueft der Aufrufer
+    (import_check_report_target_error)."""
+    path = Path(path)
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Zusammenfassung"
+    summary.append(["Prüfung vor dem Import"])
+    summary.append(["Ausgabeordner", report.output_root])
+    summary.append(["geprüft am", report.checked_at])
+    summary.append([
+        "Ergebnis",
+        f"{report.count(RULE_SEVERITY_ERROR)} Fehler, {report.count(RULE_SEVERITY_REVIEW)} zu prüfen, "
+        f"{report.count(RULE_SEVERITY_HINT)} Hinweise ({report.row_total()} Zeilen betroffen)",
+    ])
+    summary.append([])
+    summary.append(["Regel", "Stufe", "Befunde", "Zeilen", "Was Apollo damit macht"])
+    for rule, severity, number, row_count in report.by_rule(include_empty=True):
+        summary.append([rule, severity, number, row_count, import_check_rule_info(rule)[1]])
+    summary.append([])
+    summary.append(["Hinweise"])
+    for note in report.notes or ["keine"]:
+        summary.append(["", _sanitize_cell_value(note)])
+    summary.append([])
+    summary.append(["Grundlage"])
+    summary.append(["", "Ausgabeordner", report.output_root])
+    summary.append(["", "geprüft am", report.checked_at])
+    for label, value in report.basis:
+        summary.append(["", _sanitize_cell_value(label), _sanitize_cell_value(value)])
+    for file_name, count in report.checked_rows.items():
+        summary.append(["", f"geprüfte Zeilen {file_name}", count])
+    _import_check_autosize(summary, {"A": 46, "B": 34, "C": 60, "D": 10, "E": 90})
+
+    findings_sheet = workbook.create_sheet("Befunde")
+    findings_sheet.append(list(IMPORT_CHECK_HEADERS))
+    for finding in sort_import_check_findings(report.findings):
+        cells: list[object] = [_sanitize_cell_value(cell) for cell in finding.as_row()]
+        cells[3] = finding.excel_row
+        cells[9] = finding.row_count
+        findings_sheet.append(cells)
+    findings_sheet.freeze_panes = "A2"
+    findings_sheet.auto_filter.ref = f"A1:J{max(1, len(report.findings) + 1)}"
+    _import_check_autosize(findings_sheet, {"A": 9, "B": 44, "C": 26, "D": 11, "E": 20, "F": 34, "G": 30, "H": 90, "I": 40, "J": 8})
+
+    key_list_sheet = workbook.create_sheet("Schluessellisten")
+    key_list_sheet.append(list(IMPORT_CHECK_KEY_LIST_HEADERS))
+    for key_list_row in report.key_lists:
+        key_list_sheet.append([_sanitize_cell_value(cell) for cell in key_list_row])
+    key_list_sheet.freeze_panes = "A2"
+    _import_check_autosize(key_list_sheet, {"A": 40, "B": 12, "C": 40, "D": 30, "E": 10, "F": 8, "G": 30, "H": 60})
+
+    rules_sheet = workbook.create_sheet("Regeln")
+    rules_sheet.append(["Regel", "Stufe", "Was Apollo damit macht"])
+    for rule, severity, text in IMPORT_CHECK_RULES:
+        rules_sheet.append([rule, severity, text])
+    rules_sheet.append([])
+    rules_sheet.append(["Stufen"])
+    for severity in IMPORT_CHECK_SEVERITIES:
+        rules_sheet.append([severity, "", IMPORT_CHECK_SEVERITY_TEXTS.get(severity, "")])
+    _import_check_autosize(rules_sheet, {"A": 46, "B": 10, "C": 110})
+
+    temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    try:
+        workbook.save(temp_path)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+# Ergebnisfenster (ImportCheckWindow) und App-Aktionen - reine Helfer, ohne Tk testbar.
+IMPORT_CHECK_FILTER_ALL = "alle"
+IMPORT_CHECK_BUTTON_TEXT = "Prüfung vor dem Import…"
+# (Spalten-ID, Kopf, Breite) der Tabelle im Ergebnisfenster.
+IMPORT_CHECK_TABLE_COLUMNS: tuple[tuple[str, str, int], ...] = (
+    ("severity", "Stufe", 70),
+    ("rule", "Regel", 260),
+    ("file", "Datei", 160),
+    ("row", "Zeile", 70),
+    ("article", "Artikel", 120),
+    ("field", "Feld", 210),
+    ("value", "Wert", 170),
+    ("reason", "Grund", 460),
+    ("proposal", "Vorschlag", 240),
+)
+IMPORT_CHECK_NOT_READY_QUESTION = (
+    "Attributkatalog bzw. Schlüsselwerte sind nicht geladen – Schlüsselwert-Zeilen können nicht geprüft werden."
+    "\n\nTrotzdem prüfen (alle übrigen Regeln)?"
+)
+IMPORT_CHECK_FLUSH_FAILED_TEXT = (
+    "Es werden noch Änderungen gespeichert – die Prüfung sähe einen halben Stand. Bitte kurz warten und erneut versuchen."
+)
+
+
+def import_check_table_values(finding: ImportCheckFinding) -> tuple[str, ...]:
+    """Zellen einer Tabellenzeile in der Reihenfolge von IMPORT_CHECK_TABLE_COLUMNS. Gebuendelte Befunde
+    (Fahrzeuge) zeigen die Zahl der Zeilen: '286 (140 Zeilen)'."""
+    row_text = str(finding.excel_row)
+    if finding.row_count > 1:
+        row_text += f" ({finding.row_count} Zeilen)"
+    return (
+        finding.severity, finding.rule, finding.file_name, row_text, finding.article_number,
+        finding.field, finding.value, finding.reason, finding.proposal,
+    )
+
+
+def sort_import_check_table(
+    findings: list[ImportCheckFinding], column: str = "", descending: bool = False
+) -> list[ImportCheckFinding]:
+    """Sortierung per Spaltenkopf: Stufe nach Rang, Zeile als Zahl, sonst Text ohne Gross/Klein; bei
+    Gleichstand die Reihenfolge des Berichts (sort_import_check_findings). Unbekannte Spalte: Bericht."""
+    base = sort_import_check_findings(findings)
+    columns = [name for name, _heading, _width in IMPORT_CHECK_TABLE_COLUMNS]
+    if column not in columns:
+        return list(reversed(base)) if descending else base
+    position = {id(finding): rank for rank, finding in enumerate(base)}
+    index = columns.index(column)
+
+    def key(finding: ImportCheckFinding) -> tuple:
+        if column == "severity":
+            primary: object = _IMPORT_CHECK_SEVERITY_RANK.get(finding.severity, len(IMPORT_CHECK_SEVERITIES))
+        elif column == "row":
+            primary = finding.excel_row
+        else:
+            primary = import_check_table_values(finding)[index].casefold()
+        return (primary, position[id(finding)])
+
+    return sorted(base, key=key, reverse=descending)
+
+
+def import_check_rule_choices(report: ImportCheckReport | None) -> list[str]:
+    """Auswahl 'Regel' im Ergebnisfenster: 'alle' und die Regeln mit Befund (Reihenfolge des Berichts)."""
+    rules = [rule for rule, _severity, _count, _rows in report.by_rule()] if report is not None else []
+    return [IMPORT_CHECK_FILTER_ALL, *rules]
+
+
+def import_check_summary_lines(report: ImportCheckReport) -> list[str]:
+    """Uebersicht je Regel im Kopf des Ergebnisfensters: 'Regel – Stufe – Befunde – Zeilen'."""
+    lines = [
+        f"{rule} – {severity} – {count} Befund{'e' if count != 1 else ''} – {rows} Zeile{'n' if rows != 1 else ''}"
+        for rule, severity, count, rows in report.by_rule()
+    ]
+    return lines or ["Keine Befunde – alle geprüften Zeilen halten die Regeln ein."]
+
+
+def import_check_key_list_change_question(
+    criteria_label: str, list_text: str, previous_text: str, reported_rows: int
+) -> str:
+    """Rueckfrage je Kriterium bei 'Listenwechsel als geprüft vermerken…' (PLAN 7.5)."""
+    return (
+        f"{criteria_label}: {list_text}, vorher {previous_text} – {reported_rows} "
+        f"Zeile{'n' if reported_rows != 1 else ''} gemeldet. Sind alle Zeilen dieses Kriteriums geprüft bzw. "
+        "korrigiert? Danach meldet die Prüfung diesen Listenwechsel nicht mehr."
+    )
+
+
+def import_check_media_summary(found: list[ImportCheckFinding]) -> str:
+    """Satz fuer Statuszeile und Hinweise nach 'Mediendateien vergleichen…'."""
+    identical = sum(1 for finding in found if finding.rule == RULE_MEDIA_IDENTICAL)
+    missing = sum(1 for finding in found if finding.rule == RULE_MEDIA_MISSING)
+    other = len(found) - identical - missing
+    text = f"Mediendateien verglichen: {identical} inhaltsgleich, {missing} fehlen"
+    if other:
+        text += f", {other} nicht prüfbar"
+    return text + "."
 
 
 def format_import_stand_label(
@@ -12085,11 +14545,28 @@ class MediaTableFrame(ttk.LabelFrame):
         )
         if not selected:
             return
+        existing = self.get_rows()
+        skipped: list[str] = []
+        added = 0
         for path in selected:
             art = infer_document_art(path) if self.infer_art else self.art_var.get().strip() or self.default_art
             sprache = self.sprache_var.get().strip() or self.default_sprache
+            new_row = MediaRow(path_or_link=str(path).strip(), art=art, sprache=sprache)
+            if media_duplicate_error(existing, new_row):
+                skipped.append(str(path))
+                continue
+            existing.append(new_row)
             self.tree.insert("", "end", values=(path, art, sprache))
+            added += 1
         self.path_var.set(selected[-1])
+        if skipped:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"{len(skipped)} Datei(en) stehen schon in der Liste und wurden nicht noch einmal übernommen:\n"
+                + "\n".join(skipped),
+            )
+        if not added:
+            return
         self._select_first_row()
         self._emit_change()
 
@@ -12103,9 +14580,27 @@ class MediaTableFrame(ttk.LabelFrame):
         if self.infer_art and not self.art_var.get().strip():
             art = infer_document_art(path)
             self.art_var.set(art)
+        error = media_duplicate_error(self.get_rows(), MediaRow(path_or_link=path, art=art, sprache=sprache))
+        if error:
+            messagebox.showwarning(APP_TITLE, error)
+            return
         self.tree.insert("", "end", values=(path, art, sprache))
         self._select_first_row(select_last=True)
         self._emit_change()
+
+    def _row_values(self, item_id: str) -> tuple[str, str, str]:
+        values = [str(value).strip() for value in self.tree.item(item_id, "values")]
+        values.extend([""] * max(0, 3 - len(values)))
+        return values[0], values[1], values[2]
+
+    def _other_rows(self, except_item: str) -> list[MediaRow]:
+        rows: list[MediaRow] = []
+        for item_id in self.tree.get_children():
+            if item_id == except_item:
+                continue
+            path, art, sprache = self._row_values(item_id)
+            rows.append(MediaRow(path_or_link=path, art=art, sprache=sprache))
+        return rows
 
     def update_selected_row(self) -> None:
         selected = self.tree.selection()
@@ -12120,6 +14615,14 @@ class MediaTableFrame(ttk.LabelFrame):
 
         art = self.art_var.get().strip() or self.default_art
         sprache = self.sprache_var.get().strip() or self.default_sprache
+        # Unveraenderte Zeile wird nicht geprueft (ab v0.1.58).
+        if (path, art, sprache) != self._row_values(selected[0]):
+            error = media_duplicate_error(
+                self._other_rows(selected[0]), MediaRow(path_or_link=path, art=art, sprache=sprache)
+            )
+            if error:
+                messagebox.showwarning(APP_TITLE, error)
+                return
         self.tree.item(selected[0], values=(path, art, sprache))
         self.tree.focus(selected[0])
         self._handle_selection()
@@ -12327,6 +14830,17 @@ class MediaTableFrame(ttk.LabelFrame):
         values[column_index] = new_value
         if self.infer_art and column_index == 0 and not str(values[1]).strip():
             values[1] = infer_document_art(new_value)
+        # Alle drei Spalten: auch eine geaenderte Art/Sprache kann ein Doppel erzeugen. Unveraenderte Zeile
+        # (der Editor schliesst bei jedem Fokusverlust ueber diese Methode): keine Pruefung.
+        new_values = tuple(str(value).strip() for value in values[:3])
+        if new_values != self._row_values(item_id):
+            error = media_duplicate_error(
+                self._other_rows(item_id),
+                MediaRow(path_or_link=new_values[0], art=new_values[1], sprache=new_values[2]),
+            )
+            if error:
+                messagebox.showwarning(APP_TITLE, error)
+                return
 
         self.tree.item(item_id, values=values)
         self.tree.selection_set(item_id)
@@ -12571,6 +15085,13 @@ class LinkTableFrame(ttk.LabelFrame):
         self.tree.grid(row=1, column=0, sticky="nsew")
         self.tree.heading("link", text=label_text)
         self.tree.column("link", width=780, anchor="w")
+        # Bestandslinks ueber WEB_LINK_MAX_LENGTH: rot markiert + Hinweis unter der Tabelle (ab v0.1.58);
+        # sie bleiben in der Liste und im Export.
+        self.tree.tag_configure("too_long", foreground="#B3261E")
+        self.long_link_var = tk.StringVar(value="")
+        self.long_link_label = ttk.Label(self, textvariable=self.long_link_var, foreground="#B3261E")
+        self.long_link_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.long_link_label.grid_remove()
 
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
@@ -12610,6 +15131,34 @@ class LinkTableFrame(ttk.LabelFrame):
         self.bind("<Configure>", self._handle_resize)
         self.after_idle(self._apply_responsive_layout)
 
+    def _row_link(self, item_id: str) -> str:
+        values = self.tree.item(item_id, "values")
+        return str(values[0]).strip() if values else ""
+
+    def _other_links(self, except_item: str | None) -> list[str]:
+        return [self._row_link(item_id) for item_id in self.tree.get_children() if item_id != except_item]
+
+    def _refresh_long_link_marks(self) -> None:
+        """Zeilen ueber WEB_LINK_MAX_LENGTH rot markieren; Hinweis nur, wenn es solche Zeilen gibt. Wirft nie."""
+        try:
+            count = 0
+            for item_id in self.tree.get_children():
+                too_long = len(self._row_link(item_id)) > WEB_LINK_MAX_LENGTH
+                count += 1 if too_long else 0
+                self.tree.item(item_id, tags=("too_long",) if too_long else ())
+            if count:
+                self.long_link_var.set(
+                    f"1 Link länger als {WEB_LINK_MAX_LENGTH} Zeichen – Apollo schneidet ihn ab."
+                    if count == 1
+                    else f"{count} Links länger als {WEB_LINK_MAX_LENGTH} Zeichen – Apollo schneidet sie ab."
+                )
+                self.long_link_label.grid()
+            else:
+                self.long_link_var.set("")
+                self.long_link_label.grid_remove()
+        except Exception as exc:  # pragma: no cover - Markierung darf das Laden nie abbrechen
+            log_perf("Links: Markierung fehlgeschlagen", 0, detail=str(exc), always=True)
+
     def add_row(self) -> None:
         link = self.link_var.get().strip()
         if not link:
@@ -12617,7 +15166,12 @@ class LinkTableFrame(ttk.LabelFrame):
             return
         if self.normalize_link_fn is not None:
             link = self.normalize_link_fn(link)
+        error = link_entry_error(link, self._other_links(None))
+        if error:
+            messagebox.showwarning(APP_TITLE, error)
+            return
         self.tree.insert("", "end", values=(link,))
+        self._refresh_long_link_marks()
         children = list(self.tree.get_children())
         if children:
             self.tree.selection_set(children[-1])
@@ -12637,7 +15191,14 @@ class LinkTableFrame(ttk.LabelFrame):
             return
         if self.normalize_link_fn is not None:
             link = self.normalize_link_fn(link)
+        # Unveraenderte Zeile wird nicht geprueft (ein Bestandslink ueber 300 Zeichen bleibt bearbeitbar).
+        if link != self._row_link(selected[0]):
+            error = link_entry_error(link, self._other_links(selected[0]))
+            if error:
+                messagebox.showwarning(APP_TITLE, error)
+                return
         self.tree.item(selected[0], values=(link,))
+        self._refresh_long_link_marks()
         self.tree.focus(selected[0])
         self._handle_selection()
         self._emit_change()
@@ -12645,6 +15206,7 @@ class LinkTableFrame(ttk.LabelFrame):
     def remove_selected(self) -> None:
         for item_id in self.tree.selection():
             self.tree.delete(item_id)
+        self._refresh_long_link_marks()
         children = list(self.tree.get_children())
         if children:
             self.tree.selection_set(children[0])
@@ -12738,8 +15300,16 @@ class LinkTableFrame(ttk.LabelFrame):
             return
         if self.normalize_link_fn is not None:
             link = self.normalize_link_fn(link)
+        # Der Editor schliesst bei jedem Fokusverlust ueber diese Methode: eine unveraenderte Zeile wird nicht
+        # geprueft (sonst kaeme bei einem Bestandslink ueber 300 Zeichen die Warnung schon beim Anklicken).
+        if link != self._row_link(item_id):
+            error = link_entry_error(link, self._other_links(item_id))
+            if error:
+                messagebox.showwarning(APP_TITLE, error)
+                return
 
         self.tree.item(item_id, values=(link,))
+        self._refresh_long_link_marks()
         self.tree.selection_set(item_id)
         self.tree.focus(item_id)
         self._handle_selection()
@@ -13040,6 +15610,7 @@ class LinkTableFrame(ttk.LabelFrame):
             if self.normalize_link_fn is not None:
                 link = self.normalize_link_fn(link)
             self.tree.insert("", "end", values=(link,))
+        self._refresh_long_link_marks()
         self._select_first_row()
 
 
@@ -14870,6 +17441,8 @@ class SearchTermFrame(ttk.LabelFrame):
         self.tree.heading("length", text="Zeichen")
         self.tree.column("term", width=420, anchor="w")
         self.tree.column("length", width=90, anchor="center")
+        # Bestandswoerter ueber SEARCH_TERM_MAX_LENGTH: rot markiert, nicht entfernt (ab v0.1.58).
+        self.tree.tag_configure("too_long", foreground="#B3261E")
         self.tree.bind("<Button-3>", self._open_context_menu)
 
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
@@ -14889,8 +17462,16 @@ class SearchTermFrame(ttk.LabelFrame):
             self.on_auto()
 
     def _update_count(self) -> None:
-        count = len(self.tree.get_children())
-        self.count_var.set(f"{count} Suchwörter" if count != 1 else "1 Suchwort")
+        children = self.tree.get_children()
+        count = len(children)
+        text = f"{count} Suchwörter" if count != 1 else "1 Suchwort"
+        too_long = sum(1 for item_id in children if search_term_too_long(str(self.tree.item(item_id, "values")[0])))
+        if too_long:
+            text += (
+                f", davon {too_long} länger als {SEARCH_TERM_MAX_LENGTH} Zeichen "
+                "(Apollo schneidet ab oder lehnt ab)"
+            )
+        self.count_var.set(text)
 
     def add_terms(self) -> None:
         raw = self.term_var.get().strip()
@@ -14900,8 +17481,8 @@ class SearchTermFrame(ttk.LabelFrame):
         candidates = normalize_search_terms(split_code_list_input(raw))
         if not candidates:
             return
-        too_long = [term for term in candidates if len(term) > SEARCH_TERM_MAX_LENGTH]
-        candidates = [term for term in candidates if len(term) <= SEARCH_TERM_MAX_LENGTH]
+        too_long = [term for term in candidates if search_term_too_long(term)]
+        candidates = [term for term in candidates if not search_term_too_long(term)]
         existing = {term.casefold() for term in self.get_terms()}
         added = 0
         for term in candidates:
@@ -14914,7 +17495,8 @@ class SearchTermFrame(ttk.LabelFrame):
         if too_long:
             messagebox.showwarning(
                 APP_TITLE,
-                f"Diese Suchwörter sind länger als {SEARCH_TERM_MAX_LENGTH} Zeichen und wurden nicht übernommen:\n"
+                f"Diese Suchwörter sind länger als {SEARCH_TERM_MAX_LENGTH} Zeichen und wurden nicht übernommen "
+                f"(Apollo speichert höchstens {SEARCH_TERM_MAX_LENGTH} Zeichen):\n"
                 + "\n".join(too_long),
             )
         if added:
@@ -14954,7 +17536,8 @@ class SearchTermFrame(ttk.LabelFrame):
         for item_id in self.tree.get_children():
             self.tree.delete(item_id)
         for term in normalize_search_terms(terms):
-            self.tree.insert("", "end", values=(term, len(term)))
+            # Kein Filter: ein vorhandenes langes Suchwort bleibt, bis der User es aendert - nur markiert.
+            self.tree.insert("", "end", values=(term, len(term)), tags=("too_long",) if search_term_too_long(term) else ())
         self._update_count()
 
     def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
@@ -15334,10 +17917,71 @@ class SearchTermSuggestionDialog:
         return self.result
 
 
+# Hinweise, solange Attributkatalog bzw. Schluesselwerte nicht geladen sind (ab v0.1.58).
+ATTRIBUTE_CATALOG_WARNING_TEXT = (
+    "Achtung: Attributkatalog bzw. Schlüsselwerte sind nicht geladen (Laufwerk G: nicht erreichbar?). "
+    "Eingaben werden NICHT gegen die Schlüssellisten geprüft. Unter Projekt › Datenstämme 'Neu laden' wählen."
+)
+ATTRIBUTE_CATALOG_STATUS_WARNING = (
+    "Achtung: Schlüsselwerte bzw. Attributkatalog nicht geladen – Schlüsselwert-Eingaben werden nicht geprüft."
+)
+ATTRIBUTE_FLAG_FORMAT_KEY = "flag (ja / nein)"
+
+
+def attribute_row_mask_key(row: AttributeRow) -> tuple[str, str, str]:
+    """Vergleichsschluessel 'steht so schon in der Maske': Kriterien-ID, Wert, Wert bis."""
+    return (row.criteria_id.strip(), row.value.strip(), row.value_to.strip())
+
+
+def attribute_rows_same_entry(left: AttributeRow, right: AttributeRow) -> bool:
+    """Gleiche Zeile im Sinn der Maske: Kriterien-ID, Format, Wert, Wert bis. Eine unveraenderte
+    Bestandszeile wird beim 'Auswahl aktualisieren' nicht gegen die Eingaberegeln geprueft."""
+    return (
+        left.criteria_id.strip() == right.criteria_id.strip()
+        and left.value_format.strip().casefold() == right.value_format.strip().casefold()
+        and left.value.strip() == right.value.strip()
+        and left.value_to.strip() == right.value_to.strip()
+    )
+
+
+def attribute_key_value_hint_text(
+    row: AttributeRow,
+    attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]],
+    catalog_date: str = "",
+) -> str:
+    """Hinweiszeile der Maske fuer ein Schluesselwert-Kriterium (Liste da / keine Liste / Kataloge fehlen)."""
+    if not attribute_key_value_lists_ready(attribute_key_values_by_group):
+        return (
+            "Format: Schlüsselwert. Schlüsselwerte bzw. Attributkatalog sind nicht geladen – Eingaben werden "
+            "NICHT geprüft und unverändert gespeichert."
+        )
+    options = attribute_key_value_list_for(row.criteria_id, attribute_key_values_by_group)
+    if not options:
+        return (
+            "Format: Schlüsselwert. Für dieses Kriterium ist keine gültige Schlüsselliste zugeordnet – bitte "
+            "'Schlüsselliste zuordnen…' wählen; ohne Liste kann kein Wert übernommen werden."
+        )
+    stand = f", Stand der Datei: {catalog_date}" if catalog_date else ""
+    return (
+        f"Format: Schlüsselwert. Schlüsselliste: {attribute_key_value_list_label(options)} "
+        f"({len(options)} Werte{stand}). Wert im Feld 'Wert' suchen und aus der Liste wählen – gespeichert "
+        "wird das Kürzel. Kein Bereich ('Wert bis' bleibt leer)."
+    )
+
+
 class AttributeTableFrame(ttk.LabelFrame):
-    def __init__(self, master: tk.Misc, on_change: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_change: Callable[[], None] | None = None,
+        on_assign_key_list: Callable[[str], None] | None = None,
+    ) -> None:
         super().__init__(master, text="Attribute", padding=14)
         self.on_change = on_change
+        self.on_assign_key_list = on_assign_key_list
+        # Regelverstoesse der Bestandszeilen (Item-ID -> Meldung), siehe _refresh_row_marks.
+        self.row_violations: dict[str, str] = {}
+        self.key_value_catalog_date = ""
         self.catalog_options: list[AttributeOption] = []
         self.catalog_by_id: dict[str, AttributeOption] = {}
         self.catalog_by_label: dict[str, AttributeOption] = {}
@@ -15371,12 +18015,24 @@ class AttributeTableFrame(ttk.LabelFrame):
         header.columnconfigure(1, weight=1)
         header.columnconfigure(5, weight=1)
 
+        intro = ttk.Frame(header)
+        intro.grid(row=0, column=0, columnspan=9, sticky="ew", pady=(0, 10))
+        # Fester roter Hinweis, solange Attributkatalog bzw. Schluesselwerte nicht geladen sind -
+        # unabhaengig vom Feld 'Format' (siehe _update_catalog_warning).
+        self.catalog_warning_label = ttk.Label(
+            intro,
+            text=ATTRIBUTE_CATALOG_WARNING_TEXT,
+            foreground="#B3261E",
+            wraplength=980,
+            justify="left",
+        )
+        self.catalog_warning_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
         ttk.Label(
-            header,
+            intro,
             text="Attribute werden über die TecDoc Kriterien ID ausgewählt. Format und maximale Länge dienen als Pflegehilfe.",
             foreground="#5E6472",
             wraplength=980,
-        ).grid(row=0, column=0, columnspan=9, sticky="w", pady=(0, 10))
+        ).grid(row=1, column=0, sticky="w")
 
         ttk.Label(header, text="Attribut").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         self.attribute_entry = ttk.Entry(header, textvariable=self.attribute_display_var)
@@ -15408,20 +18064,28 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.value_entry.bind("<FocusOut>", self._handle_value_focus_out)
 
         ttk.Label(header, text="Wert bis").grid(row=3, column=6, sticky="w", padx=(12, 8), pady=4)
-        ttk.Entry(header, textvariable=self.value_to_var).grid(row=3, column=7, sticky="ew", pady=4)
+        self.value_to_entry = ttk.Entry(header, textvariable=self.value_to_var)
+        self.value_to_entry.grid(row=3, column=7, sticky="ew", pady=4)
 
         quick_row = ttk.Frame(header)
         quick_row.grid(row=3, column=8, sticky="e", padx=(12, 0), pady=4)
-        ttk.Button(quick_row, text="Ja", command=lambda: self.value_var.set("Ja")).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(quick_row, text="Nein", command=lambda: self.value_var.set("Nein")).grid(row=0, column=1)
+        # Ja/Nein nur bei Format Flag aktiv (_update_entry_controls).
+        self.yes_button = ttk.Button(quick_row, text="Ja", command=lambda: self.value_var.set("Ja"))
+        self.yes_button.grid(row=0, column=0, padx=(0, 6))
+        self.no_button = ttk.Button(quick_row, text="Nein", command=lambda: self.value_var.set("Nein"))
+        self.no_button.grid(row=0, column=1)
 
-        ttk.Label(header, textvariable=self.hint_var, foreground="#5E6472", wraplength=980).grid(
+        ttk.Label(header, textvariable=self.hint_var, foreground="#5E6472", wraplength=820).grid(
             row=4,
             column=0,
-            columnspan=9,
+            columnspan=8,
             sticky="w",
             pady=(6, 8),
         )
+        self.assign_button = ttk.Button(
+            header, text="Schlüsselliste zuordnen…", command=self._emit_assign_key_list, state="disabled"
+        )
+        self.assign_button.grid(row=4, column=8, sticky="e", padx=(12, 0), pady=(6, 8))
 
         actions = ttk.Frame(header)
         actions.grid(row=5, column=0, columnspan=9, sticky="w")
@@ -15445,24 +18109,94 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.tree.column("value_to", width=160, anchor="w")
         self.tree.bind("<<TreeviewSelect>>", self._handle_selection)
         self.tree.bind("<Button-3>", self._open_context_menu)
+        # Bestandszeilen mit Regelverstoss: rot = Fehler, orange = bitte pruefen (_refresh_row_marks).
+        self.tree.tag_configure(ATTRIBUTE_ROW_ERROR_TAG, foreground="#B3261E")
+        self.tree.tag_configure(ATTRIBUTE_ROW_REVIEW_TAG, foreground="#B45309")
 
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
+        # Auch von Hand getippte Kriterien-ID/Format loesen die Sperren richtig aus.
+        for variable in (self.criteria_id_var, self.format_var, self.value_to_var):
+            variable.trace_add("write", lambda *_args: self._update_entry_controls())
+        self._update_catalog_warning()
+        self._update_entry_controls()
+
     def set_attribute_catalog(self, options: list[AttributeOption]) -> None:
         self.catalog_options = list(options)
         self.catalog_by_id = {option.criteria_id: option for option in self.catalog_options}
-        self.catalog_by_label = {option.display_label(): option for option in self.catalog_options}
+        # Auswahl mit Nummer UND Herkunft (gleichnamige Kriterien unterscheidbar).
+        self.catalog_by_label = {attribute_option_choice_label(option): option for option in self.catalog_options}
         self._update_attribute_combo_values(self.attribute_display_var.get())
         self._sync_current_attribute_metadata()
+        self._update_entry_controls()
+        self._update_hint()
+        self._refresh_row_marks()
 
     def set_attribute_key_value_catalog(
         self,
         options_by_group: dict[str, list[AttributeKeyValueOption]],
+        catalog_date: str = "",
     ) -> None:
         self.key_value_options_by_group = {key: list(values) for key, values in options_by_group.items()}
+        self.key_value_catalog_date = catalog_date
+        self._update_catalog_warning()
+        self.refresh_key_value_display()
         self._normalize_current_value_selection()
+        self._update_entry_controls()
+        self._update_hint()
+
+    def _update_catalog_warning(self) -> None:
+        """Roten Hinweis zeigen, solange die Kataloge nicht bereit sind (sonst ausblenden)."""
+        label = getattr(self, "catalog_warning_label", None)
+        if label is None:
+            return
+        try:
+            if attribute_key_value_lists_ready(self.key_value_options_by_group):
+                label.grid_remove()
+            else:
+                label.grid()
+        except tk.TclError:  # pragma: no cover - Fenster wird gerade abgebaut
+            pass
+
+    def _set_control_enabled(self, name: str, enabled: bool) -> None:
+        widget = getattr(self, name, None)
+        if widget is None:
+            return
+        try:
+            widget.configure(state="normal" if enabled else "disabled")
+        except tk.TclError:  # pragma: no cover - Fenster wird gerade abgebaut
+            pass
+
+    def _effective_format(self) -> str:
+        """Format des Katalogs, wenn er die Kriterien-ID kennt, sonst das Feld 'Format'. Fuer neue Eingaben
+        zaehlt damit dieselbe Bedingung 'Schluesselwert-Zeile' wie in Export, Laden und Regel."""
+        option = self.catalog_by_id.get(self.criteria_id_var.get().strip())
+        if option is not None and option.value_format.strip():
+            return option.value_format.strip()
+        return self.format_var.get().strip()
+
+    def _update_entry_controls(self) -> None:
+        """Setzt IMMER alle drei Zustaende: 'Wert bis' (bei Schluesselwert gesperrt, solange es leer ist -
+        ein gefuellter Bestandswert bleibt offen, damit man ihn leeren kann), Ja/Nein (nur Format Flag),
+        'Schlüsselliste zuordnen…' (nur wenn der Index das Kriterium kennt)."""
+        value_format = self._effective_format()
+        is_key_value = is_attribute_key_value_format(value_format)
+        self._set_control_enabled("value_to_entry", not (is_key_value and not self.value_to_var.get().strip()))
+        is_flag = value_format.casefold() == ATTRIBUTE_FLAG_FORMAT_KEY
+        self._set_control_enabled("yes_button", is_flag)
+        self._set_control_enabled("no_button", is_flag)
+        known = (
+            self.on_assign_key_list is not None
+            and attribute_key_value_list_for(self.criteria_id_var.get().strip(), self.key_value_options_by_group) is not None
+        )
+        self._set_control_enabled("assign_button", known)
+
+    def _emit_assign_key_list(self) -> None:
+        criteria_id = self.criteria_id_var.get().strip()
+        if self.on_assign_key_list is not None and criteria_id:
+            self.on_assign_key_list(criteria_id)
 
     def _update_attribute_combo_values(self, query: str = "") -> list[str]:
         query_text = query.strip().casefold()
@@ -15484,7 +18218,7 @@ class AttributeTableFrame(ttk.LabelFrame):
             )
             filtered_options = [option for _score, option in ranked_matches[:150]]
 
-        self.attribute_suggestion_values = [option.display_label() for option in filtered_options]
+        self.attribute_suggestion_values = [attribute_option_choice_label(option) for option in filtered_options]
         return list(self.attribute_suggestion_values)
 
     def _resolve_attribute_option(self, raw_value: str) -> AttributeOption | None:
@@ -15495,6 +18229,12 @@ class AttributeTableFrame(ttk.LabelFrame):
             return self.catalog_by_label[value]
         if value in self.catalog_by_id:
             return self.catalog_by_id[value]
+        # 'ID | Bezeichnung' (Form bis v0.1.57: Sitzung, _handle_selection ohne Katalog) und die neue Form
+        # mit Herkunft: der Text vor dem ersten '|' ist die Kriterien-ID.
+        if "|" in value:
+            head = value.split("|", 1)[0].strip()
+            if head in self.catalog_by_id:
+                return self.catalog_by_id[head]
         exact_matches = [option for option in self.catalog_options if value.casefold() == option.label.casefold()]
         if len(exact_matches) == 1:
             return exact_matches[0]
@@ -15512,7 +18252,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.max_length_var.set("" if option.max_length is None else str(option.max_length))
         self.type_name_var.set(option.type_name)
         if not self.attribute_display_var.get().strip():
-            self.attribute_display_var.set(option.display_label())
+            self.attribute_display_var.set(attribute_option_choice_label(option))
         self._normalize_current_value_selection()
         self._update_hint()
 
@@ -15523,13 +18263,13 @@ class AttributeTableFrame(ttk.LabelFrame):
             self._hide_value_suggestions()
             self._update_hint()
             return
-        self.attribute_display_var.set(option.display_label())
+        self.attribute_display_var.set(attribute_option_choice_label(option))
         self.criteria_id_var.set(option.criteria_id)
         self.label_var.set(option.label)
         self.format_var.set(option.value_format)
         self.max_length_var.set("" if option.max_length is None else str(option.max_length))
         self.type_name_var.set(option.type_name)
-        self._update_attribute_combo_values(option.display_label())
+        self._update_attribute_combo_values(attribute_option_choice_label(option))
         self._hide_attribute_suggestions()
         self._normalize_current_value_selection()
         self._update_hint()
@@ -15707,7 +18447,7 @@ class AttributeTableFrame(ttk.LabelFrame):
         return AttributeRow(
             criteria_id=self.criteria_id_var.get().strip(),
             label=self.label_var.get().strip(),
-            value_format=self.format_var.get().strip(),
+            value_format=self._effective_format(),
             max_length=self._current_max_length(),
             type_name=self.type_name_var.get().strip(),
             value=self.value_var.get().strip(),
@@ -15715,23 +18455,25 @@ class AttributeTableFrame(ttk.LabelFrame):
         )
 
     def _current_key_value_options(self) -> list[AttributeKeyValueOption]:
+        """Die Schluesselliste des Kriteriums (feste Zuordnung bzw. gleicher Name bei gleicher Herkunft)."""
         row = self._current_attribute_row_context()
         if not is_attribute_key_value_format(row.value_format):
             return []
-        for group_key in row.key_value_group_candidates():
-            options = self.key_value_options_by_group.get(group_key, [])
-            if options:
-                return options
-        return []
+        return attribute_key_value_list_for(row.criteria_id, self.key_value_options_by_group) or []
 
-    def _resolve_value_option(self, raw_value: str) -> AttributeKeyValueOption | None:
+    def _resolve_value(self, raw_value: str) -> KeyValueResolution:
+        """Eingabe im Feld 'Wert' aufloesen (Modus Eingabe: Bezeichnung vor Kuerzel, Zahlenlisten-Regel)."""
         row = self._current_attribute_row_context()
         if not is_attribute_key_value_format(row.value_format):
-            return None
-        return resolve_attribute_key_value_option(row, raw_value, self.key_value_options_by_group)
+            return KeyValueResolution(KEY_VALUE_STATUS_EMPTY)
+        return resolve_attribute_key_value(row, raw_value, self.key_value_options_by_group, KEY_VALUE_MODE_ENTRY)
+
+    def _resolve_value_option(self, raw_value: str) -> AttributeKeyValueOption | None:
+        resolution = self._resolve_value(raw_value)
+        return resolution.option if resolution.status == KEY_VALUE_STATUS_OK else None
 
     def _normalize_current_value_selection(self) -> None:
-        if not is_attribute_key_value_format(self.format_var.get()):
+        if not is_attribute_key_value_format(self._effective_format()):
             self._hide_value_suggestions()
             return
         raw_value = self.value_var.get().strip()
@@ -15808,7 +18550,9 @@ class AttributeTableFrame(ttk.LabelFrame):
         self.value_suggestion_popup = popup
         self.value_suggestion_listbox = listbox
 
-    def _show_value_suggestions(self, values: list[str]) -> None:
+    def _show_value_suggestions(self, values: list[str], preselect: bool = True) -> None:
+        """preselect=False: ohne Vorauswahl (Eingabe doppeldeutig bzw. nur Kuerzel) - Enter uebernimmt
+        dann nichts still; Pfeil-ab/F4 oeffnet mit Vorauswahl wie bisher."""
         if not values:
             self._hide_value_suggestions()
             return
@@ -15825,8 +18569,9 @@ class AttributeTableFrame(ttk.LabelFrame):
         visible_rows = min(max(len(values), 1), 8)
         listbox.configure(height=visible_rows)
         listbox.selection_clear(0, "end")
-        listbox.selection_set(0)
-        listbox.activate(0)
+        if preselect:
+            listbox.selection_set(0)
+            listbox.activate(0)
         listbox.see(0)
 
         self.value_suggestion_popup.update_idletasks()
@@ -15862,13 +18607,17 @@ class AttributeTableFrame(ttk.LabelFrame):
         return False
 
     def _selected_value_suggestion_value(self) -> str | None:
+        """Markierter Eintrag des SICHTBAREN Vorschlagsfensters; sonst None. (Bis v0.1.57 zaehlte auch die
+        Auswahl eines ausgeblendeten Fensters bzw. der erste Vorschlag - eine veraltete Auswahl aus einem
+        anderen Kriterium konnte so mit Enter uebernommen werden.)"""
         if self.value_suggestion_listbox is None or not self.value_suggestion_listbox.winfo_exists():
+            return None
+        popup = self.value_suggestion_popup
+        if popup is None or not popup.winfo_exists() or str(popup.state()) == "withdrawn":
             return None
         selection = self.value_suggestion_listbox.curselection()
         if selection:
             return str(self.value_suggestion_listbox.get(selection[0]))
-        if self.value_suggestion_values:
-            return self.value_suggestion_values[0]
         return None
 
     def _accept_value_suggestion(self, value: str | None) -> None:
@@ -15943,13 +18692,16 @@ class AttributeTableFrame(ttk.LabelFrame):
         }
         if event.keysym in ignored_keys:
             return
-        if not is_attribute_key_value_format(self.format_var.get()):
+        if not is_attribute_key_value_format(self._effective_format()):
             self._hide_value_suggestions()
             return
 
         values = self._update_value_suggestion_values(self.value_var.get())
         if self.value_var.get().strip():
-            self._show_value_suggestions(values)
+            status = self._resolve_value(self.value_var.get()).status
+            self._show_value_suggestions(
+                values, preselect=status not in {KEY_VALUE_STATUS_AMBIGUOUS, KEY_VALUE_STATUS_KEY_ONLY}
+            )
         else:
             self._hide_value_suggestions()
 
@@ -15989,16 +18741,19 @@ class AttributeTableFrame(ttk.LabelFrame):
         return normalized
 
     def _build_current_row(self) -> AttributeRow:
-        value_format = self.format_var.get().strip()
+        # Format und Max. Laenge aus dem Katalog, wenn er das Kriterium kennt (die Felder sind dann nur
+        # Anzeige) - sonst naehme die Maske eine Zeile an, an der danach der Export des Bereichs scheitert.
+        value_format = self._effective_format()
         value = self._normalize_current_value(value_format, self.value_var.get())
         value_to = self._normalize_current_value(value_format, self.value_to_var.get())
         if value_format.strip().casefold() == "numerisch":
             value, value_to = self._normalize_numeric_input(value, value_to)
+        catalog_entry = self.catalog_by_id.get(self.criteria_id_var.get().strip())
         return AttributeRow(
             criteria_id=self.criteria_id_var.get().strip(),
             label=self.label_var.get().strip(),
             value_format=value_format,
-            max_length=self._current_max_length(),
+            max_length=catalog_entry.max_length if catalog_entry is not None else self._current_max_length(),
             type_name=self.type_name_var.get().strip(),
             value=value,
             value_to=value_to,
@@ -16016,7 +18771,7 @@ class AttributeTableFrame(ttk.LabelFrame):
             value_format="Numerisch",
         )
         if value and not value_to:
-            attempt = validate_suggestion_value(option, value, value, {})
+            attempt = validate_suggestion_value(option, value, value, {}, apply_entry_rules=False)
             if attempt is not None and attempt.confident:
                 return attempt.value, attempt.value_to
         result: list[str] = []
@@ -16024,7 +18779,7 @@ class AttributeTableFrame(ttk.LabelFrame):
             if not field_value:
                 result.append(field_value)
                 continue
-            attempt = validate_suggestion_value(option, field_value, field_value, {})
+            attempt = validate_suggestion_value(option, field_value, field_value, {}, apply_entry_rules=False)
             if attempt is not None and attempt.confident and not attempt.value_to:
                 result.append(attempt.value)
             else:
@@ -16042,48 +18797,137 @@ class AttributeTableFrame(ttk.LabelFrame):
         if format_error:
             raise ValueError(format_error)
 
-    def add_row(self) -> None:
+    def _commit_row(self, item_id: str | None, offer_free_slot: bool = True) -> bool:
+        """Gemeinsamer Ablauf fuer 'Hinzufügen' (item_id None) und 'Auswahl aktualisieren' (ab v0.1.58).
+
+        1. Pflichtangaben + bisherige Formatpruefung (_validate_row).
+        2. Nur beim Aktualisieren: ist die Zeile gleich der bisherigen, wird sie ohne die neuen Regeln
+           uebernommen - eine unveraenderte Bestandszeile loest nie eine Warnung aus und sperrt nichts.
+        3. Kataloge nicht bereit und (Schluesselwert oder Kriterium der Maske unbekannt): Rueckfrage.
+        4. Eingaberegeln (attribute_row_violations, Modus Eingabe): kein Verstoss -> Zeile umformen
+           ('Kuerzel | Bezeichnung') und uebernehmen; genau ein bestaetigbarer Verstoss (Kuerzel steht nicht
+           in der Katalogdatei, ist der Form nach aber eines) -> Rueckfrage mit Vorgabe 'Nein'; genau ein Verstoss
+           'Freitextfeld mehrfach' -> Angebot, den Text in das naechste freie Freitextfeld einzutragen (einmal);
+           sonst Meldung.
+        5. Einfuegen/Ersetzen, Markierungen auffrischen, Auswahl setzen, Aenderung melden.
+        Rueckgabe: True, wenn die Zeile uebernommen wurde."""
+        typed_value = self.value_var.get()
         self._apply_current_attribute_selection()
+        if item_id is not None and self.value_var.get() != typed_value:
+            # Die Auswahl hat den Wert umgeformt (Klartext -> 'Kuerzel | Bezeichnung'). Ergibt der Wert wie in
+            # der Zeile angezeigt die bisherige Zeile, bleibt er stehen: eine unveraenderte Bestandszeile wird
+            # nicht still umgeschrieben (Schritt 2).
+            normalized_value = self.value_var.get()
+            self.value_var.set(typed_value)
+            unchanged = next(
+                (
+                    attribute_rows_same_entry(table_row, self._build_current_row())
+                    for table_item, table_row in self._table_rows()
+                    if table_item == item_id
+                ),
+                False,
+            )
+            if not unchanged:
+                self.value_var.set(normalized_value)
         row = self._build_current_row()
         try:
             self._validate_row(row)
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
-            return
-        item_id = self.tree.insert(
-            "",
-            "end",
-            values=(row.criteria_id, row.label, row.value_format, row.value, row.value_to),
-        )
-        self.row_type_names[item_id] = row.type_name
-        self._select_first_row(select_last=True)
+            return False
+        index = self.key_value_options_by_group
+        table_rows = self._table_rows()
+        previous = next((table_row for table_item, table_row in table_rows if table_item == item_id), None)
+        if previous is None or not attribute_rows_same_entry(previous, row):
+            if not attribute_key_value_lists_ready(index) and (
+                is_attribute_key_value_format(row.value_format) or row.criteria_id not in self.catalog_by_id
+            ):
+                if not messagebox.askyesno(
+                    APP_TITLE,
+                    "Attributkatalog bzw. Schlüsselwerte sind nicht geladen (Laufwerk G: nicht erreichbar?).\n\n"
+                    f"Der Wert '{row.value or row.value_to}' kann nicht geprüft werden und würde unverändert "
+                    "gespeichert. Trotzdem übernehmen?",
+                    default=messagebox.NO,
+                    icon=messagebox.WARNING,
+                ):
+                    return False
+            if item_id is None:
+                other_rows = [table_row for _table_item, table_row in table_rows]
+            elif previous is not None and previous.criteria_id.strip() == row.criteria_id.strip():
+                # Kriterien-ID bleibt: nur die Zeilen davor zaehlen (die erste Zeile eines mehrfach
+                # belegten Felds bleibt aenderbar).
+                position = [table_item for table_item, _table_row in table_rows].index(item_id)
+                other_rows = [table_row for _table_item, table_row in table_rows[:position]]
+            else:
+                other_rows = [table_row for table_item, table_row in table_rows if table_item != item_id]
+            violations = attribute_row_violations(
+                row, other_rows, index, KEY_VALUE_MODE_ENTRY, self.key_value_catalog_date
+            )
+            if not violations:
+                row = normalize_attribute_entry_row(row, index, KEY_VALUE_MODE_ENTRY)
+            elif len(violations) == 1 and violations[0].confirmable:
+                if not messagebox.askyesno(
+                    APP_TITLE, violations[0].message, default=messagebox.NO, icon=messagebox.WARNING
+                ):
+                    return False
+            elif len(violations) == 1 and violations[0].rule == RULE_ATTRIBUTE_FREE_TEXT_TWICE:
+                remaining_rows = [table_row for table_item, table_row in table_rows if table_item != item_id]
+                return self._offer_free_text_slot(item_id, violations[0].message, remaining_rows, offer_free_slot)
+            else:
+                messagebox.showwarning(APP_TITLE, violations[0].message)
+                return False
+        values = (row.criteria_id, row.label, row.value_format, row.value, row.value_to)
+        if item_id is None:
+            new_item = self.tree.insert("", "end", values=values)
+            self.row_type_names[new_item] = row.type_name
+            self._refresh_row_marks()
+            self._select_first_row(select_last=True)
+        else:
+            self.tree.item(item_id, values=values)
+            self.row_type_names[item_id] = row.type_name
+            self._refresh_row_marks()
+            self.tree.focus(item_id)
+            self._handle_selection()
         self._emit_change()
+        return True
+
+    def _offer_free_text_slot(
+        self, item_id: str | None, message: str, remaining_rows: list[AttributeRow], allow_offer: bool
+    ) -> bool:
+        """Freitextfeld schon belegt: das naechste freie Freitextfeld anbieten (frei = von keiner uebrigen Zeile
+        belegt). Ja -> Kriterium der Eingabefelder umstellen (der Wert bleibt stehen) und einmal neu uebernehmen."""
+        free = next_free_text_slot(remaining_rows)
+        if not free:
+            messagebox.showwarning(
+                APP_TITLE, f"{message} Alle Freitextfelder ({', '.join(FREE_TEXT_SLOT_IDS)}) sind belegt."
+            )
+            return False
+        option = self.catalog_by_id.get(free)
+        if option is None or not allow_offer:
+            messagebox.showwarning(APP_TITLE, f"{message} Nächstes freies Freitextfeld: {free}.")
+            return False
+        if not messagebox.askyesno(
+            APP_TITLE, f"{message}\n\nDen Text stattdessen in {option.display_label()} eintragen?"
+        ):
+            return False
+        self.attribute_display_var.set(attribute_option_choice_label(option))
+        return self._commit_row(item_id, offer_free_slot=False)
+
+    def add_row(self) -> None:
+        self._commit_row(None)
 
     def update_selected_row(self) -> None:
         selected = self.tree.selection()
         if not selected:
             messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Zeile zum Bearbeiten auswählen.")
             return
-        self._apply_current_attribute_selection()
-        row = self._build_current_row()
-        try:
-            self._validate_row(row)
-        except ValueError as exc:
-            messagebox.showwarning(APP_TITLE, str(exc))
-            return
-        self.tree.item(
-            selected[0],
-            values=(row.criteria_id, row.label, row.value_format, row.value, row.value_to),
-        )
-        self.row_type_names[selected[0]] = row.type_name
-        self.tree.focus(selected[0])
-        self._handle_selection()
-        self._emit_change()
+        self._commit_row(selected[0])
 
     def remove_selected(self) -> None:
         for item_id in self.tree.selection():
             self.row_type_names.pop(item_id, None)
             self.tree.delete(item_id)
+        self._refresh_row_marks()
         self.clear_form()
         self._select_first_row()
         self._emit_change()
@@ -16112,53 +18956,138 @@ class AttributeTableFrame(ttk.LabelFrame):
         self._hide_value_suggestions()
         self._update_hint()
 
-    def _update_hint(self) -> None:
-        format_label = self.format_var.get().strip()
+    def _hint_text(self) -> str:
+        format_label = self._effective_format()
         if not format_label:
-            self.hint_var.set("Wähle ein Attribut aus oder gib die Kriterien-ID manuell ein.")
-            return
+            return "Wähle ein Attribut aus oder gib die Kriterien-ID manuell ein."
         format_key = format_label.casefold()
         max_length = self.max_length_var.get().strip() or "-"
         if format_key == "kein wert":
-            self.hint_var.set(f"Format: {format_label}. Dieses Attribut wird ohne Wert gespeichert. Max. Länge: {max_length}.")
-            return
-        if format_key == "flag (ja / nein)":
-            self.hint_var.set(f"Format: {format_label}. Bitte bevorzugt 'Ja' oder 'Nein' verwenden. Max. Länge: {max_length}.")
-            return
+            return f"Format: {format_label}. Dieses Attribut wird ohne Wert gespeichert. Max. Länge: {max_length}."
+        if format_key == ATTRIBUTE_FLAG_FORMAT_KEY:
+            return f"Format: {format_label}. Bitte bevorzugt 'Ja' oder 'Nein' verwenden. Max. Länge: {max_length}."
         if is_attribute_key_value_format(format_label):
-            options = self._current_key_value_options()
-            group_label = self.type_name_var.get().strip() or self.label_var.get().strip() or "-"
-            self.hint_var.set(
-                f"Format: {format_label}. Schlüsselwertgruppe: {group_label}. "
-                f"{len(options)} mögliche Werte, Suche mit Live-Vorschlägen im Feld Wert. "
-                f"Bereiche können über Wert und Wert bis gepflegt werden. Max. Länge: {max_length}."
+            return attribute_key_value_hint_text(
+                self._current_attribute_row_context(), self.key_value_options_by_group, self.key_value_catalog_date
             )
-            return
-        self.hint_var.set(f"Format: {format_label}. Wert oder Bereich über Wert und Wert bis pflegen. Max. Länge laut Katalog: {max_length}.")
+        return f"Format: {format_label}. Wert oder Bereich über Wert und Wert bis pflegen. Max. Länge laut Katalog: {max_length}."
 
-    def get_rows(self) -> list[AttributeRow]:
-        rows = []
+    def _selected_row_violation_text(self) -> str:
+        """' Bestandszeile: <Meldung>', wenn die ausgewaehlte Zeile der Tabelle (die in den Feldern steht)
+        einen Regelverstoss hat."""
+        try:
+            selected = self.tree.selection()
+            if not selected:
+                return ""
+            message = self.row_violations.get(selected[0], "")
+            if not message:
+                return ""
+            values = [str(value).strip() for value in self.tree.item(selected[0], "values")]
+            if not values or values[0] != self.criteria_id_var.get().strip():
+                return ""
+            return f" Bestandszeile: {message}"
+        except Exception:  # pragma: no cover - der Hinweis darf nie stoeren
+            return ""
+
+    def _update_hint(self) -> None:
+        self._update_entry_controls()
+        self.hint_var.set(self._hint_text() + self._selected_row_violation_text())
+
+    def _table_rows(self) -> list[tuple[str, AttributeRow]]:
+        """Zeilen der Tabelle mit Item-ID - die EINE Stelle, die Bezeichnung/Format/Laenge einer
+        Tabellenzeile bestimmt (Tabellenwert, ersatzweise Katalog). Nicht bereinigt, nicht entdoppelt."""
+        rows: list[tuple[str, AttributeRow]] = []
         for item_id in self.tree.get_children():
             values = [str(value).strip() for value in self.tree.item(item_id, "values")]
             values.extend([""] * max(0, 5 - len(values)))
             criteria_id, label, value_format, value, value_to = values[:5]
             catalog_entry = self.catalog_by_id.get(str(criteria_id).strip())
             rows.append(
-                AttributeRow(
-                    criteria_id=str(criteria_id).strip(),
-                    label=str(label).strip() or (catalog_entry.label if catalog_entry is not None else ""),
-                    value_format=str(value_format).strip() or (catalog_entry.value_format if catalog_entry is not None else ""),
-                    max_length=catalog_entry.max_length if catalog_entry is not None else None,
-                    type_name=(
-                        catalog_entry.type_name
-                        if catalog_entry is not None
-                        else self.row_type_names.get(item_id, "").strip()
+                (
+                    item_id,
+                    AttributeRow(
+                        criteria_id=str(criteria_id).strip(),
+                        label=str(label).strip() or (catalog_entry.label if catalog_entry is not None else ""),
+                        value_format=str(value_format).strip() or (catalog_entry.value_format if catalog_entry is not None else ""),
+                        max_length=catalog_entry.max_length if catalog_entry is not None else None,
+                        type_name=(
+                            catalog_entry.type_name
+                            if catalog_entry is not None
+                            else self.row_type_names.get(item_id, "").strip()
+                        ),
+                        value=str(value).strip(),
+                        value_to=str(value_to).strip(),
                     ),
-                    value=str(value).strip(),
-                    value_to=str(value_to).strip(),
                 )
             )
-        return normalize_attribute_rows(rows)
+        return rows
+
+    def get_rows(self) -> list[AttributeRow]:
+        return normalize_attribute_rows([row for _item_id, row in self._table_rows()])
+
+    def refresh_key_value_display(self) -> None:
+        """Anzeige der Schluesselwert-Zeilen der Tabelle an die geltenden Listen anpassen (nach dem Laden der
+        Kataloge bzw. einer neuen Zuordnung): gueltiges Kuerzel -> 'Kuerzel | Bezeichnung' der Liste; kein
+        Treffer -> das nackte Kuerzel bzw. der Text (eine Bezeichnung aus einer frueheren Liste bleibt nicht
+        stehen). Nur wenn die Kataloge bereit sind - sonst bleiben alle Zellen, wie sie sind. Loest KEIN
+        on_change aus: der Export schreibt vorher wie nachher den Text vor dem ersten '|'. Wirft nie."""
+        try:
+            index = self.key_value_options_by_group
+            if attribute_key_value_lists_ready(index):
+                for item_id, row in self._table_rows():
+                    if not is_attribute_key_value_format(row.value_format):
+                        continue
+                    raw_value = row.value.strip()
+                    if not raw_value:
+                        continue
+                    resolution = resolve_attribute_key_value(row, raw_value, index, KEY_VALUE_MODE_STORED)
+                    if resolution.status == KEY_VALUE_STATUS_OK and resolution.option is not None:
+                        display = resolution.option.display_label()
+                    elif "|" in raw_value:
+                        display = parse_attribute_key_value_display(raw_value)[0] or raw_value
+                    else:
+                        display = raw_value
+                    if display != raw_value:
+                        self.tree.set(item_id, "value", display)
+        except Exception as exc:
+            log_perf("Attribute: Anzeige auffrischen fehlgeschlagen", 0, detail=str(exc), always=True)
+        self._refresh_row_marks()
+
+    def _refresh_row_marks(self) -> None:
+        """Bestandszeilen mit Regelverstoss markieren (rot = Fehler, orange = bitte pruefen) und die Meldung
+        je Zeile merken. Zeilen werden nur markiert, nie entfernt oder geaendert. Wirft nie - laeuft bei
+        jedem Artikelwechsel."""
+        try:
+            index = self.key_value_options_by_group
+            marks: dict[str, str] = {}
+            before: list[AttributeRow] = []
+            table_rows = self._table_rows()
+            # Das freie Freitextfeld kommt aus ALLEN Zeilen des Artikels, nicht aus den Zeilen davor.
+            slot_proposals = free_text_slot_proposals([row for _item_id, row in table_rows])
+            for position, (item_id, row) in enumerate(table_rows):
+                violations = attribute_row_violations(
+                    row, before, index, KEY_VALUE_MODE_STORED, self.key_value_catalog_date
+                )
+                before.append(row)
+                tags: tuple[str, ...] = ()
+                if violations:
+                    errors = [violation for violation in violations if violation.severity == RULE_SEVERITY_ERROR]
+                    tags = (ATTRIBUTE_ROW_ERROR_TAG,) if errors else (ATTRIBUTE_ROW_REVIEW_TAG,)
+                    shown = (errors or violations)[0]
+                    message = shown.message
+                    if shown.rule == RULE_ATTRIBUTE_FREE_TEXT_TWICE:
+                        free = slot_proposals.get(position, "")
+                        message += (
+                            f" Nächstes freies Freitextfeld: {free}."
+                            if free
+                            else f" Alle Freitextfelder ({', '.join(FREE_TEXT_SLOT_IDS)}) sind belegt."
+                        )
+                    marks[item_id] = message
+                self.tree.item(item_id, tags=tags)
+            self.row_violations = marks
+        except Exception as exc:
+            self.row_violations = {}
+            log_perf("Attribute: Zeilen markieren fehlgeschlagen", 0, detail=str(exc), always=True)
 
     def set_rows(self, rows: list[AttributeRow]) -> None:
         for item_id in self.tree.get_children():
@@ -16171,6 +19100,7 @@ class AttributeTableFrame(ttk.LabelFrame):
                 values=(row.criteria_id, row.label, row.value_format, row.value, row.value_to),
             )
             self.row_type_names[item_id] = row.type_name
+        self._refresh_row_marks()
         self._select_first_row()
 
     def _select_first_row(self, select_last: bool = False) -> None:
@@ -16201,9 +19131,15 @@ class AttributeTableFrame(ttk.LabelFrame):
             if catalog_entry is not None
             else self.row_type_names.get(selected[0], "").strip()
         )
-        display_parts = [self.criteria_id_var.get(), self.label_var.get()]
-        self.attribute_display_var.set(" | ".join(part for part in display_parts if part))
-        self._normalize_current_value_selection()
+        if catalog_entry is not None:
+            self.attribute_display_var.set(attribute_option_choice_label(catalog_entry))
+        else:
+            display_parts = [self.criteria_id_var.get(), self.label_var.get()]
+            self.attribute_display_var.set(" | ".join(part for part in display_parts if part))
+        # Ab v0.1.58 zeigt das Wertfeld die Zeile so, wie sie in der Tabelle steht: ein Klartext-Bestand
+        # ('doppelseitig') wird beim Anklicken nicht zu 'Kuerzel | Bezeichnung' umgeformt - sonst schriebe
+        # 'Auswahl aktualisieren' ohne Aenderung ihn still um (gueltige Kuerzel zeigt die Tabelle schon als K | B).
+        self._hide_value_suggestions()
         self._update_hint()
 
     def _open_context_menu(self, event: tk.Event[tk.Misc]) -> None:
@@ -16366,13 +19302,18 @@ class AttributeSuggestionDialog(tk.Toplevel):
         attribute_options: list[AttributeOption],
         on_apply: Callable[[list[AttributeRow], list[tuple[str, str]]], None],
         attribute_key_values_by_group: dict[str, list[AttributeKeyValueOption]] | None = None,
+        rows_in_mask: list[AttributeRow] | None = None,
     ) -> None:
         super().__init__(master)
         self.title("Attribute aus Text vorschlagen")
         self.on_apply = on_apply
         self.attribute_key_values_by_group = dict(attribute_key_values_by_group or {})
+        # Zeilen, die schon in der Maske stehen (1:1-Zeilen der Vorlage): Bestand - beim Anhaken und
+        # Uebernehmen nicht erneut gegen die Eingaberegeln geprueft (ab v0.1.58).
+        self.rows_in_mask_keys = {attribute_row_mask_key(row) for row in rows_in_mask or []}
         self.attribute_options = list(attribute_options)
-        self.options_by_display = {option.display_label(): option for option in self.attribute_options}
+        # Auswahl 'Zuweisen' mit Nummer UND Herkunft (gleichnamige Kriterien unterscheidbar).
+        self.options_by_display = {attribute_option_choice_label(option): option for option in self.attribute_options}
         self.options_by_id = {option.criteria_id: option for option in self.attribute_options}
         self.suggestions_by_item: dict[str, AttributeSuggestion] = {}
         self.checked_items: set[str] = set()
@@ -16477,10 +19418,52 @@ class AttributeSuggestionDialog(tk.Toplevel):
         if checked:
             self.checked_items.add(item_id)
 
+    def _row_for_item(self, item_id: str) -> AttributeRow | None:
+        """Die Attributzeile, die 'Übernehmen' aus einer Dialogzeile baut (Wert/Wert bis aus der Tabelle)."""
+        suggestion = self.suggestions_by_item.get(item_id)
+        if suggestion is None:
+            return None
+        values = self.tree.item(item_id, "values")
+        option = suggestion.option
+        return AttributeRow(
+            criteria_id=option.criteria_id,
+            label=option.label,
+            value_format=option.value_format,
+            max_length=option.max_length,
+            type_name=option.type_name,
+            value=str(values[2]).strip(),
+            value_to=str(values[3]).strip(),
+        )
+
+    def _row_already_in_mask(self, row: AttributeRow) -> bool:
+        """Die Zeile steht unveraendert schon in der Maske (1:1-Zeile der Vorlage) - Bestand, keine Eingabe."""
+        return attribute_row_mask_key(row) in getattr(self, "rows_in_mask_keys", set())
+
+    def _key_value_unchecked_error(self, row: AttributeRow) -> str:
+        """Schluesselwert-Zeile ohne geladene Kataloge: nicht uebernehmbar (Meldung), sonst ''."""
+        if is_attribute_key_value_format(row.value_format) and not attribute_key_value_lists_ready(
+            self.attribute_key_values_by_group
+        ):
+            return (
+                "Schlüsselwerte bzw. Attributkatalog sind nicht geladen – ein Schlüsselwert kann ohne Prüfung "
+                "nicht übernommen werden."
+            )
+        return ""
+
     def _toggle_item(self, item_id: str) -> None:
         if item_id in self.checked_items:
             self.checked_items.discard(item_id)
         else:
+            # Vor dem Anhaken pruefen (ab v0.1.58): ein nicht aufloesbarer Schluesselwert laesst sich nicht
+            # als Text uebernehmen; jede Eingaberegel gilt (Modus Text, kontextfrei).
+            row = self._row_for_item(item_id)
+            if row is not None and not self._row_already_in_mask(row):
+                error = self._key_value_unchecked_error(row) or attribute_row_entry_error(
+                    row, [], self.attribute_key_values_by_group, KEY_VALUE_MODE_TEXT
+                )
+                if error:
+                    messagebox.showwarning(APP_TITLE, error, parent=self)
+                    return
             self.checked_items.add(item_id)
         values = list(self.tree.item(item_id, "values"))
         values[0] = "☑" if item_id in self.checked_items else "☐"
@@ -16500,7 +19483,7 @@ class AttributeSuggestionDialog(tk.Toplevel):
     def _assign_suggestion_values(self, query: str = "") -> list[str]:
         query_text = query.strip().casefold()
         return [
-            option.display_label()
+            attribute_option_choice_label(option)
             for option in self.attribute_options
             if not query_text or query_text in option.search_blob
         ][:200]
@@ -16532,6 +19515,11 @@ class AttributeSuggestionDialog(tk.Toplevel):
             return self.options_by_display[value]
         if value in self.options_by_id:
             return self.options_by_id[value]
+        if "|" in value:
+            # 'ID | Bezeichnung' (alte Form) bzw. 'ID | Bezeichnung | Herkunft': der Text vor dem ersten '|'.
+            head = value.split("|", 1)[0].strip()
+            if head in self.options_by_id:
+                return self.options_by_id[head]
         return None
 
     def _assign_unmatched(self) -> None:
@@ -16548,8 +19536,10 @@ class AttributeSuggestionDialog(tk.Toplevel):
         raw_value = self.assign_value_var.get().strip()
         # Über die zentrale Validierung: parst Zahlen und Bereiche, rechnet
         # Einheiten um, löst Schlüsselwerte auf und prüft Maximallängen.
+        # Hier tippt der User selbst: es gelten die Regeln der Maske (Modus Eingabe).
         suggestion = validate_suggestion_value(
-            option, raw_value, spec.source_line, self.attribute_key_values_by_group
+            option, raw_value, spec.source_line, self.attribute_key_values_by_group,
+            key_value_mode=KEY_VALUE_MODE_ENTRY,
         )
         if suggestion is None:
             suggestion = AttributeSuggestion(
@@ -16579,29 +19569,33 @@ class AttributeSuggestionDialog(tk.Toplevel):
         for item_id in self.tree.get_children():
             if item_id not in self.checked_items:
                 continue
-            suggestion = self.suggestions_by_item.get(item_id)
-            if suggestion is None:
+            row = self._row_for_item(item_id)
+            if row is None:
                 continue
-            values = self.tree.item(item_id, "values")
-            option = suggestion.option
-            row = AttributeRow(
-                criteria_id=option.criteria_id,
-                label=option.label,
-                value_format=option.value_format,
-                max_length=option.max_length,
-                type_name=option.type_name,
-                value=str(values[2]).strip(),
-                value_to=str(values[3]).strip(),
-            )
-            format_error = attribute_row_format_error(row)
+            if self._row_already_in_mask(row):
+                # 1:1-Zeile der Vorlage steht schon in der Maske: Bestand, nicht pruefen und nicht umformen
+                # (_apply_attribute_suggestions ueberspringt sie als exaktes Doppel); sie zaehlt aber fuer die
+                # Regeln der uebrigen Zeilen (z. B. zweite 9202).
+                rows.append(row)
+                continue
+            # Eingaberegeln (ab v0.1.58) statt nur der Formatpruefung: `rows` = die in dieser Uebernahme
+            # schon angenommenen Zeilen; angenommene Schluesselwert-Zeilen tragen 'Kuerzel | Bezeichnung'.
+            format_error = self._key_value_unchecked_error(row)
+            if format_error:
+                format_error = f"{row.display_label()}: {format_error}"
+            else:
+                format_error = attribute_row_entry_error(
+                    row, rows, self.attribute_key_values_by_group, KEY_VALUE_MODE_TEXT
+                )
             if format_error:
                 format_errors.append(format_error)
                 continue
-            rows.append(row)
+            rows.append(normalize_attribute_entry_row(row, self.attribute_key_values_by_group, KEY_VALUE_MODE_TEXT))
         if format_errors:
             messagebox.showwarning(
                 APP_TITLE,
-                "Diese angehakten Zeilen haben ein ungültiges Format und wurden nicht übernommen:\n\n"
+                "Diese angehakten Zeilen haben ein ungültiges Format bzw. verstoßen gegen eine Eingaberegel "
+                "und wurden nicht übernommen:\n\n"
                 + "\n".join(format_errors[:8])
                 + ("\n..." if len(format_errors) > 8 else "")
                 + "\n\nBitte Werte korrigieren und erneut übernehmen.",
@@ -16611,6 +19605,427 @@ class AttributeSuggestionDialog(tk.Toplevel):
         learned = list(self.learned_entries)
         self.destroy()
         self.on_apply(rows, learned)
+
+
+KEY_LIST_ASSIGNMENT_REMOVE = "remove"
+
+
+def key_list_assignment_state_text(
+    option: AttributeOption,
+    index: dict[str, list[AttributeKeyValueOption]],
+    assignments: dict[str, KeyListAssignment],
+    file_entries: dict[str, KeyListAssignment] | None = None,
+    session_entries: dict[str, KeyListAssignment] | None = None,
+) -> str:
+    """Heutiger Stand eines Kriteriums fuer den Zuordnungsdialog: 'keine Liste' /
+    'TecDoc/Akkuspannung – Programm-Vorgabe' / '… – Zuordnungsdatei vom 12.11.2026' /
+    '… – nur diese Sitzung (nicht gespeichert)' / 'TecDoc/Farbe – gleicher Name' /
+    'TecDoc/Xyz – zugeordnet, steht aber nicht in der Schlüsselwertdatei'."""
+    criteria_id = option.criteria_id.strip()
+    options = attribute_key_value_list_for(criteria_id, index) or []
+    assignment = assignments.get(criteria_id)
+    if assignment is not None and assignment.table.strip():
+        if not options:
+            return (
+                f"{assignment.source.strip() or option.source}/{assignment.table} – zugeordnet, steht aber nicht "
+                "in der Schlüsselwertdatei"
+            )
+        if criteria_id in (session_entries or {}):
+            origin = "nur diese Sitzung (nicht gespeichert)"
+        elif criteria_id in (file_entries or {}):
+            origin = "Zuordnungsdatei"
+            date_part = assignment.assigned_at.strip()[:10]
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_part):
+                origin += f" vom {date_part[8:10]}.{date_part[5:7]}.{date_part[0:4]}"
+        else:
+            origin = "Programm-Vorgabe"
+        return f"{attribute_key_value_list_label(options)} – {origin}"
+    if options:
+        return f"{attribute_key_value_list_label(options)} – gleicher Name"
+    return "keine Liste"
+
+
+def key_list_dialog_rows(
+    option: AttributeOption,
+    index: dict[str, list[AttributeKeyValueOption]],
+    show_other_sources: bool = False,
+    query: str = "",
+) -> list[tuple[str, str, str, int, str, str]]:
+    """Zeilen der Tabelle im Zuordnungsdialog: (Tabellenschluessel, Herkunft, Name, Anzahl, erste Eintraege,
+    Bemerkung). Vorschlaege (suggest_key_lists_for_criterion) stehen oben; ohne show_other_sources nur Listen
+    der Herkunft des Kriteriums (Regel: Kriterium und Liste tragen dieselbe Herkunft). query filtert nach
+    Tabellenname sowie nach Kuerzeln und Bezeichnungen der Werte (alle Suchwoerter muessen vorkommen)."""
+    own_source = normalize_lookup_text(option.source)
+    remarks = dict(suggest_key_lists_for_criterion(option, index))
+    order = {table_key: position for position, table_key in enumerate(remarks)}
+    tokens = normalize_lookup_text(query).split()
+    rows: list[tuple[str, str, str, int, str, str]] = []
+    for table_key, source, name, count, preview in attribute_key_value_tables(index):
+        if not show_other_sources and normalize_lookup_text(source) != own_source:
+            continue
+        if tokens:
+            blob = normalize_lookup_text(name) + " " + " ".join(
+                normalize_lookup_text(f"{entry.key_value_id} {entry.label}") for entry in index.get(table_key, [])
+            )
+            if not all(token in blob for token in tokens):
+                continue
+        rows.append((table_key, source, name, count, preview, remarks.get(table_key, "")))
+    rows.sort(key=lambda row: (order.get(row[0], len(order)), row[1].casefold(), row[2].casefold()))
+    return rows
+
+
+class KeyListAssignmentDialog:
+    """Dialog 'Schlüsselliste zuordnen…' (Reiter Attribute, ab v0.1.58).
+
+    Zeigt alle Schlüssellisten der Schlüsselwertdatei (Herkunft, Name, Anzahl, erste Einträge) und darunter
+    alle Werte der markierten Liste zum Vergleich mit der Auswahlliste in IMS. show() blockiert und liefert
+    (Herkunft, Tabelle, Hinweis), KEY_LIST_ASSIGNMENT_REMOVE oder None (Abbrechen/Fenster geschlossen)."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        option: AttributeOption,
+        index: dict[str, list[AttributeKeyValueOption]],
+        state_text: str = "",
+        removable: bool = False,
+        catalog_date: str = "",
+    ) -> None:
+        self.result: tuple[str, str, str] | str | None = None
+        self.option = option
+        self.index = index
+        self.rows_by_item: dict[str, tuple[str, str, str, int, str, str]] = {}
+        self.window = tk.Toplevel(master)
+        self.window.title(f"{APP_TITLE} – Schlüsselliste zuordnen")
+        self.window.transient(master)
+        self.window.resizable(True, True)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.window.bind("<Escape>", lambda _event: self._cancel())
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(0, weight=1)
+        self.query_var = tk.StringVar()
+        self.other_sources_var = tk.BooleanVar(value=False)
+        self.note_var = tk.StringVar()
+        self.values_title_var = tk.StringVar(value="Werte der markierten Liste")
+
+        frame = ttk.Frame(self.window, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(4, weight=3)
+        frame.rowconfigure(6, weight=2)
+
+        source_text = ", ".join(part for part in (option.source.strip(), option.value_format.strip()) if part)
+        ttk.Label(
+            frame,
+            text=f"Kriterium: {option.display_label()}" + (f" ({source_text})" if source_text else ""),
+            font=("Segoe UI Semibold", 11),
+        ).grid(row=0, column=0, sticky="w")
+        stand = f" Stand der Schlüsselwertdatei: {catalog_date}." if catalog_date else ""
+        ttk.Label(
+            frame,
+            text=f"Derzeit: {state_text or 'keine Liste'}.{stand}",
+            foreground=UI_TEXT_MUTED,
+            wraplength=900,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 6))
+        ttk.Label(
+            frame,
+            text=(
+                "Bitte die Liste wählen, die IMS für dieses Kriterium als Auswahlliste zeigt (Kürzel und "
+                "Bezeichnungen unten vergleichen). Kriterium und Liste tragen dieselbe Herkunft "
+                "(TecDoc / TOPMOTIVE); gleiche Kürzel bedeuten in gleichnamigen Listen der anderen Herkunft "
+                "meist Verschiedenes."
+            ),
+            foreground=UI_TEXT_MUTED,
+            wraplength=900,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 8))
+
+        search_row = ttk.Frame(frame)
+        search_row.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        search_row.columnconfigure(1, weight=1)
+        ttk.Label(search_row, text="Suche").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        search_entry = ttk.Entry(search_row, textvariable=self.query_var)
+        search_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Checkbutton(
+            search_row,
+            text="auch Listen der anderen Herkunft zeigen",
+            variable=self.other_sources_var,
+            command=self._refill,
+        ).grid(row=0, column=2, sticky="e", padx=(12, 0))
+
+        table = ttk.Frame(frame)
+        table.grid(row=4, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        columns = ("source", "table", "count", "preview", "remark")
+        self.tree = ttk.Treeview(table, columns=columns, show="headings", height=10, selectmode="browse")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        for column, heading, width, anchor in (
+            ("source", "Herkunft", 90, "w"),
+            ("table", "Attribut-Tabellenbezeichnung", 230, "w"),
+            ("count", "Werte", 60, "e"),
+            ("preview", "erste Einträge", 360, "w"),
+            ("remark", "Bemerkung", 190, "w"),
+        ):
+            self.tree.heading(column, text=heading)
+            self.tree.column(column, width=width, anchor=anchor, stretch=(column == "preview"))
+        tree_scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-Button-1>", lambda _event: self._assign())
+
+        ttk.Label(frame, textvariable=self.values_title_var).grid(row=5, column=0, sticky="w", pady=(8, 2))
+        values_frame = ttk.Frame(frame)
+        values_frame.grid(row=6, column=0, sticky="nsew")
+        values_frame.columnconfigure(0, weight=1)
+        values_frame.rowconfigure(0, weight=1)
+        self.values_list = tk.Listbox(values_frame, height=8, exportselection=False, activestyle="none")
+        self.values_list.grid(row=0, column=0, sticky="nsew")
+        values_scroll = ttk.Scrollbar(values_frame, orient="vertical", command=self.values_list.yview)
+        values_scroll.grid(row=0, column=1, sticky="ns")
+        self.values_list.configure(yscrollcommand=values_scroll.set)
+
+        note_row = ttk.Frame(frame)
+        note_row.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        note_row.columnconfigure(1, weight=1)
+        ttk.Label(note_row, text="Hinweis").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(note_row, textvariable=self.note_var).grid(row=0, column=1, sticky="ew")
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=8, column=0, sticky="e", pady=(12, 0))
+        column = 0
+        if removable:
+            ttk.Button(buttons, text="Zuordnung entfernen", command=self._remove).grid(row=0, column=column, padx=(0, 8))
+            column += 1
+        ttk.Button(buttons, text="Abbrechen", command=self._cancel).grid(row=0, column=column, padx=(0, 8))
+        ttk.Button(buttons, text="Zuordnen", style="Accent.TButton", command=self._assign).grid(row=0, column=column + 1)
+
+        self.query_var.trace_add("write", lambda *_args: self._refill())
+        self._refill()
+        self.window.geometry("1000x680")
+        search_entry.focus_set()
+
+    def _refill(self) -> None:
+        for item_id in self.tree.get_children():
+            self.tree.delete(item_id)
+        self.rows_by_item = {}
+        rows = key_list_dialog_rows(self.option, self.index, bool(self.other_sources_var.get()), self.query_var.get())
+        first_item = ""
+        for row in rows:
+            _table_key, source, name, count, preview, remark = row
+            item_id = self.tree.insert("", "end", values=(source, name, count, preview, remark))
+            self.rows_by_item[item_id] = row
+            first_item = first_item or item_id
+        # Der erste Vorschlag ist vorausgewaehlt; ohne Vorschlag bleibt die Auswahl leer.
+        if first_item and self.rows_by_item[first_item][5]:
+            self.tree.selection_set(first_item)
+            self.tree.focus(first_item)
+        self._on_select()
+
+    def _selected_row(self) -> tuple[str, str, str, int, str, str] | None:
+        selected = self.tree.selection()
+        return self.rows_by_item.get(selected[0]) if selected else None
+
+    def _on_select(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        self.values_list.delete(0, "end")
+        row = self._selected_row()
+        if row is None:
+            self.values_title_var.set("Werte der markierten Liste")
+            return
+        entries = self.index.get(row[0], [])
+        self.values_title_var.set(f"Werte der Liste {row[1]}/{row[2]} ({len(entries)}): Kürzel | Bezeichnung")
+        for entry in entries:
+            self.values_list.insert("end", entry.display_label())
+
+    def _assign(self) -> None:
+        row = self._selected_row()
+        if row is None:
+            messagebox.showwarning(APP_TITLE, "Bitte zuerst eine Schlüsselliste auswählen.", parent=self.window)
+            return
+        _table_key, source, name, _count, _preview, _remark = row
+        if normalize_lookup_text(source) != normalize_lookup_text(self.option.source):
+            if not messagebox.askyesno(
+                APP_TITLE,
+                f"Die Liste {source}/{name} hat eine andere Herkunft als das Kriterium ({self.option.source or '-'}). "
+                "Gleiche Kürzel bedeuten in den Listen der beiden Herkünfte meist Verschiedenes. Wirklich zuordnen?",
+                default=messagebox.NO,
+                icon=messagebox.WARNING,
+                parent=self.window,
+            ):
+                return
+        self.result = (source, name, self.note_var.get().strip())
+        self.window.destroy()
+
+    def _remove(self) -> None:
+        self.result = KEY_LIST_ASSIGNMENT_REMOVE
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+    def show(self) -> tuple[str, str, str] | str | None:
+        try:
+            self.window.grab_set()
+        except tk.TclError:  # pragma: no cover - z. B. verstecktes Hauptfenster
+            pass
+        self.window.wait_window()
+        return self.result
+
+
+class ImportCheckWindow:
+    """Ergebnisfenster der 'Prüfung vor dem Import' (ab v0.1.58, PLAN 7.8): nicht modal; Kopf mit
+    Ausgabeordner, Zeitpunkt, Katalogstand, Uebersicht je Regel und den Hinweisen des Berichts (rot); Filter
+    'Stufe' und 'Regel'; Tabelle mit sortierbaren Spaltenkoepfen; Doppelklick laedt den Artikel in die Maske.
+    Die Knoepfe rufen nur App-Methoden - die Logik steckt in reinen Funktionen (import_check_*)."""
+
+    TAGS = {RULE_SEVERITY_ERROR: "error", RULE_SEVERITY_REVIEW: "review", RULE_SEVERITY_HINT: "hint"}
+
+    def __init__(self, app: Any, report: ImportCheckReport) -> None:
+        self.app = app
+        self.report = report
+        self.sort_column = ""
+        self.sort_descending = False
+        self._items: dict[str, ImportCheckFinding] = {}
+        self.window = tk.Toplevel(app.root)
+        self.window.transient(app.root)
+        self.window.geometry("1320x720")
+        self.window.minsize(900, 460)
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(self.window, padding=12)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(5, weight=1)
+        self.heading_var = tk.StringVar()
+        self.catalog_var = tk.StringVar()
+        self.summary_var = tk.StringVar()
+        self.notes_var = tk.StringVar()
+        self.count_var = tk.StringVar()
+        ttk.Label(frame, textvariable=self.heading_var, font=("Segoe UI Semibold", 11)).grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, textvariable=self.catalog_var, foreground="#5E6472").grid(row=1, column=0, sticky="w")
+        ttk.Label(frame, textvariable=self.summary_var, justify="left").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(frame, textvariable=self.notes_var, foreground="#B00020", justify="left", wraplength=1200).grid(
+            row=3, column=0, sticky="w", pady=(4, 0)
+        )
+
+        filter_row = ttk.Frame(frame)
+        filter_row.grid(row=4, column=0, sticky="ew", pady=(8, 4))
+        ttk.Label(filter_row, text="Stufe:").grid(row=0, column=0, sticky="w")
+        self.severity_var = tk.StringVar(value=IMPORT_CHECK_FILTER_ALL)
+        self.severity_box = ttk.Combobox(
+            filter_row, textvariable=self.severity_var, state="readonly", width=10,
+            values=[IMPORT_CHECK_FILTER_ALL, *IMPORT_CHECK_SEVERITIES],
+        )
+        self.severity_box.grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(filter_row, text="Regel:").grid(row=0, column=2, sticky="w")
+        self.rule_var = tk.StringVar(value=IMPORT_CHECK_FILTER_ALL)
+        self.rule_box = ttk.Combobox(filter_row, textvariable=self.rule_var, state="readonly", width=52)
+        self.rule_box.grid(row=0, column=3, padx=(4, 12))
+        ttk.Label(filter_row, textvariable=self.count_var, foreground="#5E6472").grid(row=0, column=4, sticky="w")
+        self.severity_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_table())
+        self.rule_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_table())
+
+        table = ttk.Frame(frame)
+        table.grid(row=5, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        columns = [name for name, _heading, _width in IMPORT_CHECK_TABLE_COLUMNS]
+        self.tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse")
+        for name, heading, width in IMPORT_CHECK_TABLE_COLUMNS:
+            self.tree.heading(name, text=heading, command=lambda column=name: self._sort_by(column))
+            self.tree.column(name, width=width, minwidth=50, stretch=name in {"reason", "proposal", "value"})
+        self.tree.tag_configure("error", foreground="#B00020")
+        self.tree.tag_configure("review", foreground="#B35C00")
+        self.tree.tag_configure("hint", foreground="#5E6472")
+        y_scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        x_scroll = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.tree.bind("<Double-1>", self._open_article)
+        self.tree.bind("<Return>", self._open_article)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=6, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(buttons, text="Als Excel speichern…", command=self.app.save_import_check_report).grid(row=0, column=0, padx=(0, 8))
+        self.media_button = ttk.Button(buttons, text="Mediendateien vergleichen…", command=self.app.compare_import_check_media)
+        self.media_button.grid(row=0, column=1, padx=(0, 8))
+        self.confirm_button = ttk.Button(
+            buttons, text="Listenwechsel als geprüft vermerken…", command=self.app.confirm_key_list_changes
+        )
+        self.confirm_button.grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(buttons, text="Erneut prüfen", command=self.app.check_output_before_import).grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(buttons, text="Schließen", command=self.close).grid(row=0, column=4)
+        ttk.Label(
+            frame,
+            text="Doppelklick lädt den Artikel in die Maske. Geändert wird hier nichts – korrigiert wird in der Maske.",
+            foreground="#5E6472",
+        ).grid(row=7, column=0, sticky="w", pady=(6, 0))
+
+        self.window.bind("<Escape>", lambda _event: self.close())
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.update_report(report)
+
+    def exists(self) -> bool:
+        try:
+            return bool(self.window.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self) -> None:
+        try:
+            self.window.destroy()
+        except tk.TclError:  # pragma: no cover - schon geschlossen
+            pass
+
+    def update_report(self, report: ImportCheckReport) -> None:
+        """Neuen bzw. ergaenzten Bericht zeigen (Filter bleiben, soweit es die Regel noch gibt)."""
+        self.report = report
+        self.window.title(f"{APP_TITLE} – {import_check_window_title(report)}")
+        self.heading_var.set(import_check_window_title(report))
+        self.catalog_var.set(report.catalog_text or "Katalogstand unbekannt")
+        self.summary_var.set(import_check_status_text(report) + "\n" + "\n".join(import_check_summary_lines(report)))
+        self.notes_var.set("\n".join(report.notes))
+        choices = import_check_rule_choices(report)
+        self.rule_box.configure(values=choices)
+        if self.rule_var.get() not in choices:
+            self.rule_var.set(IMPORT_CHECK_FILTER_ALL)
+        self.media_button.configure(state="disabled" if report.media_compared else "normal")
+        self.confirm_button.configure(state="normal" if report.has_rule(RULE_KEY_VALUE_LIST_CHANGE) else "disabled")
+        self.refresh_table()
+
+    def visible_findings(self) -> list[ImportCheckFinding]:
+        shown = filter_import_check_findings(self.report.findings, self.severity_var.get(), self.rule_var.get())
+        return sort_import_check_table(shown, self.sort_column, self.sort_descending)
+
+    def refresh_table(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self._items = {}
+        shown = self.visible_findings()
+        for number, finding in enumerate(shown):
+            item_id = str(number)
+            self._items[item_id] = finding
+            self.tree.insert("", "end", iid=item_id, values=import_check_table_values(finding), tags=(self.TAGS.get(finding.severity, ""),))
+        self.count_var.set(f"{len(shown)} von {len(self.report.findings)} Befunden")
+
+    def _sort_by(self, column: str) -> None:
+        if self.sort_column == column:
+            self.sort_descending = not self.sort_descending
+        else:
+            self.sort_column, self.sort_descending = column, False
+        self.refresh_table()
+
+    def _open_article(self, _event: object = None) -> None:
+        selection = self.tree.selection()
+        finding = self._items.get(selection[0]) if selection else None
+        if finding is None or not finding.article_number:
+            return
+        if not self.app.load_article_from_overview(finding.article_number):
+            self.app.status_var.set(f"Artikel {finding.article_number} ist nicht im Artikelverzeichnis.")
 
 
 # ---------------------------------------------------------------------------
@@ -17219,6 +20634,9 @@ class ApolloImportApp:
         self.attribute_mapping_source_path_var = tk.StringVar(
             value=str(DEFAULT_ATTRIBUTE_MAPPING_SOURCE) if path_exists_safe(DEFAULT_ATTRIBUTE_MAPPING_SOURCE) else ""
         )
+        # Zuordnung Schluesselwert-Kriterium -> Schluesselliste (ab v0.1.58). Ohne path_exists_safe-Bedingung:
+        # der Pfad steht auch, wenn die Datei noch nicht existiert - das erste 'Zuordnen' legt sie dort an.
+        self.attribute_key_list_mapping_source_path_var = tk.StringVar(value=str(DEFAULT_ATTRIBUTE_KEY_LIST_MAPPING_SOURCE))
         self.product_list_path_var = tk.StringVar()
         self.deepl_api_key_var = tk.StringVar(value=os.getenv("DEEPL_API_KEY", ""))
         self.deepl_base_url_var = tk.StringVar(value=os.getenv("DEEPL_API_BASE_URL", DEEPL_DEFAULT_BASE_URL))
@@ -17285,6 +20703,7 @@ class ApolloImportApp:
         self.attribute_key_value_count_var = tk.StringVar(value="0 Schlüsselwerte geladen")
         self.vehicle_count_var = tk.StringVar(value="0 KTyp-Datensätze geladen")
         self.attribute_mapping_count_var = tk.StringVar(value="0 Zuordnungen geladen")
+        self.attribute_key_list_mapping_count_var = tk.StringVar(value="0 Schlüssellisten zugeordnet")
         self.article_browser_collapsed = False
         self.article_browser_toggle_var = tk.StringVar()
         # Suche im Artikelverzeichnis: Eingabe wird entprellt (after-Timer), der
@@ -17314,6 +20733,22 @@ class ApolloImportApp:
         self.vehicle_catalog: VehicleCatalog = VehicleCatalog()
         self.vehicle_catalog_loading = False
         self.attribute_mapping: dict[str, str] = {}
+        # Schluessellisten-Zuordnung (ab v0.1.58): Stand der Datei beim letzten Lesen, Eintraege, die nicht
+        # gespeichert werden konnten (gelten nur in dieser Sitzung), und die wirksame Zuordnung
+        # (Programm-Vorgaben < Datei < Sitzung).
+        self.attribute_key_list_file_entries: dict[str, KeyListAssignment] = {}
+        self.attribute_key_list_session_entries: dict[str, KeyListAssignment] = {}
+        # Stand der Dateizeile (Herkunft, Tabelle, Zugeordnet am) beim Anlegen eines Sitzungs-Eintrags.
+        self._attribute_key_list_session_basis: dict[str, tuple[str, str, str] | None] = {}
+        self.attribute_key_list_assignments: dict[str, KeyListAssignment] = dict(DEFAULT_KEY_LIST_ASSIGNMENTS)
+        self.genarts_without_vehicles: tuple[str, ...] = DEFAULT_GENARTS_WITHOUT_VEHICLES
+        self.attribute_catalog_date = ""              # Dateidatum 'Attribute alle.xlsx'
+        self.attribute_key_value_catalog_date = ""    # Dateidatum 'Schlüsselwerte.xlsx'
+        # Pruefung vor dem Import (ab v0.1.58): letzter Bericht, die dafuer gelesenen Rohzeilen (fuer den
+        # Medienvergleich) und das offene Ergebnisfenster.
+        self.import_check_report: ImportCheckReport | None = None
+        self._import_check_rows_by_file: dict[str, list[tuple[int, list[str]]]] | None = None
+        self.import_check_window: ImportCheckWindow | None = None
         self.article_browser_cache_dir = ""
         self.article_browser_cache_signature: tuple[tuple[str, int, int], ...] | None = None
         # Datenstand, den die Artikelliste zuletzt gezeichnet hat (siehe _article_browser_render_key).
@@ -17533,6 +20968,8 @@ class ApolloImportApp:
             self._load_genart_catalog(initial=True)
         with perf_timer("Start: KHer-Katalog laden"):
             self._load_competitor_catalog(initial=True)
+        with perf_timer("Start: Schluessellisten-Zuordnung laden"):
+            self._load_attribute_key_list_mapping(initial=True)
         with perf_timer("Start: Attributkatalog laden"):
             self._load_attribute_catalog(initial=True)
         with perf_timer("Start: Schluesselwerte laden"):
@@ -17548,6 +20985,8 @@ class ApolloImportApp:
         self._update_ki_batch_resume_button()
         # Offenen KI-Batch (Sicherungsdatei) erst anbieten, wenn das Fenster steht.
         self.root.after(300, self._offer_ki_batch_resume_at_start)
+        # Kataloge nicht geladen: einmal nach dem Start deutlich in der Statuszeile warnen (ab v0.1.58).
+        self.root.after(400, self._warn_if_attribute_key_value_catalogs_missing)
         log_perf("ApolloImportApp.__init__ gesamt", time.perf_counter() - init_started, always=True)
 
     def _configure_style(self) -> None:
@@ -18330,6 +21769,7 @@ class ApolloImportApp:
                 "attribute_key_value_source_path": self.attribute_key_value_source_path_var.get(),
                 "vehicle_source_path": self.vehicle_source_path_var.get(),
                 "attribute_mapping_source_path": self.attribute_mapping_source_path_var.get(),
+                "attribute_key_list_mapping_source_path": self.attribute_key_list_mapping_source_path_var.get(),
                 "product_list_path": self.product_list_path_var.get(),
             },
             "api": {
@@ -18511,6 +21951,15 @@ class ApolloImportApp:
                 self.vehicle_source_path_var.set(str(paths.get("vehicle_source_path", self.vehicle_source_path_var.get())))
                 self.attribute_mapping_source_path_var.set(
                     str(paths.get("attribute_mapping_source_path", self.attribute_mapping_source_path_var.get()))
+                )
+                # Ab v0.1.58; fehlt der Schluessel in einer alten Sitzungsdatei, bleibt die Vorgabe.
+                self.attribute_key_list_mapping_source_path_var.set(
+                    str(
+                        paths.get(
+                            "attribute_key_list_mapping_source_path",
+                            self.attribute_key_list_mapping_source_path_var.get(),
+                        )
+                    )
                 )
                 self.product_list_path_var.set(str(paths.get("product_list_path", self.product_list_path_var.get())))
 
@@ -19397,15 +22846,42 @@ if ($copied) {{
             row=27, column=1, columnspan=2, sticky="w"
         )
 
-        # Marke (Attribut 8988): Markenliste fuer die automatische Erkennung.
-        ttk.Separator(parent, orient="horizontal").grid(row=28, column=0, columnspan=3, sticky="ew", pady=(14, 12))
-        ttk.Label(parent, text="Marke (Attribut 8988)", font=("Segoe UI Semibold", 10)).grid(
-            row=29, column=0, columnspan=2, sticky="w", pady=(0, 4)
+        # Schluessellisten-Zuordnung (ab v0.1.58): welche Liste ein Schluesselwert-Kriterium benutzt.
+        ttk.Label(parent, text="Schlüssellisten-Zuordnung XLSX").grid(row=28, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.attribute_key_list_mapping_source_path_var).grid(
+            row=28, column=1, sticky="ew", pady=6
         )
-        ttk.Label(parent, text="Markenliste").grid(row=30, column=0, sticky="w", padx=(0, 10), pady=6)
-        ttk.Entry(parent, textvariable=self.brand_list_var).grid(row=30, column=1, sticky="ew", pady=6)
+        key_list_actions = ttk.Frame(parent)
+        key_list_actions.grid(row=28, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Button(
+            key_list_actions, text="Datei wählen", command=self.choose_attribute_key_list_mapping_source_file
+        ).grid(row=0, column=0)
+        ttk.Button(
+            key_list_actions, text="Neu laden", command=self._reload_attribute_key_list_mapping
+        ).grid(row=0, column=1, padx=(8, 0))
+        ttk.Label(
+            parent,
+            text=(
+                "Welche Auswahlliste (Schlüsselliste) ein Schlüsselwert-Kriterium benutzt. Gepflegt wird sie im "
+                "Reiter Attribute über 'Schlüsselliste zuordnen…'; ohne Eintrag gilt die gleichnamige Liste "
+                "derselben Herkunft (TecDoc/TOPMOTIVE), sonst gibt es keine Liste."
+            ),
+            foreground="#5E6472",
+            wraplength=760,
+        ).grid(row=29, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(parent, textvariable=self.attribute_key_list_mapping_count_var, foreground="#5E6472").grid(
+            row=30, column=1, columnspan=2, sticky="w"
+        )
+
+        # Marke (Attribut 8988): Markenliste fuer die automatische Erkennung.
+        ttk.Separator(parent, orient="horizontal").grid(row=31, column=0, columnspan=3, sticky="ew", pady=(14, 12))
+        ttk.Label(parent, text="Marke (Attribut 8988)", font=("Segoe UI Semibold", 10)).grid(
+            row=32, column=0, columnspan=2, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(parent, text="Markenliste").grid(row=33, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(parent, textvariable=self.brand_list_var).grid(row=33, column=1, sticky="ew", pady=6)
         brand_actions = ttk.Frame(parent)
-        brand_actions.grid(row=30, column=2, sticky="w", padx=(10, 0), pady=6)
+        brand_actions.grid(row=33, column=2, sticky="w", padx=(10, 0), pady=6)
         ttk.Button(
             brand_actions,
             text="Standard",
@@ -19424,7 +22900,7 @@ if ($copied) {{
             ),
             foreground="#5E6472",
             wraplength=760,
-        ).grid(row=31, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=34, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def _toggle_article_browser_section(self) -> None:
         self.article_browser_collapsed = not self.article_browser_collapsed
@@ -19823,6 +23299,11 @@ if ($copied) {{
             import_row, text="Löschlisten je Haken…", command=self.save_apollo_delete_lists_by_category
         )
         self.import_category_delete_button.grid(row=0, column=4, padx=(8, 0))
+        # Prueft alle Output-Dateien auf das, was Apollo ablehnt oder anders speichert (ab v0.1.58).
+        self.import_check_button = ttk.Button(
+            import_row, text=IMPORT_CHECK_BUTTON_TEXT, command=self.check_output_before_import
+        )
+        self.import_check_button.grid(row=0, column=5, padx=(8, 0))
 
         columns = ("article", "changed", "source", "short_id", "long_id", "genart", "attr", "oe", "comparison", "lists", "images", "documents", "videos", "links")
         self.browser_content_frame = ttk.Frame(browser_frame)
@@ -20026,6 +23507,7 @@ if ($copied) {{
         self.attribute_frame = AttributeTableFrame(
             self.attribute_tab,
             on_change=lambda: self._write_live_section("attributes"),
+            on_assign_key_list=self.open_key_list_assignment_dialog,
         )
         self.attribute_frame.grid(row=0, column=0, sticky="nsew")
 
@@ -20492,12 +23974,27 @@ if ($copied) {{
             existing = self.attribute_frame.get_rows()
             seen = {(row.criteria_id, row.value.casefold(), row.value_to.casefold()) for row in existing}
             new_rows = []
+            rejected: list[str] = []
+            index = self.attribute_key_values_by_group
             for row in rows:
                 key = (row.criteria_id, row.value.casefold(), row.value_to.casefold())
                 if key in seen:
                     continue
+                # Eingaberegeln gegen Maske + schon uebernommene Zeilen (ab v0.1.58); exakte Doppel oben
+                # bleiben wie bisher still uebersprungen.
+                error = attribute_row_entry_error(row, existing + new_rows, index, KEY_VALUE_MODE_TEXT)
+                if error:
+                    rejected.append(error)
+                    continue
                 seen.add(key)
-                new_rows.append(row)
+                new_rows.append(normalize_attribute_entry_row(row, index, KEY_VALUE_MODE_TEXT))
+            if rejected:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Nicht übernommen:\n"
+                    + "\n".join(rejected[:8])
+                    + ("\n..." if len(rejected) > 8 else ""),
+                )
             if new_rows:
                 rows_out = existing + new_rows
                 if template is not None:
@@ -20634,6 +24131,9 @@ if ($copied) {{
             all_ids_in_reference_order=list(dict.fromkeys(row.criteria_id.strip() for row in template_rows)),
             unknown_copy_ids=unknown_copy_ids,
         )
+        # Ab v0.1.58: Kopier-IDs, deren Zeilen im Referenzartikel selbst gegen eine Eingaberegel verstossen,
+        # werden in diesem Lauf weder kopiert noch gesucht noch ersetzt (rule_blocked_copy_ids).
+        template = apply_reference_copy_rules(template, dict(self.attribute_key_values_by_group))
         return template, ""
 
     def _resolve_reference_attribute_template(self) -> tuple[str, list[str] | None, list[str], str]:
@@ -20797,7 +24297,11 @@ if ($copied) {{
         angehakte Zeilen mit Hinweis, und die Statuszeile nennt die 1:1-Zeilen
         sowie die gesuchten Vorlage-Attribute, die weder vorhanden noch gefunden
         sind. Ein erneuter Lauf auf demselben Artikel aendert nichts mehr.
+
+        Ab v0.1.58 laufen die sicheren Treffer vorher noch einmal durch die Eingaberegeln
+        (demote_rule_violations): ein Verstoss geht in die Pruefung statt in die Maske.
         """
+        demote_rule_violations(result, self.attribute_key_values_by_group)
         existing = self.attribute_frame.get_rows()
         existing_ids = {row.criteria_id.strip() for row in existing if row.criteria_id.strip()}
         accepted_rows = [attribute_suggestion_to_row(suggestion) for suggestion in result.accepted]
@@ -20865,6 +24369,11 @@ if ($copied) {{
                 )
             if template.unknown_copy_ids:
                 status_parts.append(f"unbekannte 1:1-IDs ignoriert: {', '.join(template.unknown_copy_ids)}")
+            if template.rule_blocked_copy_ids:
+                status_parts.append(
+                    "1:1 nicht übernommen – Referenzartikel verstößt gegen eine Eingaberegel: "
+                    f"{', '.join(template.rule_blocked_copy_ids)}"
+                )
         if result.ai_error:
             status_parts.append(f"KI-Fehler: {result.ai_error}")
         elif result.ai_used:
@@ -20903,6 +24412,14 @@ if ($copied) {{
 
         if result.ai_error and not auto:
             messagebox.showwarning(APP_TITLE, f"KI-Attribut-Findung fehlgeschlagen (Regeln liefen trotzdem):\n{result.ai_error}")
+        if template is not None and template.rule_blocked_copy_ids and not auto:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Der Referenzartikel {template.reference_article} verstößt selbst gegen eine Eingaberegel:\n"
+                + "\n".join(template.rule_blocked_notes)
+                + "\n\nDiese Kriterien wurden NICHT 1:1 übernommen (vorhandene Zeilen des Artikels bleiben, wie "
+                "sie sind). Bitte den Referenzartikel bereinigen.",
+            )
 
         copy_suggestions: list[AttributeSuggestion] = []
         if template is not None:
@@ -20932,6 +24449,7 @@ if ($copied) {{
                 attribute_options=self.attribute_options,
                 on_apply=lambda rows, learned: self._apply_attribute_suggestions(rows, learned, template=template),
                 attribute_key_values_by_group=self.attribute_key_values_by_group,
+                rows_in_mask=list(template.copy_rows) if template is not None else None,
             )
         elif not auto and added == 0 and not copied:
             messagebox.showinfo(APP_TITLE, "Im Text wurden keine neuen Attribute erkannt.")
@@ -21579,11 +25097,16 @@ if ($copied) {{
         if source_path is None or not path_exists_safe(source_path):
             self.attribute_options = []
             self.attribute_options_by_id = {}
+            self.attribute_catalog_date = ""
             self.attribute_count_var.set("0 Attribute geladen")
             if hasattr(self, "attribute_frame"):
                 self.attribute_frame.set_attribute_catalog([])
+            # Ab v0.1.58 haengt der Schluesselindex auch am Kriterienkatalog (Liste je Kriterium).
+            self._rebuild_attribute_key_value_index()
             if not initial and source_path is not None:
                 self.status_var.set(f"Attributdatei nicht gefunden: {source_path}")
+            if not initial:
+                self._warn_if_attribute_key_value_catalogs_missing()
             return
 
         try:
@@ -21591,9 +25114,11 @@ if ($copied) {{
         except ValueError as exc:
             self.attribute_options = []
             self.attribute_options_by_id = {}
+            self.attribute_catalog_date = ""
             self.attribute_count_var.set("0 Attribute geladen")
             if hasattr(self, "attribute_frame"):
                 self.attribute_frame.set_attribute_catalog([])
+            self._rebuild_attribute_key_value_index()
             if not initial:
                 self.status_var.set(str(exc))
                 messagebox.showwarning(APP_TITLE, str(exc))
@@ -21601,12 +25126,14 @@ if ($copied) {{
 
         self.attribute_options = options
         self.attribute_options_by_id = {option.criteria_id: option for option in options}
+        self.attribute_catalog_date = catalog_file_date_text(source_path)
         self.attribute_count_var.set(f"{len(options)} Attribute geladen")
         if hasattr(self, "attribute_frame"):
             self.attribute_frame.set_attribute_catalog(options)
-        self._request_article_browser_reload()
+        self._rebuild_attribute_key_value_index()
         if not initial:
             self.status_var.set(f"Attributkatalog geladen: {len(options)} Einträge")
+            self._warn_if_attribute_key_value_catalogs_missing()
             self.refresh_preview()
 
     def _load_attribute_key_value_catalog(self, initial: bool = False) -> None:
@@ -21617,38 +25144,298 @@ if ($copied) {{
         )
         if source_path is None or not path_exists_safe(source_path):
             self.attribute_key_value_options = []
-            self.attribute_key_values_by_group = {}
-            self.attribute_key_value_count_var.set("0 Schlüsselwerte geladen")
-            if hasattr(self, "attribute_frame"):
-                self.attribute_frame.set_attribute_key_value_catalog({})
+            self.attribute_key_value_catalog_date = ""
+            self._rebuild_attribute_key_value_index()
             if not initial and source_path is not None:
                 self.status_var.set(f"Schlüsselwertdatei nicht gefunden: {source_path}")
+            if not initial:
+                self._warn_if_attribute_key_value_catalogs_missing()
             return
 
         try:
             options = load_attribute_key_value_options(source_path)
         except ValueError as exc:
             self.attribute_key_value_options = []
-            self.attribute_key_values_by_group = {}
-            self.attribute_key_value_count_var.set("0 Schlüsselwerte geladen")
-            if hasattr(self, "attribute_frame"):
-                self.attribute_frame.set_attribute_key_value_catalog({})
+            self.attribute_key_value_catalog_date = ""
+            self._rebuild_attribute_key_value_index()
             if not initial:
                 self.status_var.set(str(exc))
                 messagebox.showwarning(APP_TITLE, str(exc))
             return
 
         self.attribute_key_value_options = options
-        self.attribute_key_values_by_group = build_attribute_key_value_group_index(options)
-        self.attribute_key_value_count_var.set(
-            f"{len(options)} Schlüsselwerte in {len(self.attribute_key_values_by_group)} Gruppen geladen"
-        )
-        if hasattr(self, "attribute_frame"):
-            self.attribute_frame.set_attribute_key_value_catalog(self.attribute_key_values_by_group)
-        self._request_article_browser_reload()
+        self.attribute_key_value_catalog_date = catalog_file_date_text(source_path)
+        self._rebuild_attribute_key_value_index()
         if not initial:
             self.status_var.set(f"Schlüsselwertkatalog geladen: {len(options)} Einträge")
+            self._warn_if_attribute_key_value_catalogs_missing()
             self.refresh_preview()
+
+    def _rebuild_attribute_key_value_index(self) -> None:
+        """Die EINE Stelle, die den Schluesselindex baut (ab v0.1.58): Tabellen nach (Herkunft, Name) und die
+        Liste je Schluesselwert-Kriterium aus Schluesselwerten, Kriterienkatalog und Zuordnung. Danach die
+        Zaehler unter Datenstaemme, die Maske und das Neuladen des Artikelverzeichnisses."""
+        self.attribute_key_values_by_group = build_attribute_key_value_index(
+            self.attribute_key_value_options, self.attribute_options, self.attribute_key_list_assignments
+        )
+        stats = attribute_key_value_index_stats(self.attribute_key_values_by_group, self.attribute_key_list_assignments)
+        self.attribute_key_value_count_var.set(
+            attribute_key_value_count_text(len(self.attribute_key_value_options), stats, self.attribute_key_value_catalog_date)
+        )
+        self.attribute_key_list_mapping_count_var.set(
+            key_list_mapping_count_text(
+                self.attribute_key_list_assignments,
+                self.attribute_key_list_file_entries,
+                self.attribute_key_list_session_entries,
+                stats,
+            )
+        )
+        if hasattr(self, "attribute_frame"):
+            self.attribute_frame.set_attribute_key_value_catalog(
+                self.attribute_key_values_by_group, catalog_date=self.attribute_key_value_catalog_date
+            )
+        self._request_article_browser_reload()
+
+    def _warn_if_attribute_key_value_catalogs_missing(self) -> None:
+        """Statuszeile, solange Schluesselwerte bzw. Attributkatalog fehlen (nach dem Start und nach jedem
+        Neuladen)."""
+        if not attribute_key_value_lists_ready(self.attribute_key_values_by_group):
+            self.status_var.set(ATTRIBUTE_CATALOG_STATUS_WARNING)
+
+    def _load_attribute_key_list_mapping(self, initial: bool = False) -> None:
+        """Zuordnungsdatei Kriterium -> Schluesselliste lesen (ab v0.1.58) und den Index neu bauen.
+        Nicht lesbar: nur Programm-Vorgaben und Sitzungs-Eintraege."""
+        source_text = self.attribute_key_list_mapping_source_path_var.get().strip()
+        source_path = Path(source_text) if source_text else None
+        unreadable = ""
+        try:
+            file_entries = load_attribute_key_list_assignments(source_path) if source_path is not None else {}
+        except ValueError as exc:
+            file_entries = {}
+            unreadable = str(exc)
+        self.attribute_key_list_file_entries = file_entries
+        # Sitzungs-Eintraege entfallen, sobald die Datei fuer das Kriterium inzwischen eine ANDERE Zeile hat als
+        # beim Anlegen des Sitzungs-Eintrags (ein Kollege bzw. ein spaeteres Speichern hat zugeordnet). Eine
+        # schon vorher vorhandene, unveraenderte Dateizeile verdraengt den Sitzungs-Eintrag nicht.
+        kept_session: dict[str, KeyListAssignment] = {}
+        for criteria_id, entry in self.attribute_key_list_session_entries.items():
+            basis = self._attribute_key_list_session_basis.get(criteria_id)
+            if _key_list_assignment_identity(file_entries.get(criteria_id)) == basis:
+                kept_session[criteria_id] = entry
+            else:
+                self._attribute_key_list_session_basis.pop(criteria_id, None)
+        self.attribute_key_list_session_entries = kept_session
+        self.attribute_key_list_assignments = merge_key_list_assignments(
+            DEFAULT_KEY_LIST_ASSIGNMENTS, file_entries, self.attribute_key_list_session_entries
+        )
+        self.genarts_without_vehicles = (
+            load_genarts_without_vehicles(source_path) if source_path is not None else DEFAULT_GENARTS_WITHOUT_VEHICLES
+        )
+        self._rebuild_attribute_key_value_index()
+        if unreadable:
+            self.attribute_key_list_mapping_count_var.set("Zuordnungsdatei nicht lesbar – nur Programm-Vorgaben")
+            if not initial:
+                self.status_var.set(unreadable)
+                messagebox.showwarning(APP_TITLE, unreadable)
+                return
+        if not initial:
+            self.status_var.set(f"Schlüssellisten-Zuordnung geladen: {self.attribute_key_list_mapping_count_var.get()}")
+            self._warn_if_attribute_key_value_catalogs_missing()
+            self.refresh_preview()
+
+    def choose_attribute_key_list_mapping_source_file(self) -> None:
+        current = self.attribute_key_list_mapping_source_path_var.get().strip()
+        selected = filedialog.askopenfilename(
+            title="Schlüssellisten-Zuordnung XLSX wählen",
+            initialdir=str(Path(current).parent) if current else str(DEFAULT_ATTRIBUTE_KEY_LIST_MAPPING_SOURCE.parent),
+            filetypes=[("Excel Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
+        )
+        if selected:
+            self.attribute_key_list_mapping_source_path_var.set(selected)
+            self._load_attribute_key_list_mapping()
+
+    def _reload_attribute_key_list_mapping(self) -> None:
+        self._load_attribute_key_list_mapping()
+
+    def open_key_list_assignment_dialog(
+        self,
+        criteria_id: str,
+        choice: tuple[str, str, str] | str | None = None,
+    ) -> None:
+        """'Schlüsselliste zuordnen…' im Reiter Attribute (ab v0.1.58).
+
+        choice ersetzt in Tests den Dialog: (Herkunft, Tabelle, Hinweis) oder KEY_LIST_ASSIGNMENT_REMOVE.
+        Ablauf: nicht waehrend eines Hintergrundvorgangs (Massenimport, Findung und IMS-Uebernahme arbeiten mit
+        einer Kopie des Index); Datei frisch lesen und bei Abweichung erst neu laden; Dialog; speichern mit
+        Konfliktpruefung (anderer Arbeitsplatz) - bei Schreibfehler gilt die Zuordnung nur fuer diese Sitzung;
+        danach neu laden (Index, Maske, Artikelverzeichnis)."""
+        if self._import_stand_action_blocked():
+            return
+        criteria_id = str(criteria_id or "").strip()
+        option = self.attribute_options_by_id.get(criteria_id)
+        if option is None or not is_attribute_key_value_format(option.value_format):
+            messagebox.showwarning(
+                APP_TITLE,
+                f"{criteria_id or '-'}: Das Kriterium steht nicht als Schlüsselwert-Kriterium im Attributkatalog – "
+                "eine Schlüsselliste kann dafür nicht zugeordnet werden.",
+            )
+            return
+        if not attribute_key_value_lists_ready(self.attribute_key_values_by_group):
+            messagebox.showwarning(
+                APP_TITLE,
+                "Attributkatalog bzw. Schlüsselwerte sind nicht geladen (Laufwerk G: nicht erreichbar?) – eine "
+                "Schlüsselliste kann jetzt nicht zugeordnet werden. Unter Projekt › Datenstämme 'Neu laden' wählen.",
+            )
+            return
+        criteria_label = option.display_label()
+        source_text = self.attribute_key_list_mapping_source_path_var.get().strip()
+        mapping_path = Path(source_text) if source_text else DEFAULT_ATTRIBUTE_KEY_LIST_MAPPING_SOURCE
+        # Den gemeinsamen Stand zeigen, nicht den vom Programmstart.
+        try:
+            fresh_entries = load_attribute_key_list_assignments(mapping_path)
+        except ValueError:
+            fresh_entries = dict(self.attribute_key_list_file_entries)
+        if fresh_entries != self.attribute_key_list_file_entries:
+            self._load_attribute_key_list_mapping()
+        known_file_entry = fresh_entries.get(criteria_id)
+        index = self.attribute_key_values_by_group
+        current_options = attribute_key_value_list_for(criteria_id, index) or []
+        in_file = criteria_id in self.attribute_key_list_file_entries
+        in_session = criteria_id in self.attribute_key_list_session_entries
+        if choice is None:
+            dialog = KeyListAssignmentDialog(
+                self.root,
+                option,
+                index,
+                state_text=key_list_assignment_state_text(
+                    option,
+                    index,
+                    self.attribute_key_list_assignments,
+                    self.attribute_key_list_file_entries,
+                    self.attribute_key_list_session_entries,
+                ),
+                removable=in_file or in_session,
+                catalog_date=self.attribute_key_value_catalog_date,
+            )
+            choice = dialog.show()
+        if choice is None:
+            return
+
+        if choice == KEY_LIST_ASSIGNMENT_REMOVE:
+            if not (in_file or in_session):
+                messagebox.showinfo(
+                    APP_TITLE,
+                    f"{criteria_label}: Eine Programm-Vorgabe lässt sich nicht entfernen, nur durch eine andere "
+                    "Zuordnung übersteuern.",
+                )
+                return
+            self.attribute_key_list_session_entries.pop(criteria_id, None)
+            self._attribute_key_list_session_basis.pop(criteria_id, None)
+            if in_file:
+                try:
+                    remove_attribute_key_list_assignment(mapping_path, criteria_id, known_file_entry=known_file_entry)
+                except KeyListAssignmentConflict as exc:
+                    self._load_attribute_key_list_mapping()
+                    messagebox.showwarning(APP_TITLE, self._key_list_conflict_text(criteria_label, exc.current))
+                    return
+                except Exception as exc:
+                    self._load_attribute_key_list_mapping()
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        f"Die Zuordnung konnte nicht aus der Datei entfernt werden:\n{exc}\n\nBitte die Datei "
+                        f"{mapping_path} schließen bzw. die Schreibrechte klären und erneut versuchen.",
+                    )
+                    return
+            self._load_attribute_key_list_mapping()
+            new_options = attribute_key_value_list_for(criteria_id, self.attribute_key_values_by_group) or []
+            self.status_var.set(
+                f"Schlüssellisten-Zuordnung entfernt: {criteria_label} → "
+                + (
+                    f"{attribute_key_value_list_label(new_options)} ({len(new_options)} Werte)."
+                    if new_options
+                    else "keine Liste."
+                )
+            )
+            return
+
+        if not isinstance(choice, tuple) or len(choice) != 3:
+            return
+        list_source, list_table, note = (str(part or "").strip() for part in choice)
+        if not list_table:
+            return
+        new_key = attribute_key_value_table_key(list_source or option.source, list_table)
+        current_key = (
+            attribute_key_value_table_key(current_options[0].source, current_options[0].attribute_group)
+            if current_options
+            else ""
+        )
+        if current_key and current_key == new_key:
+            self.status_var.set(
+                f"Schlüsselliste unverändert: {criteria_label} → {attribute_key_value_list_label(current_options)}."
+            )
+            return
+        assignment = KeyListAssignment(
+            criteria_id=criteria_id,
+            source=list_source,
+            table=list_table,
+            note=note,
+            assigned_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # 'Bisherige Liste' = die bis eben wirksame Liste; gab es keine, gibt es auch nichts zu pruefen.
+            previous_source=current_options[0].source if current_options else "",
+            previous_table=current_options[0].attribute_group if current_options else "",
+            stock_checked_at="",
+        )
+        saved = True
+        try:
+            save_attribute_key_list_assignment(
+                mapping_path, assignment, option.label, known_file_entry=known_file_entry
+            )
+            self.attribute_key_list_session_entries.pop(criteria_id, None)
+            self._attribute_key_list_session_basis.pop(criteria_id, None)
+        except KeyListAssignmentConflict as exc:
+            self._load_attribute_key_list_mapping()
+            messagebox.showwarning(APP_TITLE, self._key_list_conflict_text(criteria_label, exc.current))
+            return
+        except Exception as exc:
+            # Keine Schreibrechte, Datei in Excel geoeffnet, Datei defekt: die Zuordnung gilt fuer diese Sitzung -
+            # ein fehlendes Schreibrecht auf G:\Apollo sperrt so kein Kriterium.
+            saved = False
+            self.attribute_key_list_session_entries[criteria_id] = assignment
+            self._attribute_key_list_session_basis[criteria_id] = _key_list_assignment_identity(known_file_entry)
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Die Zuordnung konnte nicht gespeichert werden:\n{exc}\n\nSie gilt jetzt nur an diesem "
+                "Arbeitsplatz bis zum Programmende. Bitte die Datei "
+                f"{mapping_path} schließen bzw. die Schreibrechte klären und erneut zuordnen.",
+            )
+        self._load_attribute_key_list_mapping()
+        new_options = attribute_key_value_list_for(criteria_id, self.attribute_key_values_by_group) or []
+        status = (
+            f"Schlüsselliste zugeordnet: {criteria_label} → "
+            f"{attribute_key_value_list_label(new_options) or f'{list_source or option.source}/{list_table}'} "
+            f"({len(new_options)} Werte)."
+        )
+        if not saved:
+            status += " Nur für diese Sitzung (nicht gespeichert)."
+        if current_options:
+            status += (
+                " Vorhandene Zeilen dieses Kriteriums meldet 'Prüfung vor dem Import…', bis der Listenwechsel "
+                "dort als geprüft vermerkt ist."
+            )
+        self.status_var.set(status)
+
+    @staticmethod
+    def _key_list_conflict_text(criteria_label: str, current: KeyListAssignment | None) -> str:
+        if current is not None:
+            list_text = f"{current.source.strip() or '-'}/{current.table.strip()}"
+            date_text = current.assigned_at.strip() or "ohne Datum"
+        else:
+            list_text = "keine Liste (Zeile entfernt)"
+            date_text = "ohne Datum"
+        return (
+            f"Für {criteria_label} wurde inzwischen an einem anderen Arbeitsplatz {list_text} zugeordnet "
+            f"({date_text}). Die Zuordnung wurde neu geladen – bitte prüfen und bei Bedarf erneut zuordnen."
+        )
 
     def _refresh_genart_combobox_values(self) -> None:
         if self.genart_suggestions is None:
@@ -24385,7 +28172,9 @@ if ($copied) {{
             # Vorlage des urspruenglichen Laufs (fuer Finalisierung, Lernschleife, Abschlussdialog).
             stored_template = resume.get("reference_template")
             if isinstance(stored_template, ReferenceTemplate):
-                template_worker = stored_template
+                # Die gespeicherte Vorlage ist ungefiltert (und kennt aus v0.1.57 die neuen Felder nicht):
+                # dieselbe Regel wie beim Aufloesen (ab v0.1.58).
+                template_worker = apply_reference_copy_rules(stored_template, attribute_key_values_worker)
             elif resume.get("template_ids"):
                 # Sicherung bis v0.1.50 (nur IDs + Referenzartikel): alles gesucht, nichts 1:1.
                 stored_ids = [str(cid) for cid in (resume.get("template_ids") or [])]  # type: ignore[union-attr]
@@ -24399,6 +28188,20 @@ if ($copied) {{
             if template_error:
                 messagebox.showwarning(APP_TITLE, template_error)
                 return
+        if template_worker is not None and template_worker.rule_blocked_copy_ids:
+            # Ab v0.1.58: Kopier-IDs mit Regelverstoss im Referenzartikel werden nicht 1:1 verteilt.
+            if not messagebox.askyesno(
+                APP_TITLE,
+                f"Der Referenzartikel {template_worker.reference_article} verstößt selbst gegen eine Eingaberegel:\n"
+                + "\n".join(template_worker.rule_blocked_notes)
+                + "\n\nDiese Kriterien werden in diesem Lauf NICHT 1:1 übernommen (vorhandene Zeilen der Artikel "
+                "bleiben, wie sie sind). Bitte den Referenzartikel bereinigen.\n\nLauf trotzdem starten?",
+            ):
+                self.status_var.set(f"{run_label} abgebrochen: Referenzartikel verstößt gegen eine Eingaberegel.")
+                return
+        # Sicherung einer aelteren Version: deren Regel-Treffer wurden mit Kuerzel-vor-Bezeichnung aufgeloest -
+        # jeder sichere Schluesselwert-Vorschlag geht deshalb in die Pruefung (demote_rule_violations).
+        resume_pre_update = ki_batch_resume_pre_update(resume)
         search_ids_worker: list[str] | None = list(template_worker.search_ids) if template_worker is not None else None
         reference_lines_worker: list[str] = list(template_worker.reference_lines) if template_worker is not None else []
         copy_ids_worker: set[str] = set(template_worker.copy_ids) if template_worker is not None else set()
@@ -24792,6 +28595,9 @@ if ($copied) {{
                     # der Vorlage als sicher liefern. Verwirft auch gelernte Zuordnungen
                     # (nichts dauerhaft in die Zuordnungsdatei lernen).
                     restrict_hybrid_to_template(hybrid, search_ids_worker)
+                # Letzte Sicherung vor dem Schreiben (ab v0.1.58): sichere Vorschlaege mit Regelverstoss gehen
+                # in die Pruefung (Testbericht/Prueflisten zeigen sie nur dort, nicht zusaetzlich 'automatisch').
+                demote_rule_violations(hybrid, attribute_key_values_worker, pre_update=resume_pre_update)
                 if hybrid.ai_error:
                     summary["media_warnings"].append((bundle.article_number, f"Attribut-KI: {hybrid.ai_error}"))
                     if "Key" in hybrid.ai_error:
@@ -25102,7 +28908,9 @@ if ($copied) {{
                         resume_payload.update(
                             {
                                 "version": 1,
-                                "app": APP_VERSION,
+                                # Beim Abholen bleibt die Version der Sicherung stehen (sonst ginge 'vor dem
+                                # Update' verloren, sobald die Sicherung bei offenem Batch neu geschrieben wird).
+                                "app": ki_batch_resume_app_version(resume),
                                 "created_at": (str(resume.get("created_at") or "") if resume is not None else "")
                                 or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "run_label": str(resume.get("run_label") or run_label) if resume is not None else run_label,
@@ -26536,6 +30344,254 @@ if ($copied) {{
         )
         if record_error:
             self._warn_delete_list_at_not_recorded(record_error, fallback, fallback_empty)
+
+    # ------------------------------------------------------------------
+    # Pruefung vor dem Import (ab v0.1.58, PLAN 7.7/7.8) - die Regeln stecken in check_output_rows.
+    # ------------------------------------------------------------------
+    def _import_check_mapping_path(self) -> Path:
+        source_text = self.attribute_key_list_mapping_source_path_var.get().strip()
+        return Path(source_text) if source_text else DEFAULT_ATTRIBUTE_KEY_LIST_MAPPING_SOURCE
+
+    def check_output_before_import(self, confirm_without_catalogs: bool | None = None, show_window: bool = True) -> bool:
+        """'Prüfung vor dem Import…': liest die Rohzeilen der Output-Dateien (Schreibsperre nur fuers Lesen) und
+        prueft sie im Hintergrund mit Kopien von Katalog, Index und Zuordnung. Schreibt nichts in den
+        Ausgabeordner und aendert keine Zeile. confirm_without_catalogs ersetzt in Tests die Rueckfrage, wenn die
+        Kataloge nicht geladen sind. True = Pruefung gestartet."""
+        if self._import_stand_action_blocked():
+            return False
+        try:
+            output_root = self._resolve_output_root()
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return False
+        if not self._flush_live_writes(reason="Prüfung: "):
+            self.status_var.set(IMPORT_CHECK_FLUSH_FAILED_TEXT)
+            messagebox.showwarning(APP_TITLE, IMPORT_CHECK_FLUSH_FAILED_TEXT)
+            return False
+        if not attribute_key_value_lists_ready(self.attribute_key_values_by_group):
+            if confirm_without_catalogs is None:
+                confirm_without_catalogs = messagebox.askyesno(APP_TITLE, IMPORT_CHECK_NOT_READY_QUESTION)
+            if not confirm_without_catalogs:
+                self.status_var.set("Prüfung vor dem Import abgebrochen – Kataloge nicht geladen.")
+                return False
+        # Kopien fuer den Arbeits-Thread (die App kann waehrenddessen neu laden).
+        options = dict(self.attribute_options_by_id)
+        index = dict(self.attribute_key_values_by_group)
+        assignments = dict(self.attribute_key_list_assignments)
+        genarts = tuple(self.genarts_without_vehicles)
+        key_value_date = self.attribute_key_value_catalog_date
+        attribute_date = self.attribute_catalog_date
+        basis = build_import_check_basis(
+            APP_VERSION_TAG,
+            self.attribute_source_path_var.get().strip(),
+            attribute_date,
+            self.attribute_key_value_source_path_var.get().strip(),
+            key_value_date,
+            str(self._import_check_mapping_path()),
+            assignments,
+            genarts,
+        )
+        catalog_text = import_check_catalog_text(key_value_date, attribute_date)
+
+        def worker() -> tuple[dict[str, list[tuple[int, list[str]]]], ImportCheckReport]:
+            with WORKBOOK_WRITE_LOCK:
+                rows_by_file = read_output_rows_for_check(output_root)
+            report = check_output_rows(
+                rows_by_file, options, index, assignments, genarts,
+                catalog_date=key_value_date, output_root=str(output_root),
+            )
+            report.basis = basis
+            report.catalog_text = catalog_text
+            return rows_by_file, report
+
+        def on_success(result: object) -> None:
+            rows_by_file, report = result  # type: ignore[misc]
+            self._finish_import_check(rows_by_file, report, show_window)
+
+        return self._run_background_task(
+            "Prüfung vor dem Import läuft … (Dateien lesen, Regeln prüfen)",
+            worker,
+            on_success,
+            "Prüfung vor dem Import fehlgeschlagen",
+        )
+
+    def _finish_import_check(
+        self,
+        rows_by_file: dict[str, list[tuple[int, list[str]]]],
+        report: ImportCheckReport,
+        show_window: bool = True,
+    ) -> None:
+        self.import_check_report = report
+        self._import_check_rows_by_file = rows_by_file
+        self.status_var.set(import_check_status_text(report))
+        if show_window:
+            self._show_import_check_window()
+
+    def _show_import_check_window(self) -> None:
+        """Ein offenes Ergebnisfenster wird durch das neue ersetzt (Titel = Zeitpunkt der Pruefung)."""
+        report = self.import_check_report
+        if report is None:
+            return
+        if self.import_check_window is not None and self.import_check_window.exists():
+            self.import_check_window.close()
+        self.import_check_window = ImportCheckWindow(self, report)
+
+    def _refresh_import_check_window(self) -> None:
+        window = self.import_check_window
+        if window is not None and window.exists() and self.import_check_report is not None:
+            window.update_report(self.import_check_report)
+
+    def save_import_check_report(self, target_path: Path | None = None) -> Path | None:
+        """'Als Excel speichern…': Bericht der letzten Pruefung. Vorgabeordner = Sicherungsordner neben dem
+        Ausgabeordner (ims_sync_backup_dir, fehlt er: der Elternordner). Ein Ziel IM Ausgabeordner wird
+        abgelehnt. target_path ersetzt in Tests den Dateidialog."""
+        report = self.import_check_report
+        if report is None:
+            messagebox.showinfo(APP_TITLE, "Es liegt noch keine Prüfung vor – bitte zuerst „Prüfung vor dem Import…“.")
+            return None
+        output_root = report.output_root
+        if target_path is None:
+            initial_dir: Path = Path.cwd()
+            if output_root:
+                try:
+                    backup_dir = ims_sync_backup_dir(output_root)
+                    initial_dir = backup_dir if path_exists_safe(backup_dir) else Path(output_root).parent
+                except ValueError:  # Ausgabeordner = Laufwerkswurzel: kein Nachbarordner
+                    initial_dir = Path(output_root)
+            window = self.import_check_window
+            target = filedialog.asksaveasfilename(
+                parent=window.window if window is not None and window.exists() else self.root,
+                title="Prüfbericht als Excel speichern",
+                defaultextension=".xlsx",
+                initialdir=str(initial_dir),
+                initialfile=import_check_report_default_name(),
+                filetypes=[("Excel Dateien", "*.xlsx")],
+            )
+            if not target:
+                return None
+            target_path = Path(target)
+        target_path = Path(target_path)
+        refusal = import_check_report_target_error(target_path, output_root)
+        if refusal:
+            messagebox.showwarning(APP_TITLE, refusal)
+            self.status_var.set("Prüfbericht nicht gespeichert – Ziel liegt im Ausgabeordner.")
+            return None
+        try:
+            write_import_check_report(target_path, report)
+        except OSError as exc:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"Der Prüfbericht konnte nicht gespeichert werden:\n{exc}\n\nIst die Datei noch in Excel geöffnet?",
+            )
+            self.status_var.set("Prüfbericht nicht gespeichert.")
+            return None
+        self.status_var.set(f"Prüfbericht gespeichert: {target_path}")
+        return target_path
+
+    def compare_import_check_media(self) -> bool:
+        """'Mediendateien vergleichen…': zweiter Hintergrundvorgang OHNE Schreibsperre ueber die Zeilen der
+        letzten Pruefung (find_identical_media_files liest die Dateien nur); die Befunde werden angehaengt."""
+        report = self.import_check_report
+        rows_by_file = self._import_check_rows_by_file
+        if report is None or rows_by_file is None:
+            messagebox.showinfo(APP_TITLE, "Es liegt noch keine Prüfung vor – bitte zuerst „Prüfung vor dem Import…“.")
+            return False
+        if report.media_compared:
+            self.status_var.set("Die Mediendateien dieser Prüfung sind schon verglichen.")
+            return False
+        if self._import_stand_action_blocked():
+            return False
+
+        def worker() -> list[ImportCheckFinding]:
+            return find_identical_media_files(rows_by_file)
+
+        def on_success(result: object) -> None:
+            if self.import_check_report is not report:
+                return  # inzwischen neu geprueft - der alte Vergleich gehoert nicht dazu
+            found = list(result)  # type: ignore[call-overload]
+            summary = import_check_media_summary(found)
+            report.findings = sort_import_check_findings(report.findings + found)
+            report.media_compared = True
+            report.notes.append(summary)
+            self.status_var.set(f"{import_check_status_text(report)} {summary}")
+            self._refresh_import_check_window()
+
+        return self._run_background_task(
+            "Mediendateien werden verglichen … (Größe und SHA-1, nur lesen)",
+            worker,
+            on_success,
+            "Medienvergleich fehlgeschlagen",
+        )
+
+    def confirm_key_list_changes(self, criteria_ids: list[str] | None = None, confirm: bool | None = None) -> int:
+        """'Listenwechsel als geprüft vermerken…' (PLAN 7.5): je Kriterium mit Befund 'Listenwechsel nicht
+        bestätigt' Rueckfrage, dann die geltende Zuordnung mit 'Bestand geprüft am' = jetzt in die gemeinsame
+        Zuordnungsdatei (fuer eine Programm-Vorgabe entsteht damit eine Dateizeile mit denselben Listen).
+        Schlaegt das Speichern fehl (Schreibfehler, Konflikt): Meldung, kein Vermerk. confirm ersetzt in Tests
+        die Rueckfragen. Danach Zuordnung neu laden und erneut pruefen. Rueckgabe: Zahl der Vermerke."""
+        if self._import_stand_action_blocked():
+            return 0
+        report = self.import_check_report
+        if criteria_ids is None:
+            criteria_ids = import_check_key_list_change_criteria(report) if report is not None else []
+        if not criteria_ids:
+            messagebox.showinfo(APP_TITLE, "Die letzte Prüfung meldet keinen offenen Listenwechsel.")
+            return 0
+        reported = Counter(
+            finding.criteria_id() for finding in (report.findings if report is not None else [])
+            if finding.rule == RULE_KEY_VALUE_LIST_CHANGE
+        )
+        mapping_path = self._import_check_mapping_path()
+        try:
+            fresh_entries = load_attribute_key_list_assignments(mapping_path)
+        except ValueError:
+            fresh_entries = dict(self.attribute_key_list_file_entries)
+        if fresh_entries != self.attribute_key_list_file_entries:
+            self._load_attribute_key_list_mapping()
+        done: list[str] = []
+        problems: list[str] = []
+        for criteria_id in criteria_ids:
+            criteria_id = str(criteria_id).strip()
+            current = self.attribute_key_list_assignments.get(criteria_id)
+            option = self.attribute_options_by_id.get(criteria_id)
+            label = option.display_label() if option is not None else criteria_id
+            if current is None or not current.previous_table.strip() or current.stock_checked_at.strip():
+                problems.append(f"{label}: kein offener Listenwechsel (mehr) – nichts vermerkt.")
+                continue
+            own_source = option.source if option is not None else ""
+            list_text = f"{current.source.strip() or own_source}/{current.table.strip()}"
+            previous_text = f"{current.previous_source.strip() or current.source.strip() or own_source}/{current.previous_table.strip()}"
+            question = import_check_key_list_change_question(label, list_text, previous_text, reported.get(criteria_id, 0))
+            answer = confirm if confirm is not None else messagebox.askyesno(APP_TITLE, question)
+            if not answer:
+                continue
+            entry = dataclass_replace(current, stock_checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), builtin=False)
+            try:
+                save_attribute_key_list_assignment(
+                    mapping_path, entry, option.label if option is not None else "",
+                    known_file_entry=fresh_entries.get(criteria_id),
+                )
+            except KeyListAssignmentConflict as exc:
+                problems.append(self._key_list_conflict_text(label, exc.current))
+                continue
+            except Exception as exc:  # Schreibrechte, Datei in Excel offen, Datei defekt: kein Vermerk
+                problems.append(
+                    f"{label}: Der Vermerk konnte nicht gespeichert werden:\n{exc}\n\nBitte die Datei {mapping_path} "
+                    "schließen bzw. die Schreibrechte klären und erneut vermerken."
+                )
+                continue
+            # Ein Sitzungs-Eintrag (ohne Vermerk) uebersteuerte sonst die eben geschriebene Dateizeile.
+            self.attribute_key_list_session_entries.pop(criteria_id, None)
+            self._attribute_key_list_session_basis.pop(criteria_id, None)
+            done.append(label)
+        if done or problems:
+            self._load_attribute_key_list_mapping()
+        if problems:
+            messagebox.showwarning(APP_TITLE, "\n\n".join(problems))
+        if done:
+            self.status_var.set(f"Listenwechsel als geprüft vermerkt: {', '.join(done)}. Die Prüfung läuft erneut …")
+            self.check_output_before_import(show_window=self.import_check_window is not None and self.import_check_window.exists())
+        return len(done)
 
     def _record_delete_list_at(
         self, output_root: Path, list_at: str, list_base: str, size: int
@@ -29380,6 +33436,7 @@ if ($copied) {{
             self.import_stand_button.configure(state="disabled")
             self.import_delete_list_button.configure(state="disabled")
             self.import_category_delete_button.configure(state="disabled")
+            self.import_check_button.configure(state="disabled")
             self.batch_progress_bar.configure(maximum=max(total, 1), value=0)
             self.batch_progress_var.set(f"0/{total} Artikel verarbeitet")
             self.batch_progress_bar.grid()
@@ -29392,6 +33449,7 @@ if ($copied) {{
             self.import_stand_button.configure(state="normal")
             self.import_delete_list_button.configure(state="normal")
             self.import_category_delete_button.configure(state="normal")
+            self.import_check_button.configure(state="normal")
             self._update_ki_batch_resume_button()
 
     def _apply_batch_progress(self, done: int, total: int, detail: str, elapsed: float) -> None:
